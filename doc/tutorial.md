@@ -99,7 +99,7 @@ fn add(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
 }
 ```
 
-### 参数元信息
+### 参数元信息（声明式）
 
 `createWithParams` 声明参数名，在 PHP 反射中可读：
 
@@ -109,6 +109,50 @@ phpzig.FunctionDesc.createWithParams("add", add, &.{
     phpzig.ParamDesc.create("b"),
 }),
 ```
+
+### 参数元信息（comptime struct 反射）★ v0.4.0 新增
+
+Zig 惯用方式：定义一个 struct，字段名 = 参数名，字段类型 → PHP 类型标注。
+编译期自动推导 arg_info，零手写：
+
+```zig
+// 1. 定义参数 struct（字段顺序 = PHP 参数顺序）
+const AddArgs = struct {
+    a: i64,          // → 参数 "a"，类型 LONG
+    b: i64,          // → 参数 "b"，类型 LONG
+};
+
+const FormatArgs = struct {
+    name: []const u8,  // → 参数 "name"，类型 STRING
+    age: i64,           // → 参数 "age"，类型 LONG
+};
+
+// 2. 一行注册
+phpzig.FunctionDesc.createFrom("add", add, AddArgs),
+phpzig.FunctionDesc.createFrom("format", format, FormatArgs),
+
+// 3. Optional 参数用 ?T
+const OptArgs = struct {
+    name: []const u8,
+    limit: ?i64,       // → 参数 "limit"，类型 LONG，allow_null=true
+};
+phpzig.FunctionDesc.createFrom("query", query, OptArgs),
+```
+
+**类型映射表**：
+
+| Zig 类型 | PHP 类型 |
+|----------|---------|
+| `i64`, `u64`, `isize`, `usize` | `int` |
+| `f64`, `f32` | `float` |
+| `bool` | `bool` |
+| `[]const u8`, `[:0]const u8` | `string` |
+| `*T.Zval` | `mixed` |
+
+**静态方法**用 `createStaticFrom`，其余完全相同。
+
+声明式 `createWithParams` 完全保留，与 comptime 反射双轨并行——
+C/C++ 开发者习惯声明式，Zig 开发者习惯类型推导，各取所需。
 
 ### 返回值类型
 
@@ -264,6 +308,51 @@ const M = phpzig.Module(.{
 });
 ```
 
+### 类属性 ★ v0.5.0
+
+声明式创建属性，5 种类型 + 访问修饰符：
+
+```zig
+// 声明式
+phpzig.ClassDesc.createWithProperties("BankAccount", &.{
+    phpzig.FunctionDesc.create("__construct", handler),
+    phpzig.FunctionDesc.createProtected("getBalance", handler),
+    phpzig.FunctionDesc.createPrivate("internal", handler),
+}, &.{
+    phpzig.ClassPropertyDesc.createLong("balance", 0),
+    phpzig.ClassPropertyDesc.createBool("open", true).makeProtected(),
+    phpzig.ClassPropertyDesc.createString("label", "default").makeStatic(),
+    phpzig.ClassPropertyDesc.createNull("data"),
+}),
+```
+
+### 类属性 comptime struct 反射 ★ v0.5.0
+
+```zig
+const BankProps = struct {
+    balance: i64 = 0,         // → long 属性，默认值 0
+    open: bool = true,        // → bool 属性，默认值 true
+    rate: f64 = 0.05,         // → double 属性，默认值 0.05
+    label: []const u8 = "ok", // → string 属性，默认值 "ok"
+};
+
+phpzig.ClassDesc.createWithPropsFrom("Bank", &.{
+    phpzig.FunctionDesc.create("__construct", handler),
+}, BankProps)
+```
+
+### 类继承 ★ v0.5.0
+
+```zig
+phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
+    phpzig.FunctionDesc.create("interest", handler),
+}),
+```
+
+```
+父类必须是先于子类在同一个 `.classes` 数组中声明的类。
+```
+
 ### 数组操作
 
 ```zig
@@ -387,7 +476,7 @@ comptime {
 ```bash
 cd php-zig
 zig build test
-# 18/18 通过
+# 50/50 通过（v0.5.0）
 ```
 
 示例扩展编译后运行 PHP 集成测试：
@@ -396,5 +485,5 @@ zig build test
 cd example
 zig build -Dphp=/usr/local
 php -d extension=zig-out/lib/libhello.so test_all.php
-# 47/47 通过
+# 82/82 通过（v0.5.0）
 ```

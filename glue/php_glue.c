@@ -233,6 +233,50 @@ void phpglue_fill_arg_info(void *dst, uint32_t required_count, const char **name
     *out_entry_count = name_count;
 }
 
+/* — 类型化版本：逐参数设置 PHP 类型标注 — */
+
+static void fill_typed_param_entry(zend_internal_arg_info *entry, const char *name, uint8_t php_type, uint8_t allow_null_flag) {
+    /* 从无类型模板起步（正确的 zend_type 初始化状态） */
+    memcpy(entry, &__phpglue_arg_param_template[0], sizeof(zend_internal_arg_info));
+    entry->name = name;
+
+    /* ZEND_TYPE_INIT_CODE 在各 PHP 8.x 版本中处理了 allow_null 的位编码差异 */
+    switch (php_type) {
+        case 0: /* mixed — 保持模板默认 */ break;
+        case 1: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG,   allow_null_flag, 0); break;
+        case 2: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_DOUBLE, allow_null_flag, 0); break;
+        case 3: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_STRING, allow_null_flag, 0); break;
+        case 4: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL,  allow_null_flag, 0); break;
+        case 5: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_ARRAY,  allow_null_flag, 0); break;
+        case 6: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_OBJECT, allow_null_flag, 0); break;
+        default: break;
+    }
+}
+
+void phpglue_fill_arg_info_typed(void *dst, uint32_t required_count,
+    const char **names, const uint8_t *types, const uint8_t *allow_null,
+    size_t name_count, size_t *out_entry_count)
+{
+    zend_internal_arg_info *entries = (zend_internal_arg_info *)dst;
+
+    /* Header — 同无类型版本 */
+    memcpy(&entries[0], &__phpglue_arg_header_template[0], sizeof(zend_internal_arg_info));
+    entries[0].name = (const char *)(uintptr_t)(required_count);
+
+    /* 按类型逐参数填充 */
+    for (size_t i = 0; i < name_count; i++) {
+        fill_typed_param_entry(&entries[i + 1], names[i],
+            types ? types[i] : 0,
+            allow_null ? allow_null[i] : 0);
+    }
+
+    /* 末尾哨兵 */
+    memcpy(&entries[name_count + 1], &__phpglue_arg_param_template[0], sizeof(zend_internal_arg_info));
+    entries[name_count + 1].name = NULL;
+
+    *out_entry_count = name_count;
+}
+
 /* ================================================================
  * 异常
  * ================================================================ */
@@ -265,7 +309,13 @@ int phpglue_register_class_ex(const char *name, size_t n, const zend_function_en
     INIT_CLASS_ENTRY_EX(ce, name, n, methods);
     return zend_register_internal_class_ex(&ce, parent) != NULL ? 1 : 0;
 }
-zend_class_entry *phpglue_lookup_class(const char *name, size_t n) { return zend_hash_str_find_ptr(CG(class_table), name, n); }
+zend_class_entry *phpglue_lookup_class(const char *name, size_t n) {
+    /* CG(class_table) 键是小写，手动 tolower 后查找 */
+    char buf[128];
+    size_t len = n < sizeof(buf) ? n : sizeof(buf) - 1;
+    for (size_t i = 0; i < len; i++) buf[i] = (char)((unsigned char)name[i] >= 'A' && (unsigned char)name[i] <= 'Z' ? name[i] + 32 : name[i]);
+    return zend_hash_str_find_ptr(CG(class_table), buf, len);
+}
 
 /* — 类常量 — */
 
@@ -289,6 +339,65 @@ int phpglue_register_class_with_constants(const char *name, size_t name_len, con
         zend_declare_class_constant(ce_ptr, const_keys[i], const_key_lens[i], &zv);
         zval_ptr_dtor(&zv);
     }
+    return 1;
+}
+
+/* — 完整注册：方法 + 常量 + 属性 — */
+
+static void declare_one_property(zend_class_entry *ce_ptr,
+    const char *name, size_t name_len, const void *val, size_t val_len,
+    uint32_t access, uint8_t prop_type)
+{
+    // 委托 Zend 高层 API 处理类型生命周期，避免手动管理 zval/zend_string refcount
+    switch (prop_type) {
+        case 0: /* long   */
+            zend_declare_property_long(ce_ptr, name, name_len, *(const zend_long *)val, access);
+            break;
+        case 1: /* double */
+            zend_declare_property_double(ce_ptr, name, name_len, *(const double *)val, access);
+            break;
+        case 2: /* string */
+            zend_declare_property_stringl(ce_ptr, name, name_len, (const char *)val, val_len, access);
+            break;
+        case 3: /* bool   */
+            zend_declare_property_bool(ce_ptr, name, name_len, *(const uint8_t *)val, access);
+            break;
+        case 4: /* null   */
+        default:
+            zend_declare_property_null(ce_ptr, name, name_len, access);
+            break;
+    }
+}
+
+int phpglue_register_class_full(const char *name, size_t name_len, const zend_function_entry *methods,
+    int const_count, const char **const_keys, size_t *const_key_lens,
+    const void **const_vals, size_t *const_val_lens, uint8_t *const_types,
+    int prop_count, const char **prop_keys, size_t *prop_key_lens,
+    const void **prop_vals, size_t *prop_val_lens, uint32_t *prop_accesses, uint8_t *prop_types)
+{
+    zend_class_entry ce;
+    INIT_CLASS_ENTRY_EX(ce, name, name_len, methods);
+    zend_class_entry *ce_ptr = zend_register_internal_class(&ce);
+    if (ce_ptr == NULL) return 0;
+
+    /* 类常量 */
+    for (int i = 0; i < const_count; i++) {
+        zval zv;
+        if (const_types[i] == 0) {
+            ZVAL_LONG(&zv, *(const zend_long *)const_vals[i]);
+        } else {
+            ZVAL_STRINGL(&zv, (const char *)const_vals[i], const_val_lens[i]);
+        }
+        zend_declare_class_constant(ce_ptr, const_keys[i], const_key_lens[i], &zv);
+        zval_ptr_dtor(&zv);
+    }
+
+    /* 类属性 */
+    for (int i = 0; i < prop_count; i++) {
+        declare_one_property(ce_ptr, prop_keys[i], prop_key_lens[i],
+            prop_vals[i], prop_val_lens[i], prop_accesses[i], prop_types[i]);
+    }
+
     return 1;
 }
 

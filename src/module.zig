@@ -60,10 +60,47 @@ const ARGINFO_ENTRY_SIZE_MAX: usize = 64;
 
 // ＝＝ 参数描述符 ＝＝
 
-pub const ParamDesc = struct {
-    name: [:0]const u8,
-    pub fn create(name: [:0]const u8) ParamDesc { return .{ .name = name }; }
+/// PHP 类型标注枚举。值 0~6 与 C glue phpglue_fill_arg_info_typed 约定一致。
+pub const ParamType = enum(u8) {
+    mixed  = 0,  // 无类型提示
+    long   = 1,
+    double = 2,
+    string = 3,
+    bool   = 4,
+    array  = 5,
+    object = 6,
 };
+
+pub const ParamDesc = struct {
+    name:       [:0]const u8,
+    param_type: ParamType = .mixed,
+    allow_null: bool      = false,
+
+    /// 声明式构造（兼容旧版，无类型标注）
+    pub fn create(name: [:0]const u8) ParamDesc { return .{ .name = name }; }
+    /// 声明式构造 + 类型标注
+    pub fn createTyped(name: [:0]const u8, pt: ParamType) ParamDesc {
+        return .{ .name = name, .param_type = pt };
+    }
+};
+
+/// comptime：Zig 类型 → PHP 参数类型 + allow_null
+/// ?i64 → { .long, allow_null=true }; ?[]const u8 → { .string, allow_null=true }
+pub fn zigTypeToPhpType(comptime Z: type) struct { pt: ParamType, an: bool } {
+    const info = @typeInfo(Z);
+    if (info == .@"optional") {
+        const inner = zigTypeToPhpType(info.@"optional".child);
+        return .{ .pt = inner.pt, .an = true };
+    }
+    return switch (Z) {
+        i64, u64, i32, u32, isize, usize => .{ .pt = .long,   .an = false },
+        f64, f32                         => .{ .pt = .double, .an = false },
+        bool                             => .{ .pt = .bool,   .an = false },
+        []const u8, [:0]const u8         => .{ .pt = .string, .an = false },
+        *T.Zval                          => .{ .pt = .mixed,  .an = false },
+        else => @compileError("Unsupported comptime arg type: " ++ @typeName(Z)),
+    };
+}
 
 // ＝＝ 函数 / 方法描述符 ＝＝
 //
@@ -77,6 +114,8 @@ pub const FunctionDesc = struct {
     /// 运行时标志位（0 表示 init 时自动从 C glue 获取）：
     ///   PUBLIC=0 — 模块级函数用 ACC_PUBLIC；类方法用 ACC_PUBLIC；
     ///   STATIC  — 类静态方法用 ACC_PUBLIC|ACC_STATIC
+    ///   PROTECTED_MARKER — ACC_PUBLIC|ACC_PROTECTED
+    ///   PRIVATE_MARKER   — ACC_PUBLIC|ACC_PRIVATE
     flags:    u32 = 0,
     params:   []const ParamDesc = &.{},
 
@@ -95,11 +134,173 @@ pub const FunctionDesc = struct {
     pub fn createStaticWithParams(name: [:0]const u8, handler: T.FunctionHandler, params: []const ParamDesc) FunctionDesc {
         return .{ .name = name, .handler = handler, .params = params, .flags = Marker.static_marker };
     }
+
+    /// comptime struct 反射 — 从 struct 字段名和类型自动推导 arg_info。
+    ///
+    /// ```zig
+    /// const AddArgs = struct { a: i64, b: i64, name: []const u8 };
+    /// const funcs = &.{ FunctionDesc.createFrom("my_add", my_add, AddArgs) };
+    /// ```
+    ///
+    /// 字段顺序 = 参数顺序，字段名 = 参数名，字段类型 → PHP 类型标注。
+    /// ?T 类型自动映射为 allow_null。
+    pub fn createFrom(comptime name: [:0]const u8, handler: T.FunctionHandler, comptime Args: type) FunctionDesc {
+        return .{
+            .name    = name,
+            .handler = handler,
+            .params  = comptime paramsFromStruct(Args),
+        };
+    }
+
+    /// createFrom 的静态方法版本
+    pub fn createStaticFrom(comptime name: [:0]const u8, handler: T.FunctionHandler, comptime Args: type) FunctionDesc {
+        return .{
+            .name    = name,
+            .handler = handler,
+            .params  = comptime paramsFromStruct(Args),
+            .flags   = Marker.static_marker,
+        };
+    }
+
+    pub fn createProtected(name: [:0]const u8, handler: T.FunctionHandler) FunctionDesc {
+        return .{ .name = name, .handler = handler, .flags = Marker.protected_marker };
+    }
+    pub fn createProtectedWithParams(name: [:0]const u8, handler: T.FunctionHandler, params: []const ParamDesc) FunctionDesc {
+        return .{ .name = name, .handler = handler, .params = params, .flags = Marker.protected_marker };
+    }
+    pub fn createPrivate(name: [:0]const u8, handler: T.FunctionHandler) FunctionDesc {
+        return .{ .name = name, .handler = handler, .flags = Marker.private_marker };
+    }
+    pub fn createPrivateWithParams(name: [:0]const u8, handler: T.FunctionHandler, params: []const ParamDesc) FunctionDesc {
+        return .{ .name = name, .handler = handler, .params = params, .flags = Marker.private_marker };
+    }
 };
 
 /// 哨兵常量 — 用于区分"用户未设置 flags"和"用户设了 PUBLIC"
 const Marker = struct {
-    const static_marker: u32 = 0xDEADBEEF;
+    const static_marker:    u32 = 0xDEADBEEF;
+    const protected_marker: u32 = 0xDEADBEF0;
+    const private_marker:   u32 = 0xDEADBEF1;
+};
+
+/// comptime：从 struct 类型反射出 []const ParamDesc
+fn paramsFromStruct(comptime Args: type) []const ParamDesc {
+    const info = @typeInfo(Args);
+    if (info != .@"struct") @compileError("createFrom expects a struct, got " ++ @typeName(Args));
+    const fields = info.@"struct".fields;
+    const params: [fields.len]ParamDesc = blk: {
+        var arr: [fields.len]ParamDesc = undefined;
+        inline for (fields, 0..) |field, i| {
+            const ti = zigTypeToPhpType(field.type);
+            arr[i] = ParamDesc{
+                .name       = field.name,
+                .param_type = ti.pt,
+                .allow_null = ti.an,
+            };
+        }
+        break :blk arr;
+    };
+    return &params;
+}
+
+/// comptime：从 struct 类型反射出 []const ClassPropertyDesc
+fn propsFromStruct(comptime Props: type) []const ClassPropertyDesc {
+    const info = @typeInfo(Props);
+    if (info != .@"struct") @compileError("createWithPropsFrom expects a struct, got " ++ @typeName(Props));
+    const fields = info.@"struct".fields;
+    const props: [fields.len]ClassPropertyDesc = blk: {
+        var arr: [fields.len]ClassPropertyDesc = undefined;
+        inline for (fields, 0..) |field, i| {
+            const dv = switch (field.type) {
+                i64, u64, i32, u32, isize, usize => ClassPropertyDesc.ClassPropertyValue{
+                    .long = if (field.default_value_ptr) |dv_ptr|
+                        @as(*const i64, @ptrCast(@alignCast(dv_ptr))).*
+                    else
+                        @as(T.zend_long, 0),
+                },
+                f64, f32 => ClassPropertyDesc.ClassPropertyValue{
+                    .double = if (field.default_value_ptr) |dv_ptr|
+                        @floatCast(@as(*const f64, @ptrCast(@alignCast(dv_ptr))).*)
+                    else
+                        @as(f64, 0.0),
+                },
+                bool => ClassPropertyDesc.ClassPropertyValue{
+                    .bool = if (field.default_value_ptr) |dv_ptr|
+                        @as(*const bool, @ptrCast(@alignCast(dv_ptr))).*
+                    else
+                        false,
+                },
+                []const u8, [:0]const u8 => bk2: {
+                    if (field.default_value_ptr) |dv_ptr| {
+                        const s = @as(*const []const u8, @ptrCast(@alignCast(dv_ptr))).*;
+                        break :bk2 ClassPropertyDesc.ClassPropertyValue{
+                            .string = s.ptr[0..s.len :0],
+                        };
+                    }
+                    break :bk2 ClassPropertyDesc.ClassPropertyValue{ .string = "" };
+                },
+                else => unreachable,
+            };
+            arr[i] = ClassPropertyDesc{
+                .name   = field.name,
+                .value  = dv,
+                .access = 0, // PUBLIC
+            };
+        }
+        break :blk arr;
+    };
+    return &props;
+}
+
+// ＝＝ 类属性描述符 ＝＝
+
+pub const PropertyType = enum(u8) {
+    long   = 0,
+    double = 1,
+    string = 2,
+    bool   = 3,
+    null_  = 4,
+};
+
+pub const ClassPropertyDesc = struct {
+    name:    [:0]const u8,
+    value:   ClassPropertyValue,
+    /// ZEND_ACC_* 组合——由 C glue 运行时查询，不硬编码
+    access:  u32 = 0, // 0 = init 时自动设为 ACC_PUBLIC
+
+    pub const ClassPropertyValue = union(enum) {
+        long:   T.zend_long,
+        double: f64,
+        string: [:0]const u8,
+        bool:   bool,
+        null_:  void,
+    };
+
+    pub fn createLong(name: [:0]const u8, v: T.zend_long) ClassPropertyDesc {
+        return .{ .name = name, .value = .{ .long = v } };
+    }
+    pub fn createDouble(name: [:0]const u8, v: f64) ClassPropertyDesc {
+        return .{ .name = name, .value = .{ .double = v } };
+    }
+    pub fn createString(name: [:0]const u8, v: [:0]const u8) ClassPropertyDesc {
+        return .{ .name = name, .value = .{ .string = v } };
+    }
+    pub fn createBool(name: [:0]const u8, v: bool) ClassPropertyDesc {
+        return .{ .name = name, .value = .{ .bool = v } };
+    }
+    pub fn createNull(name: [:0]const u8) ClassPropertyDesc {
+        return .{ .name = name, .value = .{ .null_ = {} } };
+    }
+
+    pub fn makeStatic(self: ClassPropertyDesc) ClassPropertyDesc {
+        return .{ .name = self.name, .value = self.value, .access = 1 }; // 1 = static marker
+    }
+    pub fn makeProtected(self: ClassPropertyDesc) ClassPropertyDesc {
+        return .{ .name = self.name, .value = self.value, .access = 2 }; // 2 = protected marker
+    }
+    pub fn makePrivate(self: ClassPropertyDesc) ClassPropertyDesc {
+        return .{ .name = self.name, .value = self.value, .access = 3 }; // 3 = private marker
+    }
 };
 
 // ＝＝ 类描述符 ＝＝
@@ -109,6 +310,7 @@ pub const ClassDesc = struct {
     methods:         []const FunctionDesc,
     parent_name:     ?[:0]const u8 = null,
     class_constants: []const ClassConstantDesc = &.{},
+    properties:      []const ClassPropertyDesc = &.{},
 
     pub fn create(name: [:0]const u8, methods: []const FunctionDesc) ClassDesc {
         return .{ .name = name, .methods = methods };
@@ -118,6 +320,29 @@ pub const ClassDesc = struct {
     }
     pub fn createWithConstants(name: [:0]const u8, methods: []const FunctionDesc, constants: []const ClassConstantDesc) ClassDesc {
         return .{ .name = name, .methods = methods, .class_constants = constants };
+    }
+    pub fn createWithProperties(name: [:0]const u8, methods: []const FunctionDesc, props: []const ClassPropertyDesc) ClassDesc {
+        return .{ .name = name, .methods = methods, .properties = props };
+    }
+
+    /// comptime struct 反射类属性——从 struct 字段名、类型和默认值自动推导 ClassPropertyDesc。
+    ///
+    /// ```zig
+    /// const BankProps = struct {
+    ///     balance: i64 = 0,
+    ///     open: bool = true,
+    /// };
+    /// ClassDesc.createWithPropsFrom("Bank", &.{_}, BankProps)
+    /// ```
+    ///
+    /// 字段顺序 = 属性声明顺序，字段名 = 属性名，
+    /// 字段类型 → PropertyType，字段默认值 → 属性默认值。
+    pub fn createWithPropsFrom(comptime name: [:0]const u8, methods: []const FunctionDesc, comptime Props: type) ClassDesc {
+        return .{
+            .name       = name,
+            .methods    = methods,
+            .properties = comptime propsFromStruct(Props),
+        };
     }
 };
 
@@ -207,16 +432,24 @@ pub fn Module(comptime opts: struct {
         var param_entries_buf: [total_param_bytes]u8 align(8) = undefined;
         var module_entry:         ZendModuleEntry                            = undefined;
 
-        /// 将方法 flags 哨兵转换为运行时 ACC 标志
+        /// 将方法 flags 哨兵转换为运行时 ACC 标志。
+        /// __construct → ACC_PUBLIC|ACC_CTOR，__destruct → ACC_PUBLIC|ACC_DTOR
         fn resolveFlags(desc: FunctionDesc) u32 {
             if (desc.flags == Marker.static_marker) {
                 return c.phpglue_acc_public() | c.phpglue_acc_static();
+            }
+            if (desc.flags == Marker.protected_marker) {
+                return c.phpglue_acc_protected();
+            }
+            if (desc.flags == Marker.private_marker) {
+                return c.phpglue_acc_private();
             }
             if (desc.flags != 0) return desc.flags;
             return c.phpglue_acc_public();
         }
 
-        /// 解析 arg_info + num_args
+        /// 解析 arg_info + num_args。
+        /// 自动检测：若任一 ParamDesc 带类型标注，走 typed C glue；否则走原版。
         fn resolveArgInfo(desc: FunctionDesc, arginfo_offset: *usize) struct { ptr: ?*anyopaque, num: u32 } {
             if (desc.arg_info) |a| return .{ .ptr = a, .num = 0 };
             if (desc.params.len == 0) return .{ .ptr = c.phpglue_get_empty_arg_info(), .num = 0 };
@@ -229,12 +462,33 @@ pub fn Module(comptime opts: struct {
             if (desc.params.len > 8) @panic("max 8 params supported for arg_info");
             for (desc.params, 0..) |p, j| name_ptrs[j] = p.name.ptr;
 
+            // 检测是否包含类型标注
+            const hasTypes = for (desc.params) |p| {
+                if (p.param_type != .mixed or p.allow_null) break true;
+            } else false;
+
             var entry_count: usize = 0;
-            c.phpglue_fill_arg_info(
-                @ptrCast(&param_entries_buf[byte_off]),
-                @intCast(required), &name_ptrs, required,
-                &entry_count,
-            );
+
+            if (hasTypes) {
+                var types: [8]u8 = undefined;
+                var nulls: [8]u8 = undefined;
+                for (desc.params, 0..) |p, j| {
+                    types[j] = @intFromEnum(p.param_type);
+                    nulls[j] = @intFromBool(p.allow_null);
+                }
+                c.phpglue_fill_arg_info_typed(
+                    @ptrCast(&param_entries_buf[byte_off]),
+                    @intCast(required), &name_ptrs, &types, &nulls, required,
+                    &entry_count,
+                );
+            } else {
+                c.phpglue_fill_arg_info(
+                    @ptrCast(&param_entries_buf[byte_off]),
+                    @intCast(required), &name_ptrs, required,
+                    &entry_count,
+                );
+            }
+
             arginfo_offset.* += required + 2; // header + params + sentinel
 
             const base: [*]align(8) u8 = @as([*]align(8) u8, @ptrCast(&param_entries_buf));
@@ -313,34 +567,60 @@ pub fn Module(comptime opts: struct {
         fn rshutdownPtr() ?T.ModuleLifecycleFn { return if (opts.rshutdown) |_| &phpzigRshutdown else null; }
 
         fn registerClassWithConstants(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
+            // registerClassFull 统一处理常量+属性（prop_count=0 时只注册常量）
+            return registerClassFull(cls, methods_ptr);
+        }
+
+        fn registerClassFull(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
+            // — 常量打包 —
             const k = cls.class_constants.len;
-            if (k > 8) @panic("max 8 class constants");
-            var keys: [8][*c]const u8 = undefined;
-            var kls: [8]usize = undefined;
-            var vals: [8]?*anyopaque = undefined;
-            var vls: [8]usize = undefined;
-            var types: [8]u8 = undefined;
+            var c_keys: [8][*c]const u8 = undefined;
+            var c_kls:  [8]usize = undefined;
+            var c_vals: [8]?*anyopaque = undefined;
+            var c_vls:  [8]usize = undefined;
+            var c_types:[8]u8 = undefined;
             var ls_buf: [8]T.zend_long = undefined;
             inline for (cls.class_constants, 0..) |cnst, j| {
-                keys[j] = cnst.name.ptr;
-                kls[j] = cnst.name.len;
+                c_keys[j] = cnst.name.ptr;
+                c_kls[j]  = cnst.name.len;
                 switch (cnst.value) {
-                    .long => |v| {
-                        ls_buf[j] = v;
-                        vals[j] = @ptrCast(&ls_buf[j]);
-                        vls[j] = 0;
-                        types[j] = 0;
-                    },
-                    .string => |v| {
-                        vals[j] = @ptrCast(@constCast(v.ptr));
-                        vls[j] = v.len;
-                        types[j] = 1;
-                    },
+                    .long => |v| { ls_buf[j] = v; c_vals[j] = @ptrCast(&ls_buf[j]); c_vls[j] = 0; c_types[j] = 0; },
+                    .string => |v| { c_vals[j] = @ptrCast(@constCast(v.ptr)); c_vls[j] = v.len; c_types[j] = 1; },
                 }
             }
-            return c.phpglue_register_class_with_constants(
+            // — 属性打包 —
+            const p = cls.properties.len;
+            if (p > 8) @panic("max 8 properties");
+            var p_keys:  [8][*c]const u8 = undefined;
+            var p_kls:   [8]usize = undefined;
+            var p_vals:  [8]?*anyopaque = undefined;
+            var p_vls:   [8]usize = undefined;
+            var p_access:[8]u32 = undefined;
+            var p_types: [8]u8 = undefined;
+            var dbl_buf: [8]f64 = undefined;
+            var bl_buf:  [8]u8 = undefined;
+            inline for (cls.properties, 0..) |prop, j| {
+                p_keys[j] = prop.name.ptr;
+                p_kls[j]  = prop.name.len;
+                // 运行时解析 access 哨兵 + 默认值
+                p_access[j] = switch (prop.access) {
+                    1 => c.phpglue_acc_public() | c.phpglue_acc_static(),
+                    2 => c.phpglue_acc_protected(),
+                    3 => c.phpglue_acc_private(),
+                    else => c.phpglue_acc_public(),
+                };
+                switch (prop.value) {
+                    .long   => |v| { ls_buf[j] = v;            p_vals[j] = @ptrCast(&ls_buf[j]); p_vls[j] = 0;           p_types[j] = 0; },
+                    .double => |v| { dbl_buf[j] = v;            p_vals[j] = @ptrCast(&dbl_buf[j]); p_vls[j] = 0;           p_types[j] = 1; },
+                    .string => |v| { p_vals[j] = @ptrCast(@constCast(v.ptr)); p_vls[j] = v.len; p_types[j] = 2; },
+                    .bool   => |v| { bl_buf[j]  = @intFromBool(v); p_vals[j] = @ptrCast(&bl_buf[j]);  p_vls[j] = 0;           p_types[j] = 3; },
+                    .null_  => { p_vals[j] = null; p_vls[j] = 0; p_types[j] = 4; },
+                }
+            }
+            return c.phpglue_register_class_full(
                 cls.name.ptr, cls.name.len, methods_ptr,
-                @intCast(k), &keys, &kls, &vals, &vls, &types,
+                @intCast(k), &c_keys, &c_kls, &c_vals, &c_vls, &c_types,
+                @intCast(p), &p_keys, &p_kls, &p_vals, &p_vls, &p_access, &p_types,
             );
         }
 
@@ -356,8 +636,8 @@ pub fn Module(comptime opts: struct {
             }
             initClassMethodEntries();
             inline for (opts.classes, 0..) |cls, i| {
-                const result: c_int = if (cls.class_constants.len > 0)
-                    registerClassWithConstants(cls, class_method_ptrs[i])
+                const result: c_int = if (cls.properties.len > 0 or cls.class_constants.len > 0)
+                    registerClassFull(cls, class_method_ptrs[i])
                 else if (cls.parent_name) |parent_name|
                     c.phpglue_register_class_ex(cls.name.ptr, cls.name.len, class_method_ptrs[i],
                         c.phpglue_lookup_class(parent_name.ptr, parent_name.len) orelse return -1)

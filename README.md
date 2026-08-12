@@ -5,9 +5,13 @@
 ```zig
 const phpzig = @import("phpzig");
 
-fn hello(execute_data: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+fn hello(execute_data: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void {
     phpzig.Return.returnString(rv, "Hello from Zig!");
 }
+
+// comptime struct 反射——参数名+类型全自动推导
+const AddArgs = struct { a: i64, b: i64 };
+const funcs = &.{ phpzig.FunctionDesc.createFrom("add", add, AddArgs) };
 ```
 
 ## 为什么不用 C 写扩展？
@@ -16,7 +20,7 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
 
 **Zig 带来三样 C 不具备的东西：**
 
-- **`comptime` 编译期执行**：函数注册表、参数元信息在编译期生成，运行时零开销。不需要 C 的宏堆叠或运行期反射。
+- **`comptime` 编译期执行**：函数注册表、arg_info 参数元信息、类属性声明全在编译期生成，运行时零开销。不需要 C 的宏堆叠或运行期反射。
 - **`defer` + 明确所有权**：引用计数、动态分配的释放路径显式但无噪声，不会漏也不会 double-free。
 - **原生交叉编译**：`zig build -Dphp=/path/to/arm-php` 直接产出目标架构的 `.so`。
 
@@ -29,18 +33,18 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
     导入 @import("phpzig")
     ────────────────
     php-zig 核心层
-    - Zval     : 类型安全的 zval 包装
-    - Array    : 数组增删查 + 迭代器
-    - Return   : 返回值 + 参数获取
-    - PhpFunc  : 从 Zig 调用 PHP 函数
-    - Throw    : 异常抛出
-    - Object   : 对象属性读写
-    - Resource : 资源类型注册
-    - Iterator : HashTable 遍历
-    - Module   : comptime 模块注册（函数/类/常量/生命周期）
+    - Zval        : 类型安全的 zval 包装 + 运算符
+    - Array       : 数组增删查 + filter/map/reduce + 迭代器
+    - Return      : 返回值 + 参数获取
+    - PhpFunc     : 从 Zig 调用 PHP 函数
+    - Throw       : 异常抛出
+    - Object      : 对象属性读写 + 方法调用
+    - Resource    : 资源类型注册
+    - Iterator    : HashTable 遍历
+    - Module      : comptime 模块注册（函数/类/属性/常量/继承/生命周期）
     ────────────────
     glue/php_glue.c (300行 C)
-    ZVAL_* / RETVAL_* / array_init 等宏 → 普通 C 函数
+    ZVAL_* / RETVAL_* / array_init / class/property 等宏 → 普通 C 函数
 ```
 
 从下往上看：Zend Engine 提供 C API → glue 把宏转成函数 → php-zig 用 Zig 的类型系统和 comptime 封装 → 下游只写纯 Zig。
@@ -74,25 +78,43 @@ Hello, Zig!
 
 | 类别 | 状态 | 说明 |
 |------|:--:|------|
-| 函数注册 | ✅ | 模块级函数 + 类方法（含静态） + 参数 arg_info 自动生成 |
-| 类型系统 | ✅ | IS_* 全类型判断、取值（long/double/string/bool）、设值（5 种） |
-| 数组 | ✅ | 追加 / 索引设值 / 关联设值 / 查找 / 删除 / 计数 / pop / 迭代器 / filter / map / reduce |
+| 函数注册 | ✅ | 声明式 + comptime struct 反射 arg_info，参数名/类型/可选性全自动推导 |
+| 类型系统 | ✅ | IS_* 全类型判断（8 种）、取值（5 种）、设值（5 种）、eql/neq 运算符 |
+| 数组 | ✅ | append / set / setAssoc / find / del / count / pop / iterator / filter / map / reduce |
 | 返回值 | ✅ | 9 种返回类型 |
 | 调用 PHP | ✅ | `PhpFunc.call*` 系列 + `Object.call` 对象方法 |
-| 异常 | ✅ | `Throw.throwException(msg)` |
+| 异常 | ✅ | `Throw.throwException(className, message)` |
 | 模块常量 | ✅ | long / double / string / bool / null 五种 |
-| 类注册 | ✅ | 静态方法 + 继承 |
+| 类注册 | ✅ | 方法（含 static/protected/private）+ 类常量 + **类属性**（5 种类型）+ **继承** + **构造器 __construct** |
+| 类属性 | ✅ | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` |
 | 生命周期 | ✅ | MINIT / MSHUTDOWN / RINIT / RSHUTDOWN |
 | 对象属性 | ✅ | `readProperty` / `writeProperty` |
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 18 项 + PHP 集成测试 47 项 |
-| Zval 运算符 | ✅ | `eql` / `neq`（类型标签 + 逐值比较，纯 Zig） |
-| 非静态方法 | ✅ | flags=0 时 resolveFlags 仅返回 acc_public |
-| 类常量 | ✅ | long / string 两种，`ClassConstantDesc` |
-| Class 属性 | ❌ | 待实现 |
+| 测试 | ✅ | Zig 单元测试 50 项 + PHP 集成测试 82 项 |
 | INI 配置 | ❌ | 依赖 `PHP_INI_BEGIN/END` 编译期声明 |
-| foreach 语法糖 | ❌ | 基于内部指针的迭代器已可用 |
+| 闭包导出 | ❌ | v0.7 规划中 |
+
+### 两种注册哲学，并存
+
+```zig
+// 声明式——C/C++ 开发者惯用
+phpzig.FunctionDesc.createWithParams("add", add, &.{
+    phpzig.ParamDesc.create("a"),
+    phpzig.ParamDesc.create("b"),
+});
+
+// comptime struct 反射——Zig 惯用，编译期全自动
+const AddArgs = struct { a: i64, b: i64 };
+phpzig.FunctionDesc.createFrom("add", add, AddArgs);
+```
+
+类属性同样双轨：
+
+```zig
+const BankProps = struct { balance: i64 = 0, open: bool = true };
+phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
+```
 
 ## 版本兼容
 
@@ -102,16 +124,16 @@ Hello, Zig!
 
 ## 与 PHPX 的取舍
 
-| | PHPX (C++) | php-zig (Zig) |
+| | PHPX (C++) | php-zig v0.5 (Zig) |
 |--|-----------|---------------|
-| PHP 类导出 | Class / Interface / 继承 / 可见性 / 属性 / 常量 | Class 注册（静态方法 + 非静态方法 + 继承 + 类常量） |
-| 闭包导出 | 支持 | 不支持 |
-| 函数分发 | `_exec_function` 运行时分发 | 直接函数指针，零运行开销 |
+| 函数注册 | 宏自注册 + 运行时分发 | comptime 泛型 + 直接函数指针 |
+| arg_info | 自动生成 | 声明式 + comptime struct 反射（双轨） |
+| 类导出 | Class / Interface / 继承 / 属性 / 常量 / 访问修饰符 | Class / 继承 / 属性（5 种类型）/ 常量 / public/protected/private |
+| 闭包导出 | 支持 | v0.7 规划 |
 | 构建 | CMake + phpize | `zig build -Dphp=/path` |
-| 类型系统 | Variant（完整，包含运算符重载、类型转换） | Zval + Array（判断/取值/设值/迭代） |
-| 生产可用性 | 生产级 | 原型阶段 |
+| 生产可用性 | 生产级 | 主体功能完成（v0.5），接近生产可用 |
 
-PHPX 功能更全，php-zig 更轻、构建更直接。
+php-zig 的策略：优先覆盖 PHPX 主体功能（OOP 深度已达 v0.5），comptime 能力是 PHPX 不具备的差异优势。
 
 ## 许可证
 

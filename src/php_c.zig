@@ -142,6 +142,8 @@ pub extern fn phpglue_call_arg(execute_data: *T.ZendExecuteData, n: u32)     *T.
 
 pub extern fn phpglue_get_empty_arg_info()                                                                    ?*anyopaque;
 pub extern fn phpglue_fill_arg_info(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, name_count: usize, out_entry_count: *usize) void;
+/// 类型化版本 — types/allow_null 各为 name_count 个 u8 的数组
+pub extern fn phpglue_fill_arg_info_typed(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, name_count: usize, out_entry_count: *usize) void;
 
 // ＝＝＝＝ 类注册 ＝＝＝＝
 
@@ -153,6 +155,15 @@ pub extern fn phpglue_register_class_with_constants(
     name: [*c]const u8, name_len: usize, methods: ?*anyopaque,
     const_count: c_int, const_keys: [*c]const [*c]const u8, const_key_lens: [*c]usize,
     const_vals: [*c]const ?*anyopaque, const_val_lens: [*c]usize, const_types: [*c]u8,
+) c_int;
+
+/// 注册类 + 常量 + 属性。prop_accesses[i]=ZEND_ACC_*，prop_types[i] 0=long 1=double 2=string 3=bool 4=null
+pub extern fn phpglue_register_class_full(
+    name: [*c]const u8, name_len: usize, methods: ?*anyopaque,
+    const_count: c_int, const_keys: [*c]const [*c]const u8, const_key_lens: [*c]usize,
+    const_vals: [*c]const ?*anyopaque, const_val_lens: [*c]usize, const_types: [*c]u8,
+    prop_count: c_int, prop_keys: [*c]const [*c]const u8, prop_key_lens: [*c]usize,
+    prop_vals: [*c]const ?*anyopaque, prop_val_lens: [*c]usize, prop_accesses: [*c]u32, prop_types: [*c]u8,
 ) c_int;
 
 // ＝＝＝＝ 模块常量注册 ＝＝＝＝

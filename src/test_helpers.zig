@@ -122,15 +122,14 @@ test "ConstantDesc.createBool" {
 
 test "ConstantDesc.createNull" {
     const c = mod.ConstantDesc.createNull("NONE");
-    _ = c.value.null_; // void variant, just ensure construction succeeds
+    _ = c.value.null_;
 }
 
-// ＝＝ Module() comptime：空配置合法 ＝＝
+// ＝＝ Module() comptime 验证 ＝＝
 
 test "Module() with minimal opts compiles" {
     const M = mod.Module(.{ .name = "test", .version = "0.0.0" });
     _ = M;
-    // 编译器确认该泛型实例化无误
 }
 
 test "ClassDesc.createWithConstants stores constants" {
@@ -174,6 +173,237 @@ test "Module() with all options compiles" {
             }),
         },
         .info_func = infoStub,
+    });
+    _ = M;
+}
+
+// ＝＝ v0.4.0：comptime 类型反射 ＝＝
+
+test "zigTypeToPhpType: i64 -> long, no allow_null" {
+    const ti = mod.zigTypeToPhpType(i64);
+    try std.testing.expectEqual(mod.ParamType.long, ti.pt);
+    try std.testing.expectEqual(false, ti.an);
+}
+
+test "zigTypeToPhpType: f64 -> double" {
+    const ti = mod.zigTypeToPhpType(f64);
+    try std.testing.expectEqual(mod.ParamType.double, ti.pt);
+}
+
+test "zigTypeToPhpType: bool -> bool" {
+    const ti = mod.zigTypeToPhpType(bool);
+    try std.testing.expectEqual(mod.ParamType.bool, ti.pt);
+}
+
+test "zigTypeToPhpType: []const u8 -> string" {
+    const ti = mod.zigTypeToPhpType([]const u8);
+    try std.testing.expectEqual(mod.ParamType.string, ti.pt);
+}
+
+test "zigTypeToPhpType: [:0]const u8 -> string" {
+    const ti = mod.zigTypeToPhpType([:0]const u8);
+    try std.testing.expectEqual(mod.ParamType.string, ti.pt);
+}
+
+test "zigTypeToPhpType: ?i64 -> long, allow_null" {
+    const ti = mod.zigTypeToPhpType(?i64);
+    try std.testing.expectEqual(mod.ParamType.long, ti.pt);
+    try std.testing.expectEqual(true, ti.an);
+}
+
+test "zigTypeToPhpType: ?[]const u8 -> string, allow_null" {
+    const ti = mod.zigTypeToPhpType(?[]const u8);
+    try std.testing.expectEqual(mod.ParamType.string, ti.pt);
+    try std.testing.expectEqual(true, ti.an);
+}
+
+test "zigTypeToPhpType: *Zval -> mixed" {
+    const ti = mod.zigTypeToPhpType(*php_types.Zval);
+    try std.testing.expectEqual(mod.ParamType.mixed, ti.pt);
+}
+
+test "ParamDesc.createTyped stores type and name" {
+    const p = mod.ParamDesc.createTyped("count", .long);
+    try std.testing.expectEqualStrings("count", p.name);
+    try std.testing.expectEqual(mod.ParamType.long, p.param_type);
+    try std.testing.expectEqual(false, p.allow_null);
+}
+
+test "FunctionDesc.createFrom with simple struct" {
+    const AddArgs = struct { a: i64, b: i64 };
+    const desc = mod.FunctionDesc.createFrom("add", @ptrCast(@alignCast(&dummyHandler)), AddArgs);
+    try std.testing.expectEqualStrings("add", desc.name);
+    try std.testing.expectEqual(@as(usize, 2), desc.params.len);
+    try std.testing.expectEqualStrings("a", desc.params[0].name);
+    try std.testing.expectEqual(mod.ParamType.long, desc.params[0].param_type);
+    try std.testing.expectEqualStrings("b", desc.params[1].name);
+    try std.testing.expectEqual(mod.ParamType.long, desc.params[1].param_type);
+}
+
+test "FunctionDesc.createFrom with mixed types" {
+    const Args = struct { name: []const u8, age: i64, ratio: f64, active: bool };
+    const desc = mod.FunctionDesc.createFrom("fn", @ptrCast(@alignCast(&dummyHandler)), Args);
+    try std.testing.expectEqual(@as(usize, 4), desc.params.len);
+    try std.testing.expectEqual(mod.ParamType.string, desc.params[0].param_type);
+    try std.testing.expectEqual(mod.ParamType.long,   desc.params[1].param_type);
+    try std.testing.expectEqual(mod.ParamType.double, desc.params[2].param_type);
+    try std.testing.expectEqual(mod.ParamType.bool,   desc.params[3].param_type);
+}
+
+test "FunctionDesc.createFrom with optional types" {
+    const Args = struct { name: []const u8, limit: ?i64 };
+    const desc = mod.FunctionDesc.createFrom("fn", @ptrCast(@alignCast(&dummyHandler)), Args);
+    try std.testing.expectEqual(@as(usize, 2), desc.params.len);
+    try std.testing.expectEqual(false, desc.params[0].allow_null);
+    try std.testing.expectEqual(true,  desc.params[1].allow_null);
+    try std.testing.expectEqual(mod.ParamType.long, desc.params[1].param_type);
+}
+
+test "FunctionDesc.createStaticFrom has marker" {
+    const Args = struct { x: i64 };
+    const desc = mod.FunctionDesc.createStaticFrom("m", @ptrCast(@alignCast(&dummyHandler)), Args);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), desc.flags);
+    try std.testing.expectEqual(@as(usize, 1), desc.params.len);
+}
+
+test "Module() with createFrom compiles" {
+    const AddArgs = struct { a: i64, b: i64 };
+    const M = mod.Module(.{
+        .name = "from",
+        .version = "0.1.0",
+        .functions = &.{
+            mod.FunctionDesc.createFrom("add", @ptrCast(@alignCast(&dummyHandler)), AddArgs),
+        },
+    });
+    _ = M;
+}
+
+// ＝＝ v0.5.0：类属性 / 构造器 / 继承 / 访问修饰符（声明式） ＝＝
+
+test "ClassPropertyDesc.createLong" {
+    const p = mod.ClassPropertyDesc.createLong("count", 42);
+    try std.testing.expectEqualStrings("count", p.name);
+    try std.testing.expectEqual(@as(c_long, 42), p.value.long);
+    try std.testing.expectEqual(@as(u32, 0), p.access);
+}
+
+test "ClassPropertyDesc.createString" {
+    const p = mod.ClassPropertyDesc.createString("label", "hello");
+    try std.testing.expectEqualStrings("label", p.name);
+    try std.testing.expectEqualStrings("hello", p.value.string);
+}
+
+test "ClassPropertyDesc.createDouble" {
+    const p = mod.ClassPropertyDesc.createDouble("pi", 3.14);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), p.value.double, 0.001);
+}
+
+test "ClassPropertyDesc.createBool" {
+    const p = mod.ClassPropertyDesc.createBool("active", true);
+    try std.testing.expectEqual(true, p.value.bool);
+}
+
+test "ClassPropertyDesc.createNull" {
+    const p = mod.ClassPropertyDesc.createNull("none");
+    _ = p.value.null_;
+}
+
+test "ClassPropertyDesc.makeStatic sets access=1" {
+    const p = mod.ClassPropertyDesc.createLong("x", 1).makeStatic();
+    try std.testing.expectEqual(@as(u32, 1), p.access);
+}
+
+test "ClassPropertyDesc.makeProtected sets access=2" {
+    const p = mod.ClassPropertyDesc.createLong("x", 1).makeProtected();
+    try std.testing.expectEqual(@as(u32, 2), p.access);
+}
+
+test "ClassPropertyDesc.makePrivate sets access=3" {
+    const p = mod.ClassPropertyDesc.createLong("x", 1).makePrivate();
+    try std.testing.expectEqual(@as(u32, 3), p.access);
+}
+
+test "ClassDesc.createWithProperties stores properties" {
+    const props = [_]mod.ClassPropertyDesc{mod.ClassPropertyDesc.createLong("val", 99)};
+    const cls = mod.ClassDesc.createWithProperties("MyClass", &.{}, &props);
+    try std.testing.expectEqual(@as(usize, 1), cls.properties.len);
+    try std.testing.expectEqualStrings("val", cls.properties[0].name);
+}
+
+test "FunctionDesc.createProtected has marker" {
+    const d = mod.FunctionDesc.createProtected("m", @ptrCast(@alignCast(&dummyHandler)));
+    try std.testing.expectEqual(@as(u32, 0xDEADBEF0), d.flags);
+}
+
+test "FunctionDesc.createPrivate has marker" {
+    const d = mod.FunctionDesc.createPrivate("m", @ptrCast(@alignCast(&dummyHandler)));
+    try std.testing.expectEqual(@as(u32, 0xDEADBEF1), d.flags);
+}
+
+test "Module() with properties and extends compiles" {
+    const M = mod.Module(.{
+        .name = "oop",
+        .version = "0.5.0",
+        .classes = &.{
+            mod.ClassDesc.createWithProperties("Bank", &.{
+                mod.FunctionDesc.create("__construct", @ptrCast(@alignCast(&dummyHandler))),
+                mod.FunctionDesc.createPrivate("secret", @ptrCast(@alignCast(&dummyHandler))),
+                mod.FunctionDesc.createProtected("prot", @ptrCast(@alignCast(&dummyHandler))),
+            }, &.{
+                mod.ClassPropertyDesc.createLong("balance", 0),
+                mod.ClassPropertyDesc.createBool("open", true).makeProtected(),
+                mod.ClassPropertyDesc.createNull("data"),
+            }),
+        },
+    });
+    _ = M;
+}
+
+// ＝＝ v0.5.0 补充：comptime struct 反射类属性 ＝＝
+
+test "createWithPropsFrom: long props" {
+    const Props = struct { balance: i64 = 0, maxval: i64 = 99 };
+    const cls = mod.ClassDesc.createWithPropsFrom("Test", &.{}, Props);
+    try std.testing.expectEqual(@as(usize, 2), cls.properties.len);
+    try std.testing.expectEqualStrings("balance", cls.properties[0].name);
+    try std.testing.expectEqual(@as(c_long, 0), cls.properties[0].value.long);
+    try std.testing.expectEqualStrings("maxval", cls.properties[1].name);
+    try std.testing.expectEqual(@as(c_long, 99), cls.properties[1].value.long);
+}
+
+test "createWithPropsFrom: bool props" {
+    const Props = struct { active: bool = true, closed: bool = false };
+    const cls = mod.ClassDesc.createWithPropsFrom("Test", &.{}, Props);
+    try std.testing.expectEqual(@as(usize, 2), cls.properties.len);
+    try std.testing.expectEqual(true, cls.properties[0].value.bool);
+    try std.testing.expectEqual(false, cls.properties[1].value.bool);
+}
+
+test "createWithPropsFrom: mixed types" {
+    const Props = struct { count: i64 = 0, rate: f64 = 0.05, label: []const u8 = "hello" };
+    const cls = mod.ClassDesc.createWithPropsFrom("Test", &.{}, Props);
+    try std.testing.expectEqual(@as(usize, 3), cls.properties.len);
+    try std.testing.expectEqual(@as(c_long, 0), cls.properties[0].value.long);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.05), cls.properties[1].value.double, 0.001);
+    try std.testing.expectEqualStrings("hello", cls.properties[2].value.string);
+}
+
+test "createWithPropsFrom: no default uses zero" {
+    const Props = struct { x: i64 };
+    const cls = mod.ClassDesc.createWithPropsFrom("Test", &.{}, Props);
+    try std.testing.expectEqual(@as(c_long, 0), cls.properties[0].value.long);
+}
+
+test "Module() with createWithPropsFrom compiles" {
+    const Props = struct { balance: i64 = 0, open: bool = true };
+    const M = mod.Module(.{
+        .name = "cpf",
+        .version = "0.5.0",
+        .classes = &.{
+            mod.ClassDesc.createWithPropsFrom("Bank", &.{
+                mod.FunctionDesc.create("get", @ptrCast(@alignCast(&dummyHandler))),
+            }, Props),
+        },
     });
     _ = M;
 }

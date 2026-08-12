@@ -1,9 +1,8 @@
-//! php-zig 示例扩展：hello
+//! php-zig v0.5.0 示例扩展：hello
 //!
-//! 演示能力：
-//! - 模块级函数、参数 arg_info、异常抛出、模块常量、类注册
-//! - P3: 数组迭代器 (hello_iterate)、对象属性 (hello_object)
-//! - P4: 数组 pop (hello_pop)、phpinfo() 回调
+//! 演示全部公开 API：函数注册（声明式+comptime 反射）、返回值、zval 类型判断/取值、
+//! arg_info 反射、异常、常量、PHP Facade、类注册（常量/属性/构造器/继承/访问修饰符）、
+//! 数组操作、迭代器、对象属性、生命周期钩子、phpinfo
 
 const std = @import("std");
 const phpzig = @import("phpzig");
@@ -26,7 +25,7 @@ fn helloName(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
 }
 
 fn version(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    phpzig.Return.returnString(return_value, "php-zig v0.1.0");
+    phpzig.Return.returnString(return_value, "php-zig v0.5.0");
 }
 
 fn addFn(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -197,6 +196,52 @@ fn helloReduce(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv
     phpzig.Return.returnLong(return_value, sum);
 }
 
+// ＝＝ v0.4.0: comptime struct 反射 arg_info ＝＝
+
+fn helloSum(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const a = phpzig.Return.callArg(execute_data, 1);
+    const b = phpzig.Return.callArg(execute_data, 2);
+    phpzig.Return.returnLong(return_value, a.toLong() + b.toLong());
+}
+
+const SumArgs = struct { a: i64, b: i64 };
+
+fn helloFormat(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const name = phpzig.Return.callArg(execute_data, 1);
+    const age = phpzig.Return.callArg(execute_data, 2);
+    const msg = std.fmt.allocPrint(std.heap.c_allocator, "{s} is {d} years old", .{ name.toStringVal(), age.toLong() }) catch { phpzig.Return.returnNull(return_value); return; };
+    phpzig.Return.returnString(return_value, msg);
+}
+
+const FormatArgs = struct { name: []const u8, age: i64 };
+
+// ＝＝ v0.5.0: OOP — 类属性 + 继承 + 构造器 + 访问修饰符 ＝＝
+
+fn bankGetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    _ = execute_data;
+    phpzig.Return.returnLong(return_value, 1000);
+}
+
+fn bankSetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    const val = phpzig.Return.callArg(execute_data, 1);
+    phpzig.Return.returnLong(return_value, val.toLong());
+}
+
+fn savingsInterest(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    _ = execute_data;
+    phpzig.Return.returnDouble(return_value, 0.05);
+}
+
+fn bankInternal(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void { phpzig.Return.returnNull(rv); }
+
+const BankProps = struct {
+    balance: i64 = 0,
+    open: bool = true,
+};
+
 // ＝＝ P4: phpinfo() 输出 ＝＝
 
 fn calcDummy(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void { phpzig.Return.returnNull(rv); }
@@ -236,6 +281,9 @@ const HelloModule = phpzig.Module(.{
         phpzig.FunctionDesc.create("hello_map", helloMap),
         phpzig.FunctionDesc.create("hello_filter", helloFilter),
         phpzig.FunctionDesc.create("hello_reduce", helloReduce),
+        // v0.4.0: comptime struct 反射 arg_info
+        phpzig.FunctionDesc.createFrom("hello_sum", helloSum, SumArgs),
+        phpzig.FunctionDesc.createFrom("hello_format", helloFormat, FormatArgs),
     },
     .minit = myMinit,
     .constants = &.{
@@ -249,12 +297,36 @@ const HelloModule = phpzig.Module(.{
         phpzig.ClassDesc.create("Calculator", &.{
             phpzig.FunctionDesc.createStaticWithParams("add", calcAdd, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
             phpzig.FunctionDesc.createStatic("multiply", calcMultiply),
+            // v0.4.0: comptime struct 反射静态方法
+            phpzig.FunctionDesc.createStaticFrom("subtract", calcSubtract, SumArgs),
         }),
         phpzig.ClassDesc.createWithConstants("CalcConst", &.{
             phpzig.FunctionDesc.createStatic("dummy", calcDummy),
         }, &.{
             phpzig.ClassConstantDesc.createLong("PI", 3),
             phpzig.ClassConstantDesc.createString("NAME", "Calculator"),
+        }),
+        // v0.5.0: comptime struct 反射类属性
+        phpzig.ClassDesc.createWithPropsFrom("BankAccount", &.{
+            phpzig.FunctionDesc.create("__construct", bankSetBalance),
+            phpzig.FunctionDesc.createProtected("getBalance", bankGetBalance),
+            phpzig.FunctionDesc.createPrivate("internal", bankInternal),
+        }, BankProps),
+        // v0.5.0: 声明式类属性（传统 API 保留）
+        phpzig.ClassDesc.createWithProperties("ManualProps", &.{
+            phpzig.FunctionDesc.create("get", bankGetBalance),
+        }, &.{
+            phpzig.ClassPropertyDesc.createLong("score", 100),
+            phpzig.ClassPropertyDesc.createString("label", "ok").makeProtected(),
+            phpzig.ClassPropertyDesc.createNull("data"),
+        }),
+        // v0.5.0: 继承
+        phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
+            phpzig.FunctionDesc.create("interest", savingsInterest),
+        }),
+        // v0.5.0: 继承
+        phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
+            phpzig.FunctionDesc.create("interest", savingsInterest),
         }),
     },
     .info_func = helloInfo,
@@ -272,6 +344,13 @@ fn calcMultiply(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callcon
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
     phpzig.Return.returnLong(return_value, (if (a.isLong()) a.toLong() else @as(c_long, 0)) * (if (b.isLong()) b.toLong() else @as(c_long, 0)));
+}
+
+fn calcSubtract(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const a = phpzig.Return.callArg(execute_data, 1);
+    const b = phpzig.Return.callArg(execute_data, 2);
+    phpzig.Return.returnLong(return_value, a.toLong() - b.toLong());
 }
 
 comptime { @export(&HelloModule.get_module, .{ .name = "get_module" }); }

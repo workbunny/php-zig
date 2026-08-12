@@ -198,6 +198,15 @@ zval    *phpglue_call_arg(zend_execute_data *execute_data, uint32_t n);
 const void *phpglue_get_empty_arg_info(void);
 void phpglue_fill_arg_info(void *dst, uint32_t required_count, const char **names, size_t name_count, size_t *out_entry_count);
 
+/* 类型化版本 — 每个参数带 PHP 类型标注。
+ * types[i] 含义：
+ *   0 = mixed（无类型提示），1 = long，2 = double，
+ *   3 = string，4 = bool，5 = array，6 = object
+ * allow_null[i]：非零表示 ?Type（nullable）  */
+void phpglue_fill_arg_info_typed(void *dst, uint32_t required_count,
+    const char **names, const uint8_t *types, const uint8_t *allow_null,
+    size_t name_count, size_t *out_entry_count);
+
 /* ================================================================
  * 模块常量注册
  * ================================================================ */
@@ -226,6 +235,13 @@ zend_class_entry *phpglue_lookup_class(const char *name, size_t name_len);
 int phpglue_register_class_with_constants(const char *name, size_t name_len, const zend_function_entry *methods,
     int const_count, const char **const_keys, size_t *const_key_lens,
     const void **const_vals, size_t *const_val_lens, uint8_t *const_types);
+
+/** 注册类并添加常量和属性。accesses[i] 为 ZEND_ACC_* 组合，prop_types[i] 0=long 1=double 2=string 3=bool 4=null。 */
+int phpglue_register_class_full(const char *name, size_t name_len, const zend_function_entry *methods,
+    int const_count, const char **const_keys, size_t *const_key_lens,
+    const void **const_vals, size_t *const_val_lens, uint8_t *const_types,
+    int prop_count, const char **prop_keys, size_t *prop_key_lens,
+    const void **prop_vals, size_t *prop_val_lens, uint32_t *prop_accesses, uint8_t *prop_types);
 
 /* ================================================================
  * PHP 函数调用（Facade）

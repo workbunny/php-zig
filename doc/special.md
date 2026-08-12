@@ -246,3 +246,102 @@ PHP 8.4 中 `zend_read_property(NULL, ...)` 和 `zend_update_property(NULL, ...)
 - **写属性**：`zend_update_property(Z_OBJCE_P(obj), Z_OBJ_P(obj), name, len, val)`——scope 设为对象所属的类。
 - **读属性**：改用 `zend_hash_find(obj->properties, zend_string*)` 直接查找 HashTable，绕过 `zend_read_property` 的 scope 校验。因为 `object_init` 创建的 stdClass 的 `properties` 是一个普通 HashTable，不需要复杂的继承链查找。
 - **创建对象**：用 `object_init(zv)` 替代 `call_user_function("stdClass", ...)`。前者直接分配 zend_object，后者需要函数表查找和调用栈开销，且在模块加载早期可能尚未注册。
+
+## 类属性声明：`zend_declare_property` 而非 `_ex` 版本
+
+### 问题
+
+类属性声明需要设置默认值。PHP 提供 `zend_declare_property`（接收 `char*/size_t` 对）和 `zend_declare_property_ex`（接收 `zend_string*`）。与类常量类似，属性声明必须在 `zend_register_internal_class` **之后**调用——`ce` 在注册前是临时变量，`properties` 表未初始化。
+
+### 解决方案
+
+统一使用 `zend_declare_property`（非 `_ex` 版本）在已注册的 `ce_ptr` 上声明。5 种默认值类型：
+
+```c
+ZVAL_LONG(&zv, val);       // long
+ZVAL_DOUBLE(&zv, val);     // double
+ZVAL_STRINGL(&zv, s, l);   // string
+ZVAL_BOOL(&zv, val);       // bool
+ZVAL_NULL(&zv);            // null
+zend_declare_property(ce_ptr, name, name_len, &zv, ZEND_ACC_PUBLIC);
+```
+
+访问修饰符通过 `access` 参数传递：`ZEND_ACC_PUBLIC | ZEND_ACC_PROTECTED | ZEND_ACC_PRIVATE | ZEND_ACC_STATIC`。
+
+**时序**：先 `zend_register_internal_class` → 再 `zend_declare_class_constant`（类常量） → 再 `zend_declare_property`（类属性）。三者顺序不可颠倒。
+
+## 类继承时父类查找：CG(class_table) 键小写
+
+### 问题
+
+PHP 内部 `CG(class_table)` 中所有类名以**小写**存储为 `zend_string` 键。若用原始类名（如 `"BankAccount"`）查找，哈希不匹配，`zend_hash_str_find_ptr` 返回 NULL。
+
+### 解决方案
+
+```c
+// 错误：直接用原始类名查找
+zend_hash_str_find_ptr(CG(class_table), "BankAccount", 11); // → NULL
+
+// 正确：先转为小写再查找
+char buf[128];
+for (size_t i = 0; i < len; i++) buf[i] = tolower(name[i]);
+zend_hash_str_find_ptr(CG(class_table), buf, len); // → 找到
+```
+
+**注意**：PHP 8.4 的 `zend_lookup_class` 可能在该场景（MINIT 中查找刚刚注册的类）下触发异常或行为异常，直接查 HashTable 更可靠。
+
+## `zend_function_entry` flags 的 ZEND_ACC_PROTECTED/PRIVATE
+
+### 问题
+
+`zend_function_entry.flags` 需设置为 `ZEND_ACC_PUBLIC | ZEND_ACC_PROTECTED` 等组合才能正确反映方法可见性。与 ZEND_ACC_PUBLIC 一样，PROTECTED 和 PRIVATE 的位值也随 PHP 版本变化，不能硬编码。
+
+### 解决方案
+
+C glue 已预提供 `phpglue_acc_protected()` 和 `phpglue_acc_private()`（与 `phpglue_acc_public()` 同模式）。Zig 侧使用哨兵标记（`0xDEADBEF0`/`0xDEADBEF1`），`resolveFlags` 运行时转为真实值。
+
+```c
+// C glue（已存在）
+uint32_t phpglue_acc_protected(void) { return ZEND_ACC_PROTECTED; }
+uint32_t phpglue_acc_private(void)   { return ZEND_ACC_PRIVATE; }
+```
+
+## 类属性声明：使用高层 API 避免 zval 生命周期陷阱
+
+### 问题
+
+用 `zend_declare_property(ce_ptr, name, name_len, &zv, access)` 手动构造 zval 再注册属性时，zval 的内存管理极度脆弱：
+
+- `ZVAL_STRINGL(&zv, val, len)` 分配堆上的 zend_string
+- `zend_declare_property` 内部 `ZVAL_COPY_OR_DUP` 可能 copy 也可能 dup 引用
+- 调用方无法确定需要 dtor 还是保留，无论 `zval_ptr_dtor` 调用与否都会在 PHP shutdown 时导致 segfault（或内存泄漏）
+
+### 解决方案
+
+直接使用 Zend 高层 API，每种类型对应一个函数，内部正确处理生命周期：
+
+```c
+zend_declare_property_long(ce_ptr,   name, nlen, val, access);
+zend_declare_property_double(ce_ptr, name, nlen, val, access);
+zend_declare_property_stringl(ce_ptr, name, nlen, val, vlen, access);
+zend_declare_property_bool(ce_ptr,   name, nlen, val, access);
+zend_declare_property_null(ce_ptr,   name, nlen, access);
+```
+
+这些函数全部为 `void` 返回，内部自管理所有 zval/zend_string 生命周期，shutdown 时 PHP 统一清理。
+
+## 类继承父类查找：CG(class_table) 小写键
+
+### 问题
+
+PHP 内部 `CG(class_table)` 中所有类名以**小写** zend_string 存储。`zend_hash_str_find_ptr` 直接用原始大小写名称查找 → NULL。
+
+### 解决方案
+
+```c
+char buf[128];
+for (size_t i = 0; i < len; i++) buf[i] = tolower(name[i]);
+zend_hash_str_find_ptr(CG(class_table), buf, len);
+```
+
+`zend_lookup_class` 在 MINIT 阶段行为不稳定，直接操作 HashTable 更可靠。

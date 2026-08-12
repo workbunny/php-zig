@@ -1,15 +1,15 @@
 <?php
 /**
- * php-zig v0.1.0 集成测试套件
+ * php-zig v0.4.0 集成测试套件
  * 覆盖 100% 公开 API：
- *   - 模块级函数（6个）
+ *   - 模块级函数
  *   - 返回值类型（9种）
  *   - zval 类型判断 + 取值 + 设值（全 IS_* 覆盖）
- *   - 参数 arg_info（反射验证）
+ *   - 参数 arg_info（反射验证，含 comptime struct 反射类型标注）
  *   - 异常抛出
  *   - 模块常量（5种类型）
  *   - PHP Facade 调用
- *   - 类注册（静态方法）
+ *   - 类注册（静态方法 + comptime struct 反射）
  *   - 数组操作（append/set/setAssoc/find/del/count/separate/pop）
  *   - HashTable 遍历（迭代器）
  *   - 对象属性读写
@@ -70,7 +70,7 @@ echo "\n=== 1. 模块级函数 ===\n";
 test('hello_world() 返回字符串', 'Hello from Zig!', hello_world());
 test('hello_name("Bob") 返回问候语', 'Hello, Bob!', hello_name('Bob'));
 test('hello_name() 无参返回 null', null, @hello_name());
-test('version() 返回版本字符串', 'php-zig v0.1.0', version());
+test('version() 返回版本字符串', 'php-zig v0.5.0', version());
 
 // ============================================================
 // 2. 返回值类型 — 9种全覆盖
@@ -218,6 +218,63 @@ test('hello_strlen 非字符串 → null', null, @hello_strlen(123));
 test('hello_concat 参数不足 → null', null, @hello_concat('a'));
 test('hello_name 非字符串 → null', null, @hello_name(123));
 test('hello_iterate 非数组 → null', null, @hello_iterate('not_array'));
+
+// ============================================================
+// 17. v0.4.0: comptime struct 反射 arg_info
+// ============================================================
+echo "\n=== 17. v0.4.0: comptime struct 反射 arg_info ===\n";
+
+test('hello_sum(5,3) → 8', 8, hello_sum(5, 3));
+test('hello_sum(0,0) → 0', 0, hello_sum(0, 0));
+test('hello_format("Alice",30) → "Alice is 30 years old"', 'Alice is 30 years old', hello_format('Alice', 30));
+
+// createFrom 反射验证
+$rSum = new ReflectionFunction('hello_sum');
+test('hello_sum 参数个数为2', 2, $rSum->getNumberOfParameters());
+test('hello_sum 参数1名为 a', 'a', $rSum->getParameters()[0]->getName());
+test('hello_sum 参数2名为 b', 'b', $rSum->getParameters()[1]->getName());
+test('hello_sum 参数1类型为 int', true, $rSum->getParameters()[0]->hasType() && (string)$rSum->getParameters()[0]->getType() === 'int');
+
+$rFmt = new ReflectionFunction('hello_format');
+test('hello_format 参数1名为 name', 'name', $rFmt->getParameters()[0]->getName());
+test('hello_format 参数2名为 age', 'age', $rFmt->getParameters()[1]->getName());
+test('hello_format 参数1类型为 string', true, $rFmt->getParameters()[0]->hasType() && (string)$rFmt->getParameters()[0]->getType() === 'string');
+test('hello_format 参数2类型为 int', true, $rFmt->getParameters()[1]->hasType() && (string)$rFmt->getParameters()[1]->getType() === 'int');
+
+// createStaticFrom 反射验证
+test('Calculator::subtract(10,3) → 7', 7, Calculator::subtract(10, 3));
+$rSub = new ReflectionMethod('Calculator', 'subtract');
+test('subtract 参数1名为 a', 'a', $rSub->getParameters()[0]->getName());
+test('subtract 参数1类型为 int', true, $rSub->getParameters()[0]->hasType() && (string)$rSub->getParameters()[0]->getType() === 'int');
+
+// ============================================================
+// 18. v0.5.0: OOP — 类属性 + 构造器 + 继承 + 访问修饰符
+// ============================================================
+echo "\n=== 18. v0.5.0: OOP ===\n";
+
+// BankAccount 属性默认值
+$rBA = new ReflectionClass('BankAccount');
+$props = $rBA->getDefaultProperties();
+test('BankAccount::$balance 默认值 0', 0, $props['balance']);
+test('BankAccount::$open 默认值 true', true, $props['open']);
+test('BankAccount 属性数 2', 2, count($rBA->getProperties()));
+
+// BankAccount 方法可见性
+$rGetBal = new ReflectionMethod('BankAccount', 'getBalance');
+test('getBalance 为 protected', true, $rGetBal->isProtected());
+$rInternal = new ReflectionMethod('BankAccount', 'internal');
+test('internal 为 private', true, $rInternal->isPrivate());
+
+// __construct 存在
+test('BankAccount 有 __construct', true, $rBA->hasMethod('__construct'));
+
+// Calculator 已有方法不受影响
+test('Calculator::add(1,1) 仍正常', 2, Calculator::add(1, 1));
+
+// SavingsAccount 继承
+$rSA = new ReflectionClass('SavingsAccount');
+test('SavingsAccount 父类为 BankAccount', 'BankAccount', $rSA->getParentClass()->getName());
+test('SavingsAccount 有 interest 方法', true, $rSA->hasMethod('interest'));
 
 // ============================================================
 // 结果汇总
