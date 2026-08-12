@@ -164,6 +164,23 @@ c.phpglue_zval_set_stringl(&zv, "hello", 5);
 c.phpglue_zval_set_bool(&zv, true);
 ```
 
+### zval 比较
+
+```zig
+const a = phpzig.Return.callArg(execute_data, 1);
+const b = phpzig.Return.callArg(execute_data, 2);
+
+if (a.eql(b)) { /* 按 PHP 类型值比较相等 */ }
+if (a.neq(b)) { /* 不等 */ }
+```
+
+### zval 到数组
+
+```zig
+const arg = phpzig.Return.callArg(execute_data, 1);
+const arr = arg.toArray() orelse { phpzig.Return.returnNull(return_value); return; };
+```
+
 ### 异常抛出
 
 ```zig
@@ -233,8 +250,14 @@ const M = phpzig.Module(.{
     .name = "myext",
     .version = "1.0.0",
     .classes = &.{
+        // 静态方法
         phpzig.ClassDesc.create("Calculator", &.{
             phpzig.FunctionDesc.createStatic("add", calcAdd),
+        }),
+        // 含类常量的类
+        phpzig.ClassDesc.createWithConstants("MathConst", &.{}, &.{
+            phpzig.ClassConstantDesc.createLong("PI", 3),
+            phpzig.ClassConstantDesc.createString("NAME", "Math"),
         }),
     },
     // ...
@@ -244,7 +267,8 @@ const M = phpzig.Module(.{
 ### 数组操作
 
 ```zig
-var arr = phpzig.Array.init();
+var zv: T.Zval = undefined;
+var arr = phpzig.Array.init(&zv);
 
 // 追加
 arr.appendLong(1);
@@ -253,14 +277,12 @@ arr.appendBool(true);
 
 // 按索引设值
 arr.setLong(0, 99);
-arr.setString(0, "updated");
 
 // 按键设值（关联数组）
 arr.setAssocLong("key", 42);
-arr.setAssocString("name", "value");
 
 // 查询
-if (arr.find("key")) |zv| { ... }
+if (arr.find("key")) |zv2| { ... }
 if (arr.exists("key")) { ... }
 
 // 删除
@@ -281,14 +303,53 @@ while (iter.next()) {
 const n: u32 = arr.count();
 ```
 
-### 对象属性读写
+### 数组算法（filter / map / reduce）
 
 ```zig
-var obj: T.Zval = undefined;
-phpzig.PhpFunc.call0("stdClass", &obj);
+var src_zv: T.Zval = undefined;
+var src = phpzig.Array.init(&src_zv);
+src.appendLong(1); src.appendLong(2); src.appendLong(3); src.appendLong(4);
 
-phpzig.Object.writeProperty(&obj, "name", &value_zval);
-if (phpzig.Object.readProperty(&obj, "name")) |prop| { ... }
+// filter — 输出到调用者提供的 zval
+var filtered_zv: T.Zval = undefined;
+src.filterInto(&filtered_zv, struct {
+    fn even(v: phpzig.Zval) bool { return v.toLong() % 2 == 0; }
+}.even);
+
+// map — 每个元素 ×2
+var mapped_zv: T.Zval = undefined;
+src.mapInto(&mapped_zv, c_long, struct {
+    fn double(v: phpzig.Zval) c_long { return v.toLong() * 2; }
+}.double);
+
+// reduce — 求和
+const sum = src.reduce(c_long, 0, struct {
+    fn add(acc: c_long, v: phpzig.Zval) c_long { return acc + v.toLong(); }
+}.add);
+```
+
+### 对象操作
+
+```zig
+// 创建对象
+var obj: T.Zval = undefined;
+phpzig.Object.createStdClass(&obj);
+
+// 写入属性
+var zv_name: T.Zval = undefined;
+c.phpglue_zval_set_stringl(&zv_name, "php-zig", 7);
+phpzig.Object.writeProperty(&obj, "name", &zv_name);
+
+// 读取属性（zend_hash_find 直读 HashTable）
+if (phpzig.Object.readProperty(&obj, "name")) |prop| {
+    const val = prop.toStringVal();
+}
+
+// 调用方法
+var retval: T.Zval = undefined;
+if (phpzig.Object.call(&obj, "someMethod", &retval, &.{})) {
+    // 处理返回值
+}
 ```
 
 ### 资源类型

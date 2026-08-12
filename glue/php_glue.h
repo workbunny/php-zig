@@ -159,6 +159,8 @@ int    phpglue_array_pop(zval *zv, zval *retval);
 
 zval *phpglue_object_read_property(zval *obj, const char *name, size_t name_len);
 void  phpglue_object_write_property(zval *obj, const char *name, size_t name_len, zval *val);
+/** 创建 stdClass 对象，存入 zv */
+void  phpglue_object_create_stdclass(zval *zv);
 
 /* ================================================================
  * 资源类型
@@ -220,10 +222,10 @@ int phpglue_register_class(const char *name, size_t name_len, const zend_functio
 int phpglue_register_class_ex(const char *name, size_t name_len, const zend_function_entry *methods, zend_class_entry *parent);
 zend_class_entry *phpglue_lookup_class(const char *name, size_t name_len);
 
-/** 向已注册的类添加 long 常量 */
-void phpglue_declare_class_constant_long(zend_class_entry *ce, const char *name, size_t name_len, zend_long val);
-/** 向已注册的类添加 string 常量 */
-void phpglue_declare_class_constant_string(zend_class_entry *ce, const char *name, size_t name_len, const char *val, size_t val_len);
+/** 注册类并添加常量。count 为常量个数，keys/vals 同为 arrays 长度为 count。type_ids[i]=0 表示 long，1 表示 string。 */
+int phpglue_register_class_with_constants(const char *name, size_t name_len, const zend_function_entry *methods,
+    int const_count, const char **const_keys, size_t *const_key_lens,
+    const void **const_vals, size_t *const_val_lens, uint8_t *const_types);
 
 /* ================================================================
  * PHP 函数调用（Facade）

@@ -113,7 +113,10 @@ int phpglue_hash_index_del(zend_array *ht, zend_ulong idx) { return zend_hash_in
 
 void phpglue_hash_internal_pointer_reset(zend_array *ht) { zend_hash_internal_pointer_reset(ht); }
 int  phpglue_hash_move_forward(zend_array *ht)           { return zend_hash_move_forward(ht); }
-zval *phpglue_hash_get_current_data(zend_array *ht)      { return zend_hash_get_current_data(ht); }
+zval *phpglue_hash_get_current_data(zend_array *ht)      {
+    if (zend_hash_num_elements(ht) == 0) return NULL;
+    return zend_hash_get_current_data(ht);
+}
 int phpglue_hash_get_current_key_ex(zend_array *ht, zend_string **str_index, zend_ulong *num_index) {
     return zend_hash_get_current_key(ht, str_index, num_index);
 }
@@ -136,13 +139,20 @@ int phpglue_array_pop(zval *zv, zval *retval) {
  * ================================================================ */
 
 zval *phpglue_object_read_property(zval *obj, const char *name, size_t name_len) {
-    /* zend_read_property 可能将结果写入调用者的 rv，直接返回该指针。 */
-    zval *result = zend_read_property(NULL, Z_OBJ_P(obj), name, name_len, 1, NULL);
+    zend_object *zobj = Z_OBJ_P(obj);
+    if (zobj == NULL || zobj->properties == NULL) return NULL;
+    zend_string *key = zend_string_init(name, name_len, 0);
+    zval *result = zend_hash_find(zobj->properties, key);
+    zend_string_release(key);
     return result;
 }
 
 void phpglue_object_write_property(zval *obj, const char *name, size_t name_len, zval *val) {
-    zend_update_property(NULL, Z_OBJ_P(obj), name, name_len, val);
+    zend_update_property(Z_OBJCE_P(obj), Z_OBJ_P(obj), name, name_len, val);
+}
+
+void phpglue_object_create_stdclass(zval *zv) {
+    object_init(zv);
 }
 
 /* ================================================================
@@ -259,18 +269,27 @@ zend_class_entry *phpglue_lookup_class(const char *name, size_t n) { return zend
 
 /* — 类常量 — */
 
-void phpglue_declare_class_constant_long(zend_class_entry *ce, const char *name, size_t name_len, zend_long val) {
-    zval zval_val;
-    ZVAL_LONG(&zval_val, val);
-    zend_declare_class_constant_ex(ce, name, name_len, &zval_val, ZEND_ACC_PUBLIC, NULL);
-    zval_ptr_dtor(&zval_val);
-}
+int phpglue_register_class_with_constants(const char *name, size_t name_len, const zend_function_entry *methods,
+    int const_count, const char **const_keys, size_t *const_key_lens,
+    const void **const_vals, size_t *const_val_lens, uint8_t *const_types)
+{
+    zend_class_entry ce;
+    INIT_CLASS_ENTRY_EX(ce, name, name_len, methods);
+    zend_class_entry *ce_ptr = zend_register_internal_class(&ce);
+    if (ce_ptr == NULL) return 0;
 
-void phpglue_declare_class_constant_string(zend_class_entry *ce, const char *name, size_t name_len, const char *val, size_t val_len) {
-    zval zval_val;
-    ZVAL_STRINGL(&zval_val, val, val_len);
-    zend_declare_class_constant_ex(ce, name, name_len, &zval_val, ZEND_ACC_PUBLIC, NULL);
-    zval_ptr_dtor(&zval_val);
+    // 在已注册的类上追加常量（匹配 PHPX Class::addConstant 流程）
+    for (int i = 0; i < const_count; i++) {
+        zval zv;
+        if (const_types[i] == 0) {
+            ZVAL_LONG(&zv, *(const zend_long *)const_vals[i]);
+        } else {
+            ZVAL_STRINGL(&zv, (const char *)const_vals[i], const_val_lens[i]);
+        }
+        zend_declare_class_constant(ce_ptr, const_keys[i], const_key_lens[i], &zv);
+        zval_ptr_dtor(&zv);
+    }
+    return 1;
 }
 
 /* ================================================================

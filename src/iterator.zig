@@ -14,8 +14,13 @@ pub const Iterator = struct {
     ht: *T.ZendArray,
 
     /// 从 Array 构造迭代器（重置指针到开头）
+    ///
+    /// 空数组不做 reset——zend_hash_internal_pointer_reset 会置 pInternalPointer=NULL，
+    /// 后续调用 zend_hash_move_forward 时 PHP 内部路径会越界。
     pub fn init(ht: *T.ZendArray) Iterator {
-        c.phpglue_hash_internal_pointer_reset(ht);
+        if (c.phpglue_hash_num_elements(ht) > 0) {
+            c.phpglue_hash_internal_pointer_reset(ht);
+        }
         return .{ .ht = ht };
     }
 

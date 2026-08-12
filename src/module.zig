@@ -312,6 +312,38 @@ pub fn Module(comptime opts: struct {
         fn rinitPtr()     ?T.ModuleLifecycleFn { return if (opts.rinit) |_| &phpzigRinit else null; }
         fn rshutdownPtr() ?T.ModuleLifecycleFn { return if (opts.rshutdown) |_| &phpzigRshutdown else null; }
 
+        fn registerClassWithConstants(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
+            const k = cls.class_constants.len;
+            if (k > 8) @panic("max 8 class constants");
+            var keys: [8][*c]const u8 = undefined;
+            var kls: [8]usize = undefined;
+            var vals: [8]?*anyopaque = undefined;
+            var vls: [8]usize = undefined;
+            var types: [8]u8 = undefined;
+            var ls_buf: [8]T.zend_long = undefined;
+            inline for (cls.class_constants, 0..) |cnst, j| {
+                keys[j] = cnst.name.ptr;
+                kls[j] = cnst.name.len;
+                switch (cnst.value) {
+                    .long => |v| {
+                        ls_buf[j] = v;
+                        vals[j] = @ptrCast(&ls_buf[j]);
+                        vls[j] = 0;
+                        types[j] = 0;
+                    },
+                    .string => |v| {
+                        vals[j] = @ptrCast(@constCast(v.ptr));
+                        vls[j] = v.len;
+                        types[j] = 1;
+                    },
+                }
+            }
+            return c.phpglue_register_class_with_constants(
+                cls.name.ptr, cls.name.len, methods_ptr,
+                @intCast(k), &keys, &kls, &vals, &vls, &types,
+            );
+        }
+
         fn phpzigMinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
             inline for (opts.constants) |cnst| {
                 switch (cnst.value) {
@@ -324,21 +356,15 @@ pub fn Module(comptime opts: struct {
             }
             initClassMethodEntries();
             inline for (opts.classes, 0..) |cls, i| {
-                const result = if (cls.parent_name) |parent_name|
+                const result: c_int = if (cls.class_constants.len > 0)
+                    registerClassWithConstants(cls, class_method_ptrs[i])
+                else if (cls.parent_name) |parent_name|
                     c.phpglue_register_class_ex(cls.name.ptr, cls.name.len, class_method_ptrs[i],
                         c.phpglue_lookup_class(parent_name.ptr, parent_name.len) orelse return -1)
                 else
                     c.phpglue_register_class(cls.name.ptr, cls.name.len, class_method_ptrs[i]);
-                if (result == 0) return -1;
 
-                // 注册类常量
-                const ce = c.phpglue_lookup_class(cls.name.ptr, cls.name.len) orelse return -1;
-                inline for (cls.class_constants) |cnst| {
-                    switch (cnst.value) {
-                        .long   => |v| c.phpglue_declare_class_constant_long(ce, cnst.name.ptr, cnst.name.len, v),
-                        .string => |v| c.phpglue_declare_class_constant_string(ce, cnst.name.ptr, cnst.name.len, v.ptr, v.len),
-                    }
-                }
+                if (result == 0) return -1;
             }
             if (opts.minit) |user_minit| return user_minit(type_, module_number);
             return 0;

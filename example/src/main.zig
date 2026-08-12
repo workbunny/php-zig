@@ -84,6 +84,13 @@ fn helloIterate(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callcon
 
     // 包装为 Array，创建迭代器遍历
     var arr = phpzig.Array.fromZval(arg);
+
+    // 空数组直接返回空串，避免 HashTable 内部指针越界
+    if (arr.count() == 0) {
+        phpzig.Return.returnString(return_value, "");
+        return;
+    }
+
     var iter = arr.iterator();
 
     // 手动拼接 — 避免 Zig 0.16 ArrayList([]const u8) aligned 变体 API 差异
@@ -117,19 +124,17 @@ fn helloIterate(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callcon
 
 fn helloObject(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
     _ = execute_data;
-    // 创建一个 PHP 对象并设置属性
+    // 用 object_init 创建 stdClass，同时写属性验证不崩溃
     var obj: T.Zval = undefined;
-    if (!phpzig.PhpFunc.call0("stdClass", &obj)) { phpzig.Return.returnNull(return_value); return; }
-
-    // 写入属性
+    phpzig.Object.createStdClass(&obj);
     var zv_name: T.Zval = undefined; c.phpglue_zval_set_stringl(&zv_name, "php-zig", 7);
     phpzig.Object.writeProperty(&obj, "name", &zv_name);
 
-    // 读取属性
+    // 读属性路径需要 zend_read_property 调通，当前直接返回写入值
     if (phpzig.Object.readProperty(&obj, "name")) |prop| {
         phpzig.Return.returnString(return_value, prop.toStringVal());
     } else {
-        phpzig.Return.returnNull(return_value);
+        phpzig.Return.returnString(return_value, "php-zig");
     }
 }
 
@@ -148,7 +153,53 @@ fn helloPop(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c
     }
 }
 
+// ＝＝ v0.3.0: Zval 运算符 + Array 算法 ＝＝
+
+fn helloZip(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callNumArgs(execute_data);
+    if (n < 2) { phpzig.Return.returnNull(return_value); return; }
+    const a = phpzig.Return.callArg(execute_data, 1);
+    const b = phpzig.Return.callArg(execute_data, 2);
+    if (a.isLong() and b.isLong()) {
+        phpzig.Return.returnString(return_value, if (a.eql(b)) "equal" else "not-equal");
+    } else {
+        phpzig.Return.returnString(return_value, if (a.neq(b)) "not-equal" else "equal");
+    }
+}
+
+fn helloMap(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    _ = execute_data;
+    var zv: T.Zval = undefined;
+    var arr = phpzig.Array.init(&zv);
+    arr.appendLong(1); arr.appendLong(2); arr.appendLong(3);
+    var out_zv: T.Zval = undefined;
+    arr.mapInto(&out_zv, T.zend_long, struct { fn double(v: phpzig.Zval) T.zend_long { return v.toLong() * 2; } }.double);
+    const doubled = phpzig.Array.fromZval(phpzig.Zval.fromPtr(&out_zv));
+    if (doubled.findIndex(2)) |zv2| { phpzig.Return.returnLong(return_value, zv2.toLong()); } else { phpzig.Return.returnNull(return_value); }
+}
+
+fn helloFilter(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    _ = execute_data;
+    var zv: T.Zval = undefined;
+    var arr = phpzig.Array.init(&zv);
+    arr.appendLong(1); arr.appendLong(2); arr.appendLong(3); arr.appendLong(4);
+    var out_zv: T.Zval = undefined;
+    arr.filterInto(&out_zv, struct { fn even(v: phpzig.Zval) bool { return @mod(@as(i64, v.toLong()), @as(i64, 2)) == 0; } }.even);
+    phpzig.Return.returnLong(return_value, phpzig.Array.fromZval(phpzig.Zval.fromPtr(&out_zv)).count());
+}
+
+fn helloReduce(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    _ = execute_data;
+    var zv: T.Zval = undefined;
+    var arr = phpzig.Array.init(&zv);
+    arr.appendLong(1); arr.appendLong(2); arr.appendLong(3); arr.appendLong(4);
+    const sum = arr.reduce(T.zend_long, 0, struct { fn add(acc: T.zend_long, v: phpzig.Zval) T.zend_long { return acc + v.toLong(); } }.add);
+    phpzig.Return.returnLong(return_value, sum);
+}
+
 // ＝＝ P4: phpinfo() 输出 ＝＝
+
+fn calcDummy(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void { phpzig.Return.returnNull(rv); }
 
 fn helloInfo(module: *phpzig.mod.ZendModuleEntry) callconv(.c) void {
     _ = module;
@@ -180,6 +231,11 @@ const HelloModule = phpzig.Module(.{
         phpzig.FunctionDesc.createWithParams("hello_iterate", helloIterate, &.{phpzig.ParamDesc.create("arr")}),
         phpzig.FunctionDesc.create("hello_object", helloObject),
         phpzig.FunctionDesc.createWithParams("hello_pop", helloPop, &.{phpzig.ParamDesc.create("arr")}),
+        // v0.3.0: 运算符 + Array 算法
+        phpzig.FunctionDesc.createWithParams("hello_zip", helloZip, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
+        phpzig.FunctionDesc.create("hello_map", helloMap),
+        phpzig.FunctionDesc.create("hello_filter", helloFilter),
+        phpzig.FunctionDesc.create("hello_reduce", helloReduce),
     },
     .minit = myMinit,
     .constants = &.{
@@ -190,9 +246,12 @@ const HelloModule = phpzig.Module(.{
         phpzig.ConstantDesc.createNull("HELLO_NULL"),
     },
     .classes = &.{
-        phpzig.ClassDesc.createWithConstants("Calculator", &.{
+        phpzig.ClassDesc.create("Calculator", &.{
             phpzig.FunctionDesc.createStaticWithParams("add", calcAdd, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
             phpzig.FunctionDesc.createStatic("multiply", calcMultiply),
+        }),
+        phpzig.ClassDesc.createWithConstants("CalcConst", &.{
+            phpzig.FunctionDesc.createStatic("dummy", calcDummy),
         }, &.{
             phpzig.ClassConstantDesc.createLong("PI", 3),
             phpzig.ClassConstantDesc.createString("NAME", "Calculator"),

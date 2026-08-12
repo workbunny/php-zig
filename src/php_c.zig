@@ -109,6 +109,7 @@ pub extern fn phpglue_array_pop(zv: *T.Zval, retval: *T.Zval)                   
 
 pub extern fn phpglue_object_read_property(obj: *T.Zval, name: [*c]const u8, name_len: usize)   ?*T.Zval;
 pub extern fn phpglue_object_write_property(obj: *T.Zval, name: [*c]const u8, name_len: usize, val: *T.Zval) void;
+pub extern fn phpglue_object_create_stdclass(zv: *T.Zval) void;
 
 // ＝＝＝＝ 资源类型 ＝＝＝＝
 
@@ -148,8 +149,11 @@ pub extern fn phpglue_register_class(name: [*c]const u8, name_len: usize, method
 pub extern fn phpglue_register_class_ex(name: [*c]const u8, name_len: usize, methods: ?*anyopaque, parent: *T.ZendClassEntry)    c_int;
 pub extern fn phpglue_lookup_class(name: [*c]const u8, name_len: usize)                                                        ?*T.ZendClassEntry;
 
-pub extern fn phpglue_declare_class_constant_long(ce: *T.ZendClassEntry, name: [*c]const u8, name_len: usize, val: T.zend_long)               void;
-pub extern fn phpglue_declare_class_constant_string(ce: *T.ZendClassEntry, name: [*c]const u8, name_len: usize, val: [*c]const u8, val_len: usize) void;
+pub extern fn phpglue_register_class_with_constants(
+    name: [*c]const u8, name_len: usize, methods: ?*anyopaque,
+    const_count: c_int, const_keys: [*c]const [*c]const u8, const_key_lens: [*c]usize,
+    const_vals: [*c]const ?*anyopaque, const_val_lens: [*c]usize, const_types: [*c]u8,
+) c_int;
 
 // ＝＝＝＝ 模块常量注册 ＝＝＝＝
 

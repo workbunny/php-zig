@@ -133,6 +133,18 @@ test "Module() with minimal opts compiles" {
     // 编译器确认该泛型实例化无误
 }
 
+test "ClassDesc.createWithConstants stores constants" {
+    const cc = [_]mod.ClassConstantDesc{
+        mod.ClassConstantDesc.createLong("PI", 3),
+        mod.ClassConstantDesc.createString("NAME", "Calc"),
+    };
+    const cls = mod.ClassDesc.createWithConstants("C", &.{}, &cc);
+    try std.testing.expectEqual(@as(usize, 2), cls.class_constants.len);
+    try std.testing.expectEqualStrings("PI", cls.class_constants[0].name);
+    try std.testing.expectEqual(@as(c_long, 3), cls.class_constants[0].value.long);
+    try std.testing.expectEqualStrings("NAME", cls.class_constants[1].name);
+}
+
 test "Module() with all options compiles" {
     const M = mod.Module(.{
         .name = "full",

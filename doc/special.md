@@ -155,8 +155,94 @@ pub fn createStatic(name, handler) FunctionDesc {
 
 ### 问题
 
-PHP 8.4 的 `call_user_function` 宏参数签名为 `zval params[]`（平铺值数组），老版本的 `call_user_function_ex` 则接受 `zval** argv`（指针数组）。
+PHP 的 `call_user_function` 宏参数签名为 `zval params[]`（平铺值数组），老版本的 `call_user_function_ex` 则接受 `zval** argv`（指针数组）。
 
 ### 解决方案
 
-C glue 内部使用 `call_user_function`（PHP 8.2+ 可用），参数声明为 `const zval *argv`。Zig 侧提供 `[]const T.Zval` 切片，与 C 的平铺数组布局一致。
+C glue 内部使用 `call_user_function`，参数声明为 `const zval *argv`。Zig 侧提供 `[]const T.Zval` 切片，与 C 的平铺数组布局一致。
+
+## 类常量先注册后声明
+
+### 问题
+
+PHP 的类常量声明有两种路径：
+- `zend_declare_class_constant_ex(ce, zend_string*, zval*, flags, doc_comment)` — 接收 `zend_string*`，需要自建和释放。
+- `zend_declare_class_constant(ce, char*, size_t, zval*)` — 接收裸字符串和长度。
+
+初次尝试用 `zend_declare_class_constant_ex` 在 `INIT_CLASS_ENTRY_EX` 之后、`zend_register_internal_class` 之前声明，导致 segfault。因为此时 `ce` 的 `constants_table` 尚未初始化。PHPX 的做法——先注册类、后在返回的 `zend_class_entry*` 上声明常量——是正确的流程。
+
+### 解决方案
+
+```c
+zend_class_entry ce;
+INIT_CLASS_ENTRY_EX(ce, name, name_len, methods);
+zend_class_entry *ce_ptr = zend_register_internal_class(&ce);
+
+// zend_declare_class_constant 需要在 ce_ptr 而非临时 ce 上调用
+for (int i = 0; i < const_count; i++) {
+    zval zv;
+    ZVAL_LONG(&zv, val);  // or ZVAL_STRINGL
+    zend_declare_class_constant(ce_ptr, key, key_len, &zv);
+    zval_ptr_dtor(&zv);
+}
+```
+
+两个 `zend_declare_class_constant` 变体的选择：`_ex` 版本需要 `zend_string*` + flags + doc_comment 参数，且不能在 `zend_register_internal_class` 返回之前调用。非 `_ex` 版本的参数更简单，且与 PHPX `Class::addConstant` 的实现流程一致。
+
+## `Array.init()` 接受输出参数而非返回值
+
+### 问题
+
+原始设计是 `Array.init() Array`——函数内部声明 `var zv: T.Zval = undefined` 并调用 `array_init(&zv)`，然后返回 `{ .zv = Zval.fromPtr(&zv) }`。但 `zv` 是栈上局部变量，`Array.init()` 返回后该内存已被释放或复用，`Zval.fromPtr` 持有的指针变为悬空指针。后续调用 `appendLong` 等操作会写入已被覆盖的栈空间，导致 segfault。
+
+filter/map 内部也有同样问题——局部变量 `result_zv` 在函数返回时失效。
+
+### 解决方案
+
+`Array.init()` 改为接受输出参数：调用者提供 `*T.Zval` 指针，框架在指定内存上初始化数组。生命周期由调用者显式管理。
+
+```zig
+// 修改前 — 栈指针返回，悬空
+pub fn init() Array {
+    var zv: T.Zval = undefined;
+    c.phpglue_array_init(&zv);
+    return .{ .zv = Zval.fromPtr(&zv) }; // 返回后 zv 已失效
+}
+
+// 修改后 — 调用者管理内存
+pub fn init(zv: *T.Zval) Array {
+    c.phpglue_array_init(zv);
+    return .{ .zv = Zval.fromPtr(zv) };
+}
+```
+
+`filterInto` / `mapInto` 同样接受 `out_zv: *T.Zval` 输出参数。这遵循了 Zig 的显式所有权哲学——不隐藏内存分配，调用者清楚每块内存由谁负责。
+
+## `find/findIndex/exists/existsIndex` 使用 `*const Array`
+
+### 问题
+
+查询方法不应修改数组，但原始签名为 `self: *Array`（可变指针）。在 `const doubled = arr.mapInto(...)` 后，`doubled.findIndex(2)` 对 `const` 变量调用失败——Zig 不允许将 `const` 指针传递给 `*Array` 参数。
+
+### 解决方案
+
+```zig
+// const-self 用于纯查询方法
+pub fn find(self: *const Array, key: []const u8) ?Zval { ... }
+pub fn exists(self: *const Array, key: []const u8) bool { ... }
+// mutable-self 用于修改方法
+pub fn appendLong(self: *Array, v: T.zend_long) void { ... }
+pub fn del(self: *Array, key: []const u8) void { ... }
+```
+
+## 对象属性读写：`Z_OBJCE_P` 替代 NULL scope
+
+### 问题
+
+PHP 8.4 中 `zend_read_property(NULL, ...)` 和 `zend_update_property(NULL, ...)` 的 scope 参数不再接受 NULL。传入 NULL 时内部路径尝试访问 NULL 指针的成员导致 segfault。
+
+### 解决方案
+
+- **写属性**：`zend_update_property(Z_OBJCE_P(obj), Z_OBJ_P(obj), name, len, val)`——scope 设为对象所属的类。
+- **读属性**：改用 `zend_hash_find(obj->properties, zend_string*)` 直接查找 HashTable，绕过 `zend_read_property` 的 scope 校验。因为 `object_init` 创建的 stdClass 的 `properties` 是一个普通 HashTable，不需要复杂的继承链查找。
+- **创建对象**：用 `object_init(zv)` 替代 `call_user_function("stdClass", ...)`。前者直接分配 zend_object，后者需要函数表查找和调用栈开销，且在模块加载早期可能尚未注册。

@@ -1,7 +1,7 @@
 .{
     .name = .phpzig,
     .fingerprint = 0x4612f9e1c812bbfb,
-    .version = "0.1.0",
+    .version = "0.3.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

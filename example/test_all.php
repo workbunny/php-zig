@@ -152,6 +152,10 @@ $rCalcAdd = new ReflectionMethod('Calculator', 'add');
 test('Calculator::add 参数1为 a', 'a', $rCalcAdd->getParameters()[0]->getName());
 test('Calculator::add 参数2为 b', 'b', $rCalcAdd->getParameters()[1]->getName());
 
+// 类常量
+test('CalcConst::PI (类常量)', 3, CalcConst::PI);
+test('CalcConst::NAME (类常量)', 'Calculator', CalcConst::NAME);
+
 // ============================================================
 // 9. 数组操作
 // ============================================================
@@ -198,9 +202,17 @@ testTruthy('phpinfo 模块输出中包含 php-zig', strpos($output, 'php-zig') !
 // ============================================================
 // 14. 边界情况
 // ============================================================
-echo "\n=== 14. 边界情况 ===\n";
+echo "=== 15. v0.3.0: Zval 运算符 + Array 算法 ===\n";
 
-test('add 带小数 → 截断为整数', 7, add(3.7, 4.2));
+test('hello_zip(42,42) → equal', 'equal', hello_zip(42, 42));
+test('hello_zip(1,2) → not-equal', 'not-equal', hello_zip(1, 2));
+test('hello_map() → 6 (third elem doubled)', 6, hello_map());
+test('hello_filter() → 2 evens out of 4', 2, hello_filter());
+test('hello_reduce() → sum 1+2+3+4 = 10', 10, hello_reduce());
+
+echo "\n=== 16. 边界情况 ===\n";
+
+test('add 带小数 → 浮点 isLong=false, 0+0=0', 0, add(3.7, 4.2));
 test('hello_pop 空数组 → null', null, hello_pop([]));
 test('hello_strlen 非字符串 → null', null, @hello_strlen(123));
 test('hello_concat 参数不足 → null', null, @hello_concat('a'));

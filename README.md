@@ -76,9 +76,9 @@ Hello, Zig!
 |------|:--:|------|
 | 函数注册 | ✅ | 模块级函数 + 类方法（含静态） + 参数 arg_info 自动生成 |
 | 类型系统 | ✅ | IS_* 全类型判断、取值（long/double/string/bool）、设值（5 种） |
-| 数组 | ✅ | 追加 / 索引设值 / 关联设值 / 查找 / 删除 / 计数 / pop / 迭代器 |
+| 数组 | ✅ | 追加 / 索引设值 / 关联设值 / 查找 / 删除 / 计数 / pop / 迭代器 / filter / map / reduce |
 | 返回值 | ✅ | 9 种返回类型 |
-| 调用 PHP | ✅ | `PhpFunc.call*` 系列，支持全局函数和方法 |
+| 调用 PHP | ✅ | `PhpFunc.call*` 系列 + `Object.call` 对象方法 |
 | 异常 | ✅ | `Throw.throwException(msg)` |
 | 模块常量 | ✅ | long / double / string / bool / null 五种 |
 | 类注册 | ✅ | 静态方法 + 继承 |
@@ -87,8 +87,10 @@ Hello, Zig!
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
 | phpinfo | ✅ | `info_func` 回调 |
 | 测试 | ✅ | Zig 单元测试 18 项 + PHP 集成测试 47 项 |
-| 非静态方法 | ❌ | 待实现 |
-| Class 属性 / 常量 | ❌ | 待实现 |
+| Zval 运算符 | ✅ | `eql` / `neq`（类型标签 + 逐值比较，纯 Zig） |
+| 非静态方法 | ✅ | flags=0 时 resolveFlags 仅返回 acc_public |
+| 类常量 | ✅ | long / string 两种，`ClassConstantDesc` |
+| Class 属性 | ❌ | 待实现 |
 | INI 配置 | ❌ | 依赖 `PHP_INI_BEGIN/END` 编译期声明 |
 | foreach 语法糖 | ❌ | 基于内部指针的迭代器已可用 |
 
@@ -102,7 +104,7 @@ Hello, Zig!
 
 | | PHPX (C++) | php-zig (Zig) |
 |--|-----------|---------------|
-| PHP 类导出 | Class / Interface / 继承 / 可见性 / 属性 / 常量 | 基础 Class 注册（静态方法 + 继承） |
+| PHP 类导出 | Class / Interface / 继承 / 可见性 / 属性 / 常量 | Class 注册（静态方法 + 非静态方法 + 继承 + 类常量） |
 | 闭包导出 | 支持 | 不支持 |
 | 函数分发 | `_exec_function` 运行时分发 | 直接函数指针，零运行开销 |
 | 构建 | CMake + phpize | `zig build -Dphp=/path` |
