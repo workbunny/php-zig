@@ -9,6 +9,7 @@
 const c       = @import("php_c.zig");
 const T       = @import("php_types.zig");
 const builtin = @import("builtin");
+const std     = @import("std");
 
 // ＝＝ Zend 结构体布局（extern struct，必须与 C 布局一致） ＝＝
 // 字段顺序与 PHP 头文件定义严格对应。
@@ -178,6 +179,7 @@ pub const FunctionDesc = struct {
 
 /// 哨兵常量 — 用于区分"用户未设置 flags"和"用户设了 PUBLIC"
 const Marker = struct {
+    const publicz_marker:   u32 = 0xDEADBEE0;
     const static_marker:    u32 = 0xDEADBEEF;
     const protected_marker: u32 = 0xDEADBEF0;
     const private_marker:   u32 = 0xDEADBEF1;
@@ -250,6 +252,85 @@ fn propsFromStruct(comptime Props: type) []const ClassPropertyDesc {
         break :blk arr;
     };
     return &props;
+}
+
+// ＝＝ Comptime struct → FunctionDesc[]：从 struct 内 `pub fn` 声明自动推导方法注册 ＝＝
+//
+// 命名约定：
+//   public_xxx       → ACC_PUBLIC    function xxx
+//   protect_xxx      → ACC_PROTECTED function xxx
+//   private_xxx      → ACC_PRIVATE   function xxx
+//   static_xxx       → ACC_PUBLIC|ACC_STATIC function xxx
+//
+// 魔术方法映射（magic_ 前缀）：
+//   magic_set → __set, magic_get → __get, magic_call → __call,
+//   magic_tostring → __tostring, magic_construct → __construct 等
+
+pub fn methodsFromStruct(comptime Cls: type) []const FunctionDesc {
+    const info = @typeInfo(Cls);
+    if (info != .@"struct") @compileError("Expected struct, got " ++ @typeName(Cls));
+    const decls = info.@"struct".decls;
+
+    // 只统计匹配命名约定的声明
+    comptime var count = 0;
+    inline for (decls) |d| {
+        if (std.mem.startsWith(u8, d.name, "public_") or std.mem.startsWith(u8, d.name, "protect_") or
+            std.mem.startsWith(u8, d.name, "private_") or std.mem.startsWith(u8, d.name, "static_"))
+            count += 1;
+    }
+
+    const methods: [count]FunctionDesc = blk: {
+        var arr: [count]FunctionDesc = undefined;
+        comptime var idx = 0;
+        inline for (decls) |d| {
+            if (!(std.mem.startsWith(u8, d.name, "public_") or std.mem.startsWith(u8, d.name, "protect_") or
+                std.mem.startsWith(u8, d.name, "private_") or std.mem.startsWith(u8, d.name, "static_")))
+                continue;
+
+            const name = d.name;
+            const handler: T.FunctionHandler = @ptrCast(@alignCast(&@field(Cls, name)));
+
+            // 1. 确定前缀
+            const prefix: []const u8 = if (std.mem.startsWith(u8, name, "public_"))  "public_"
+                                  else if (std.mem.startsWith(u8, name, "protect_")) "protect_"
+                                  else if (std.mem.startsWith(u8, name, "private_")) "private_"
+                                  else if (std.mem.startsWith(u8, name, "static_"))  "static_"
+                                  else @compileError("BUG: " ++ name);
+
+            // 2. 去掉前缀 (Zig 0.16: name[prefix.len..] 有 bug，显式指定结束位置)
+            const rest: [:0]const u8 = name[prefix.len..name.len];
+            const php_name: [:0]const u8 = if (std.mem.eql(u8, rest, "magic_construct"))    "__construct"
+            else if (std.mem.eql(u8, rest, "magic_destruct"))   "__destruct"
+            else if (std.mem.eql(u8, rest, "magic_call"))       "__call"
+            else if (std.mem.eql(u8, rest, "magic_callStatic")) "__callStatic"
+            else if (std.mem.eql(u8, rest, "magic_get"))        "__get"
+            else if (std.mem.eql(u8, rest, "magic_set"))        "__set"
+            else if (std.mem.eql(u8, rest, "magic_isset"))      "__isset"
+            else if (std.mem.eql(u8, rest, "magic_unset"))      "__unset"
+            else if (std.mem.eql(u8, rest, "magic_sleep"))      "__sleep"
+            else if (std.mem.eql(u8, rest, "magic_wakeup"))     "__wakeup"
+            else if (std.mem.eql(u8, rest, "magic_toString"))   "__toString"
+            else if (std.mem.eql(u8, rest, "magic_invoke"))     "__invoke"
+            else if (std.mem.eql(u8, rest, "magic_set_state"))  "__set_state"
+            else if (std.mem.eql(u8, rest, "magic_clone"))      "__clone"
+            else if (std.mem.eql(u8, rest, "magic_debugInfo"))  "__debugInfo"
+            else if (std.mem.eql(u8, rest, "magic_serialize"))  "__serialize"
+            else if (std.mem.eql(u8, rest, "magic_unserialize")) "__unserialize"
+            else if (std.mem.startsWith(u8, rest, "magic_"))     @compileError("Unknown magic method: " ++ rest)
+            else                                                   rest;
+
+            // 4. 确定 flags
+            const f: u32 = if (std.mem.eql(u8, prefix, "public_"))  Marker.publicz_marker
+                      else if (std.mem.eql(u8, prefix, "protect_")) Marker.protected_marker
+                      else if (std.mem.eql(u8, prefix, "private_")) Marker.private_marker
+                      else Marker.static_marker;
+
+            arr[idx] = FunctionDesc{ .name = php_name, .handler = handler, .flags = f };
+            idx += 1;
+        }
+        break :blk arr;
+    };
+    return &methods;
 }
 
 // ＝＝ 类属性描述符 ＝＝
@@ -342,6 +423,25 @@ pub const ClassDesc = struct {
             .name       = name,
             .methods    = methods,
             .properties = comptime propsFromStruct(Props),
+        };
+    }
+
+    /// 完全 comptime 驱动的类注册：struct 内 `pub fn` 声明 → PHP 方法，
+    /// struct 字段 → PHP 属性。方法 + 属性的名称/类型/可见性全部编译期推导。
+    ///
+    /// 命名约定：
+    ///   public_xxx  → public function xxx
+    ///   protect_xxx → protected function xxx
+    ///   private_xxx → private function xxx
+    ///   static_xxx  → public static function xxx
+    ///   *_magic_xxx → __xxx（魔术方法）
+    ///
+    /// struct 字段：balance: i64 = 0 → public long 属性，默认值 0
+    pub fn createFromStruct(comptime name: [:0]const u8, comptime Cls: type) ClassDesc {
+        return .{
+            .name       = name,
+            .methods    = comptime methodsFromStruct(Cls),
+            .properties = comptime propsFromStruct(Cls),
         };
     }
 };
@@ -443,6 +543,9 @@ pub fn Module(comptime opts: struct {
             }
             if (desc.flags == Marker.private_marker) {
                 return c.phpglue_acc_private();
+            }
+            if (desc.flags == Marker.publicz_marker) {
+                return c.phpglue_acc_public();
             }
             if (desc.flags != 0) return desc.flags;
             return c.phpglue_acc_public();

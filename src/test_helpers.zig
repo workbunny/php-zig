@@ -408,6 +408,71 @@ test "Module() with createWithPropsFrom compiles" {
     _ = M;
 }
 
+// ＝＝ v0.5.1：comptime struct → 方法 + 属性全反射 ＝＝
+
+test "methodsFromStruct: parses public/protect/private/static" {
+    const Bank = struct {
+        pub fn public_open(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+        pub fn protect_close(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+        pub fn private_secret(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+        pub fn static_util(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+    };
+    const methods = comptime mod.methodsFromStruct(Bank);
+    try std.testing.expectEqual(@as(usize, 4), methods.len);
+    try std.testing.expectEqualStrings("open", methods[0].name);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEE0), methods[0].flags); // public
+    try std.testing.expectEqualStrings("close", methods[1].name);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEF0), methods[1].flags); // protected
+    try std.testing.expectEqualStrings("secret", methods[2].name);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEF1), methods[2].flags); // private
+    try std.testing.expectEqualStrings("util", methods[3].name);
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), methods[3].flags); // static
+}
+
+test "methodsFromStruct: magic methods" {
+    const WithMagic = struct {
+        pub fn public_magic_construct(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+        pub fn protect_magic_set(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+    };
+    const methods = comptime mod.methodsFromStruct(WithMagic);
+    try std.testing.expectEqual(@as(usize, 2), methods.len);
+    try std.testing.expectEqualStrings("__construct", methods[0].name);
+    try std.testing.expectEqualStrings("__set", methods[1].name);
+}
+
+test "ClassDesc.createFromStruct combines methods + props" {
+    const Bank = struct {
+        balance: i64 = 0,
+        open: bool = true,
+        pub fn public_getBal(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+        pub fn protect_setBal(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+    };
+    const cls = comptime mod.ClassDesc.createFromStruct("Bank", Bank);
+    try std.testing.expectEqualStrings("Bank", cls.name);
+    try std.testing.expectEqual(@as(usize, 2), cls.methods.len);
+    try std.testing.expectEqualStrings("getBal", cls.methods[0].name);
+    try std.testing.expectEqualStrings("setBal", cls.methods[1].name);
+    try std.testing.expectEqual(@as(usize, 2), cls.properties.len);
+    try std.testing.expectEqualStrings("balance", cls.properties[0].name);
+    try std.testing.expectEqualStrings("open", cls.properties[1].name);
+}
+
+test "Module() with createFromStruct compiles" {
+    const Bank = struct {
+        value: i64 = 100,
+        pub fn public_deposit(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+        pub fn private_log(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
+    };
+    const M = mod.Module(.{
+        .name = "cfs",
+        .version = "0.5.1",
+        .classes = &.{
+            mod.ClassDesc.createFromStruct("Bank", Bank),
+        },
+    });
+    _ = M;
+}
+
 // ＝＝ 辅助桩函数（仅用于类型编译验证） ＝＝
 
 fn dummyHandler(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}

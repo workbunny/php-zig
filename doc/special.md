@@ -345,3 +345,56 @@ zend_hash_str_find_ptr(CG(class_table), buf, len);
 ```
 
 `zend_lookup_class` 在 MINIT 阶段行为不稳定，直接操作 HashTable 更可靠。
+
+## Zig 0.16 comptime: `name[prefix.len..]` 切片 bug
+
+### 问题
+
+Zig 0.16 的 comptime 求值中，`"public_magic_construct"["public_".len..]` 切片操作行为异常：
+实际返回的是 `name[0..prefix.len]`（前缀）而非 `name[prefix.len..]`（剩余部分）。
+
+例如 `"public_magic_construct"[7..]` 应该返回 `"magic_construct"`，实际返回 `"public_"`。
+
+### 解决方案
+
+显式指定结束位置：
+
+```zig
+// 错误（Zig 0.16）
+const rest: [:0]const u8 = name[prefix.len..];
+
+// 正确
+const rest: [:0]const u8 = name[prefix.len..name.len];
+```
+
+## Zig 0.16 comptime: marker 值冲突
+
+### 问题
+
+`ClassDesc.createFromStruct` 的方法名解析引入了新的可见性 marker `publicz_marker`，初始值与 `static_marker` 同为 `0xDEADBEEF`。
+`resolveFlags` 先匹配到 `static_marker` 导致所有 public 方法被误标为 static。
+
+### 解决方案
+
+区分 marker 值：`publicz_marker = 0xDEADBEE0`，`static_marker = 0xDEADBEEF`。
+同时在 `resolveFlags` 中显式处理 `publicz_marker` 分支（返回 `phpglue_acc_public()`），与用户自设 `flags=0` 的默认逻辑分开。
+
+## Zig 0.16 comptime: 函数传回 `[:0]const u8` 字面量失效
+
+### 问题
+
+在 `inline for` 循环内部，调用外部 `fn foo()` 返回的 `[:0]const u8` 字面量（如 `return "__construct"`），
+传到 `FunctionDesc{ .name = ... }` 后，实际存储的是原始声明名而非映射后的名。
+
+### 解决方案
+
+不通过函数调用传 comptime 字面量——在调用现场（`inline for` 循环内）直接内联 if-else 链：
+
+```zig
+const php_name: [:0]const u8 = if (std.mem.eql(u8, rest, "magic_construct")) "__construct"
+    else if (std.mem.eql(u8, rest, "magic_destruct")) "__destruct"
+    // ...
+    else rest;
+```
+
+17 条魔术方法映射全部内联到 `methodsFromStruct` 中，零函数调用，零传值。

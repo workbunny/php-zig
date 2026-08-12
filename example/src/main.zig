@@ -230,17 +230,26 @@ fn bankSetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callc
     phpzig.Return.returnLong(return_value, val.toLong());
 }
 
-fn savingsInterest(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    _ = execute_data;
-    phpzig.Return.returnDouble(return_value, 0.05);
-}
+// ＝＝ v0.5.1: Comptime struct → PHP class（方法 + 属性全部自动推导） ＝＝
 
-fn bankInternal(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void { phpzig.Return.returnNull(rv); }
-
-const BankProps = struct {
+const BankAccount = struct {
     balance: i64 = 0,
     open: bool = true,
+
+    pub fn public_magic_construct(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+        phpzig.Return.returnNull(return_value);
+    }
+    pub fn protect_getBalance(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+        phpzig.Return.returnLong(return_value, 1000);
+    }
+    pub fn private_internal(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+        phpzig.Return.returnNull(rv);
+    }
 };
+
+fn savingsInterest(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnDouble(return_value, 0.05);
+}
 
 // ＝＝ P4: phpinfo() 输出 ＝＝
 
@@ -306,13 +315,15 @@ const HelloModule = phpzig.Module(.{
             phpzig.ClassConstantDesc.createLong("PI", 3),
             phpzig.ClassConstantDesc.createString("NAME", "Calculator"),
         }),
-        // v0.5.0: comptime struct 反射类属性
-        phpzig.ClassDesc.createWithPropsFrom("BankAccount", &.{
-            phpzig.FunctionDesc.create("__construct", bankSetBalance),
+        // v0.5.1: 全部 comptime 反射——struct 即 class 定义
+        phpzig.ClassDesc.createFromStruct("BankAccount", BankAccount),
+        // 手动注册版（对比验证 createFromStruct 是否正确）
+        phpzig.ClassDesc.createWithProperties("TestBank", &.{
+            phpzig.FunctionDesc.create("__construct", bankGetBalance),
             phpzig.FunctionDesc.createProtected("getBalance", bankGetBalance),
-            phpzig.FunctionDesc.createPrivate("internal", bankInternal),
-        }, BankProps),
-        // v0.5.0: 声明式类属性（传统 API 保留）
+            phpzig.FunctionDesc.createPrivate("internal", bankGetBalance),
+        }, &.{phpzig.ClassPropertyDesc.createLong("balance", 0)}),
+        // v0.5.0: 声明式（传统 API 保留，双重方式对比用）
         phpzig.ClassDesc.createWithProperties("ManualProps", &.{
             phpzig.FunctionDesc.create("get", bankGetBalance),
         }, &.{

@@ -353,6 +353,50 @@ phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
 父类必须是先于子类在同一个 `.classes` 数组中声明的类。
 ```
 
+### 类全反射 ★ v0.5.1 — struct 即 class
+
+一个 struct 同时定义方法 + 属性 + 魔术方法，编译期全自动推导。
+
+方法命名约定：`public_xxx` → public function xxx，`protect_` → protected，`private_` → private，`static_` → public static；`magic_` → `__` 前缀魔术方法。
+
+```zig
+const BankAccount = struct {
+    // 字段 → PHP 属性
+    balance: i64 = 0,
+    open: bool = true,
+
+    // public_magic_construct → public function __construct
+    pub fn public_magic_construct(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+        phpzig.Return.returnNull(rv);
+    }
+    // protect_getBalance → protected function getBalance
+    pub fn protect_getBalance(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+        phpzig.Return.returnLong(rv, 1000);
+    }
+    // private_internal → private function internal
+    pub fn private_internal(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+        phpzig.Return.returnNull(rv);
+    }
+};
+
+// 一行注册
+phpzig.ClassDesc.createFromStruct("BankAccount", BankAccount)
+```
+
+支持的魔术方法（`magic_` 前缀）：
+
+| Zig 声明 | PHP 方法 | Zig 声明 | PHP 方法 |
+|----------|---------|----------|---------|
+| `magic_construct` | `__construct` | `magic_destruct` | `__destruct` |
+| `magic_call` | `__call` | `magic_callStatic` | `__callStatic` |
+| `magic_get` | `__get` | `magic_set` | `__set` |
+| `magic_isset` | `__isset` | `magic_unset` | `__unset` |
+| `magic_sleep` | `__sleep` | `magic_wakeup` | `__wakeup` |
+| `magic_toString` | `__toString` | `magic_invoke` | `__invoke` |
+| `magic_clone` | `__clone` | `magic_debugInfo` | `__debugInfo` |
+| `magic_serialize` | `__serialize` | `magic_unserialize` | `__unserialize` |
+| `magic_set_state` | `__set_state` | | |
+
 ### 数组操作
 
 ```zig
@@ -476,7 +520,7 @@ comptime {
 ```bash
 cd php-zig
 zig build test
-# 50/50 通过（v0.5.0）
+# 54/54 通过（v0.5.1）
 ```
 
 示例扩展编译后运行 PHP 集成测试：
@@ -485,5 +529,5 @@ zig build test
 cd example
 zig build -Dphp=/usr/local
 php -d extension=zig-out/lib/libhello.so test_all.php
-# 82/82 通过（v0.5.0）
+# 81/81 通过（v0.5.1）
 ```

@@ -12,6 +12,18 @@ fn hello(execute_data: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) v
 // comptime struct 反射——参数名+类型全自动推导
 const AddArgs = struct { a: i64, b: i64 };
 const funcs = &.{ phpzig.FunctionDesc.createFrom("add", add, AddArgs) };
+
+// v0.5.1: struct 即 class——方法 + 属性全部编译期推导
+const BankAccount = struct {
+    balance: i64 = 0,
+    open: bool = true,
+
+    pub fn public_magic_construct(_: *phpzig.ZendExecuteData, _: *phpzig.Zval) callconv(.c) void {}
+    pub fn protect_getBalance(_: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void {
+        phpzig.Return.returnLong(rv, 1000);
+    }
+};
+const classes = &.{ phpzig.ClassDesc.createFromStruct("BankAccount", BankAccount) };
 ```
 
 ## 为什么不用 C 写扩展？
@@ -85,13 +97,13 @@ Hello, Zig!
 | 调用 PHP | ✅ | `PhpFunc.call*` 系列 + `Object.call` 对象方法 |
 | 异常 | ✅ | `Throw.throwException(className, message)` |
 | 模块常量 | ✅ | long / double / string / bool / null 五种 |
-| 类注册 | ✅ | 方法（含 static/protected/private）+ 类常量 + **类属性**（5 种类型）+ **继承** + **构造器 __construct** |
-| 类属性 | ✅ | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` |
+| 类注册 | ✅ | 方法（含 static/protected/private）+ 类常量 + **类属性**（5 种类型）+ **继承** + **构造器** |
+| 类属性 | ✅ | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` + **全反射 `createFromStruct`** |
 | 生命周期 | ✅ | MINIT / MSHUTDOWN / RINIT / RSHUTDOWN |
 | 对象属性 | ✅ | `readProperty` / `writeProperty` |
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 50 项 + PHP 集成测试 82 项 |
+| 测试 | ✅ | Zig 单元测试 54 项 + PHP 集成测试 81 项 |
 | INI 配置 | ❌ | 依赖 `PHP_INI_BEGIN/END` 编译期声明 |
 | 闭包导出 | ❌ | v0.7 规划中 |
 
@@ -109,9 +121,22 @@ const AddArgs = struct { a: i64, b: i64 };
 phpzig.FunctionDesc.createFrom("add", add, AddArgs);
 ```
 
-类属性同样双轨：
+类属性同样多轨并存，且支持**完整 struct 反射**——`pub fn public_xxx` → public method，`protect_` → protected，`private_` → private，`static_` → static，`magic_` → `__`前缀魔术方法：
 
 ```zig
+// 全反射：struct 即 class 定义，方法 + 属性全部编译期推导
+const Bank = struct {
+    balance: i64 = 0,
+    open: bool = true,
+
+    pub fn public_magic_construct(_: *phpzig.ZendExecuteData, _: *phpzig.Zval) callconv(.c) void {}
+    pub fn protect_getBalance(_: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void {
+        phpzig.Return.returnLong(rv, 1000);
+    }
+};
+phpzig.ClassDesc.createFromStruct("Bank", Bank);
+
+// 分步式（方法 + 属性分开定义）
 const BankProps = struct { balance: i64 = 0, open: bool = true };
 phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
 ```
