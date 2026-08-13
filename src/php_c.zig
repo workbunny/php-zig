@@ -105,6 +105,15 @@ pub extern fn phpglue_hash_get_current_key_ex(ht: *T.ZendArray, str_index: *?*T.
 // —— 弹出 ——
 pub extern fn phpglue_array_pop(zv: *T.Zval, retval: *T.Zval)                                 c_int;
 
+// —— v0.6.0: 数组高级操作 ——
+pub extern fn phpglue_array_shift(zv: *T.Zval, retval: *T.Zval)                               c_int;
+pub extern fn phpglue_array_unshift(zv: *T.Zval, val: *T.Zval)                                void;
+pub extern fn phpglue_array_merge(dst: *T.Zval, src1: *T.Zval, src2: *T.Zval)                 void;
+pub extern fn phpglue_array_keys(src: *T.Zval, dst: *T.Zval)                                  void;
+pub extern fn phpglue_array_values(src: *T.Zval, dst: *T.Zval)                                void;
+pub extern fn phpglue_array_slice(src: *T.Zval, dst: *T.Zval, offset: T.zend_long, len: T.zend_long) void;
+pub extern fn phpglue_array_sort(zv: *T.Zval)                                                 void;
+
 // ＝＝＝＝ 对象操作 ＝＝＝＝
 
 pub extern fn phpglue_object_read_property(obj: *T.Zval, name: [*c]const u8, name_len: usize)   ?*T.Zval;
@@ -186,3 +195,14 @@ pub extern fn phpglue_call_method(obj: *T.Zval, name: [*c]const u8, name_len: us
 // ＝＝＝＝ 逻辑判断 ＝＝＝＝
 
 pub extern fn phpglue_zval_is_true(zv: *T.Zval) c_int;
+
+// ＝＝＝＝ zval 算术运算符（v0.6.0） ＝＝＝＝
+
+pub extern fn phpglue_zval_add(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
+pub extern fn phpglue_zval_sub(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
+pub extern fn phpglue_zval_mul(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
+pub extern fn phpglue_zval_div(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
+pub extern fn phpglue_zval_mod(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
+
+/// 三值比较：返回 -1 / 0 / 1
+pub extern fn phpglue_zval_compare(op1: *T.Zval, op2: *T.Zval) c_int;

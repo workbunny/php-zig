@@ -131,6 +131,120 @@ int phpglue_array_pop(zval *zv, zval *retval) {
     return 1;
 }
 
+/* — v0.6.0: 数组高级操作 — */
+
+int phpglue_array_shift(zval *zv, zval *retval) {
+    HashTable *ht = Z_ARRVAL_P(zv);
+    if (zend_hash_num_elements(ht) == 0) return 0;
+    zend_hash_internal_pointer_reset(ht);
+    zval *data = zend_hash_get_current_data(ht);
+    if (data == NULL) return 0;
+
+    zend_string *str_key = NULL;
+    zend_ulong num_key = 0;
+    int key_type = zend_hash_get_current_key(ht, &str_key, &num_key);
+
+    ZVAL_COPY(retval, data);
+
+    if (key_type == HASH_KEY_IS_STRING) {
+        zend_hash_del(ht, str_key);
+    } else {
+        zend_hash_index_del(ht, num_key);
+    }
+    return 1;
+}
+
+void phpglue_array_unshift(zval *zv, zval *val) {
+    HashTable *ht = Z_ARRVAL_P(zv);
+    zval new_arr;
+    array_init(&new_arr);
+
+    /* 新元素放最前 */
+    add_next_index_zval(&new_arr, val);
+
+    /* 遍历旧数组按顺序追加（数字键重索引，等价 PHP array_unshift） */
+    zval *data;
+    ZEND_HASH_FOREACH_VAL(ht, data) {
+        add_next_index_zval(&new_arr, data);
+    } ZEND_HASH_FOREACH_END();
+
+    /* 替换原数组 */
+    zval_ptr_dtor(zv);
+    ZVAL_COPY_VALUE(zv, &new_arr);
+}
+
+void phpglue_array_merge(zval *dst, zval *src1, zval *src2) {
+    /* 手动遍历合并，模拟 PHP array_merge 语义：
+     *   数字键 → 追加（重新索引）；字符串键 → 覆盖/新增 */
+    array_init_size(dst, zend_hash_num_elements(Z_ARRVAL_P(src1)) + zend_hash_num_elements(Z_ARRVAL_P(src2)));
+
+    zend_string *str_key;
+    zend_ulong num_key;
+    zval *data;
+
+    ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(src1), num_key, str_key, data) {
+        if (str_key) {
+            add_assoc_zval(dst, ZSTR_VAL(str_key), data);
+        } else {
+            add_next_index_zval(dst, data);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(src2), num_key, str_key, data) {
+        if (str_key) {
+            add_assoc_zval(dst, ZSTR_VAL(str_key), data);
+        } else {
+            add_next_index_zval(dst, data);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+void phpglue_array_keys(zval *src, zval *dst) {
+    array_init(dst);
+    HashTable *ht = Z_ARRVAL_P(src);
+    zend_string *str_key;
+    zend_ulong num_key;
+    ZEND_HASH_FOREACH_KEY(ht, num_key, str_key) {
+        if (str_key) {
+            add_next_index_str(dst, zend_string_copy(str_key));
+        } else {
+            add_next_index_long(dst, (zend_long)num_key);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+void phpglue_array_values(zval *src, zval *dst) {
+    array_init(dst);
+    HashTable *ht = Z_ARRVAL_P(src);
+    zval *data;
+    ZEND_HASH_FOREACH_VAL(ht, data) {
+        add_next_index_zval(dst, data);
+    } ZEND_HASH_FOREACH_END();
+}
+
+void phpglue_array_slice(zval *src, zval *dst, zend_long offset, zend_long len) {
+    array_init(dst);
+    HashTable *ht = Z_ARRVAL_P(src);
+    zend_long count = 0;
+    zval *data;
+    ZEND_HASH_FOREACH_VAL(ht, data) {
+        if (count >= offset && (len < 0 || count < offset + len)) {
+            add_next_index_zval(dst, data);
+        }
+        count++;
+    } ZEND_HASH_FOREACH_END();
+}
+
+static int phpglue_bucket_compare(Bucket *a, Bucket *b) {
+    zval result;
+    compare_function(&result, &a->val, &b->val);
+    return (int)Z_LVAL(result);
+}
+
+void phpglue_array_sort(zval *zv) {
+    zend_hash_sort(Z_ARRVAL_P(zv), phpglue_bucket_compare, 1);
+}
+
 /* ================================================================
  * 对象操作
  *
@@ -423,3 +537,19 @@ int phpglue_call_method(zval *obj, const char *name, size_t n, zval *retval, uin
  * ================================================================ */
 
 int phpglue_zval_is_true(zval *zv) { return zend_is_true(zv) ? 1 : 0; }
+
+/* ================================================================
+ * zval 算术运算符（v0.6.0）
+ * ================================================================ */
+
+int phpglue_zval_add(zval *result, zval *op1, zval *op2) { return add_function(result, op1, op2) == SUCCESS ? 1 : 0; }
+int phpglue_zval_sub(zval *result, zval *op1, zval *op2) { return sub_function(result, op1, op2) == SUCCESS ? 1 : 0; }
+int phpglue_zval_mul(zval *result, zval *op1, zval *op2) { return mul_function(result, op1, op2) == SUCCESS ? 1 : 0; }
+int phpglue_zval_div(zval *result, zval *op1, zval *op2) { return div_function(result, op1, op2) == SUCCESS ? 1 : 0; }
+int phpglue_zval_mod(zval *result, zval *op1, zval *op2) { return mod_function(result, op1, op2) == SUCCESS ? 1 : 0; }
+
+int phpglue_zval_compare(zval *op1, zval *op2) {
+    zval result;
+    compare_function(&result, op1, op2);
+    return (int)Z_LVAL(result);
+}

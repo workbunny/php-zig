@@ -25,7 +25,7 @@ fn helloName(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
 }
 
 fn version(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    phpzig.Return.returnString(return_value, "php-zig v0.5.0");
+    phpzig.Return.returnString(return_value, "php-zig v0.6.0");
 }
 
 fn addFn(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -217,6 +217,115 @@ fn helloFormat(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv
 
 const FormatArgs = struct { name: []const u8, age: i64 };
 
+// ＝＝ v0.6.0: 数组高级操作 + Zval 运算符 ＝＝
+
+fn helloArrayShift(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    if (arr.shift()) |val| { phpzig.Return.returnLong(return_value, val.toLong()); }
+    else { phpzig.Return.returnNull(return_value); }
+}
+
+fn helloArrayUnshift(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    const val = phpzig.Return.callArg(execute_data, 2);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    arr.separate(); // 写时分离，避免修改原数组
+    arr.unshift(val);
+    phpzig.Return.returnZval(return_value, arr.zv.ptr);
+}
+
+fn helloArrayMerge(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const a = phpzig.Return.callArg(execute_data, 1);
+    const b = phpzig.Return.callArg(execute_data, 2);
+    if (!a.isArray() or !b.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr1 = phpzig.Array.fromZval(a);
+    const arr2 = phpzig.Array.fromZval(b);
+    var out_zv: T.Zval = undefined;
+    arr1.merge(arr2, &out_zv);
+    phpzig.Return.returnZval(return_value, &out_zv);
+}
+
+fn helloArrayKeys(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    var out_zv: T.Zval = undefined;
+    arr.keysInto(&out_zv);
+    phpzig.Return.returnZval(return_value, &out_zv);
+}
+
+fn helloArrayValues(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    var out_zv: T.Zval = undefined;
+    arr.valuesInto(&out_zv);
+    phpzig.Return.returnZval(return_value, &out_zv);
+}
+
+fn helloArraySlice(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 3) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    const off = phpzig.Return.callArg(execute_data, 2);
+    const len = phpzig.Return.callArg(execute_data, 3);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    var out_zv: T.Zval = undefined;
+    arr.sliceInto(&out_zv, off.toLong(), len.toLong());
+    phpzig.Return.returnZval(return_value, &out_zv);
+}
+
+fn helloArraySort(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    arr.separate();
+    arr.sort();
+    phpzig.Return.returnZval(return_value, arr.zv.ptr);
+}
+
+const SumCtx = struct { sum: T.zend_long = 0 };
+
+fn helloArrayEach(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    if (!arg.isArray()) { phpzig.Return.returnNull(return_value); return; }
+    var arr = phpzig.Array.fromZval(arg);
+    var ctx = SumCtx{};
+    arr.each(&ctx, struct {
+        fn cb(ud: ?*anyopaque, v: phpzig.Zval) void {
+            const s: *SumCtx = @ptrCast(@alignCast(ud.?));
+            s.sum += v.toLong();
+        }
+    }.cb);
+    phpzig.Return.returnLong(return_value, ctx.sum);
+}
+
+fn helloZvalAdd(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const a = phpzig.Return.callArg(execute_data, 1);
+    const b = phpzig.Return.callArg(execute_data, 2);
+    var result: T.Zval = undefined;
+    if (a.add(b, &result)) { phpzig.Return.returnZval(return_value, &result); }
+    else { phpzig.Return.returnNull(return_value); }
+}
+
+fn helloZvalCmp(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 2) { phpzig.Return.returnNull(return_value); return; }
+    const a = phpzig.Return.callArg(execute_data, 1);
+    const b = phpzig.Return.callArg(execute_data, 2);
+    phpzig.Return.returnLong(return_value, a.cmp(b));
+}
+
 // ＝＝ v0.5.0: OOP — 类属性 + 继承 + 构造器 + 访问修饰符 ＝＝
 
 fn bankGetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -293,6 +402,17 @@ const HelloModule = phpzig.Module(.{
         // v0.4.0: comptime struct 反射 arg_info
         phpzig.FunctionDesc.createFrom("hello_sum", helloSum, SumArgs),
         phpzig.FunctionDesc.createFrom("hello_format", helloFormat, FormatArgs),
+        // v0.6.0: 数组高级操作 + Zval 运算符
+        phpzig.FunctionDesc.createWithParams("hello_array_shift", helloArrayShift, &.{phpzig.ParamDesc.create("arr")}),
+        phpzig.FunctionDesc.createWithParams("hello_array_unshift", helloArrayUnshift, &.{ phpzig.ParamDesc.create("arr"), phpzig.ParamDesc.create("val") }),
+        phpzig.FunctionDesc.createWithParams("hello_array_merge", helloArrayMerge, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
+        phpzig.FunctionDesc.createWithParams("hello_array_keys", helloArrayKeys, &.{phpzig.ParamDesc.create("arr")}),
+        phpzig.FunctionDesc.createWithParams("hello_array_values", helloArrayValues, &.{phpzig.ParamDesc.create("arr")}),
+        phpzig.FunctionDesc.createWithParams("hello_array_slice", helloArraySlice, &.{ phpzig.ParamDesc.create("arr"), phpzig.ParamDesc.create("offset"), phpzig.ParamDesc.create("len") }),
+        phpzig.FunctionDesc.createWithParams("hello_array_sort", helloArraySort, &.{phpzig.ParamDesc.create("arr")}),
+        phpzig.FunctionDesc.createWithParams("hello_array_each", helloArrayEach, &.{phpzig.ParamDesc.create("arr")}),
+        phpzig.FunctionDesc.createWithParams("hello_zval_add", helloZvalAdd, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
+        phpzig.FunctionDesc.createWithParams("hello_zval_cmp", helloZvalCmp, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
     },
     .minit = myMinit,
     .constants = &.{
@@ -330,10 +450,6 @@ const HelloModule = phpzig.Module(.{
             phpzig.ClassPropertyDesc.createLong("score", 100),
             phpzig.ClassPropertyDesc.createString("label", "ok").makeProtected(),
             phpzig.ClassPropertyDesc.createNull("data"),
-        }),
-        // v0.5.0: 继承
-        phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
-            phpzig.FunctionDesc.create("interest", savingsInterest),
         }),
         // v0.5.0: 继承
         phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{

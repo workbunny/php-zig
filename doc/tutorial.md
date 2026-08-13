@@ -218,6 +218,36 @@ if (a.eql(b)) { /* 按 PHP 类型值比较相等 */ }
 if (a.neq(b)) { /* 不等 */ }
 ```
 
+### zval 关系比较 ★ v0.6.0
+
+```zig
+const a = phpzig.Return.callArg(execute_data, 1);
+const b = phpzig.Return.callArg(execute_data, 2);
+
+const c: i8 = a.cmp(b);  // 三值比较：-1（小于）/ 0（等于）/ 1（大于），等价 PHP <=>
+if (a.lt(b)) { /* a < b */ }
+if (a.le(b)) { /* a <= b */ }
+if (a.gt(b)) { /* a > b */ }
+if (a.ge(b)) { /* a >= b */ }
+```
+
+### zval 算术运算符 ★ v0.6.0
+
+```zig
+const a = phpzig.Return.callArg(execute_data, 1);
+const b = phpzig.Return.callArg(execute_data, 2);
+
+var result: T.Zval = undefined;
+if (a.add(b, &result)) { /* result = a + b */ }
+if (a.sub(b, &result)) { /* result = a - b */ }
+if (a.mul(b, &result)) { /* result = a * b */ }
+if (a.div(b, &result)) { /* result = a / b */ }
+if (a.mod_(b, &result)) { /* result = a % b */ }
+```
+
+算术运算符结果写入调用者提供的 `*T.Zval`（成功返回 `true`），遵循 Zig 显式所有权哲学。
+类型不兼容（如 PHP 8 中字符串 `+` 字符串）时返回 `false`，`result` 未定义。
+
 ### zval 到数组
 
 ```zig
@@ -436,6 +466,46 @@ while (iter.next()) {
 const n: u32 = arr.count();
 ```
 
+### 数组高级操作 ★ v0.6.0
+
+```zig
+// shift — 移除并返回首元素（空数组返回 null）
+if (arr.shift()) |val| { ... }
+
+// unshift — 头部插入（数字键重索引）
+arr.unshift(some_zval);
+
+// merge — 合并两个数组（数字键重索引、字符串键覆盖）
+var merged_zv: T.Zval = undefined;
+arr1.merge(arr2, &merged_zv);
+
+// keys / values — 收集键或值
+var keys_zv: T.Zval = undefined;
+arr.keysInto(&keys_zv);
+
+var vals_zv: T.Zval = undefined;
+arr.valuesInto(&vals_zv);
+
+// slice — 切片（len<0 表示到末尾）
+var slice_zv: T.Zval = undefined;
+arr.sliceInto(&slice_zv, 1, 2);  // 从下标 1 起取 2 个
+
+// sort — 值排序 + 重索引（原地修改）
+arr.sort();
+
+// each — foreach 语法糖，context 指针捕获可变状态
+const SumCtx = struct { sum: c_long = 0 };
+var ctx = SumCtx{};
+arr.each(&ctx, struct {
+    fn cb(ud: ?*anyopaque, v: phpzig.Zval) void {
+        const s: *SumCtx = @ptrCast(@alignCast(ud.?));
+        s.sum += v.toLong();
+    }
+}.cb);
+```
+
+**注意**：`merge/keysInto/valuesInto/sliceInto` 都接受输出参数 `*T.Zval`，由调用者管理结果内存生命周期（与 `Array.init()` 同哲学）。`sort/unshift` 原地修改，调用前若数组可能是共享的，先 `arr.separate()` 写时分离。
+
 ### 数组算法（filter / map / reduce）
 
 ```zig
@@ -520,7 +590,7 @@ comptime {
 ```bash
 cd php-zig
 zig build test
-# 54/54 通过（v0.5.1）
+# 54/54 通过（v0.6.0）
 ```
 
 示例扩展编译后运行 PHP 集成测试：
@@ -529,5 +599,5 @@ zig build test
 cd example
 zig build -Dphp=/usr/local
 php -d extension=zig-out/lib/libhello.so test_all.php
-# 81/81 通过（v0.5.1）
+# 100/100 通过（v0.6.0）
 ```

@@ -104,8 +104,74 @@ pub const Array = struct {
         return Zval.fromPtr(&retval);
     }
 
+    // —— v0.6.0: 队列/栈操作 ——
+
+    /// 移除并返回第一个元素（等价 PHP array_shift），空数组返回 null
+    pub fn shift(self: *Array) ?Zval {
+        var retval: T.Zval = undefined;
+        if (c.phpglue_array_shift(self.zv.ptr, &retval) == 0) return null;
+        return Zval.fromPtr(&retval);
+    }
+
+    /// 头部插入元素（等价 PHP array_unshift，数字键重索引）
+    pub fn unshift(self: *Array, zv: Zval) void {
+        c.phpglue_array_unshift(self.zv.ptr, zv.ptr);
+    }
+
+    // —— v0.6.0: 集合操作 ——
+
+    /// 合并另一个数组，结果写入 out_zv（等价 PHP array_merge，本数组在前）
+    pub fn merge(self: *Array, other: Array, out_zv: *T.Zval) void {
+        c.phpglue_array_merge(out_zv, self.zv.ptr, other.zv.ptr);
+    }
+
+    /// 收集所有键到 out_zv（等价 PHP array_keys）
+    pub fn keysInto(self: *Array, out_zv: *T.Zval) void {
+        c.phpglue_array_keys(self.zv.ptr, out_zv);
+    }
+
+    /// 收集所有值到 out_zv（等价 PHP array_values，数字键重索引）
+    pub fn valuesInto(self: *Array, out_zv: *T.Zval) void {
+        c.phpglue_array_values(self.zv.ptr, out_zv);
+    }
+
+    /// 切片：从 offset 起取 len 个元素（len<0 表示到末尾），结果写入 out_zv
+    pub fn sliceInto(self: *Array, out_zv: *T.Zval, offset: T.zend_long, len: T.zend_long) void {
+        c.phpglue_array_slice(self.zv.ptr, out_zv, offset, len);
+    }
+
+    /// 值排序 + 重索引（等价 PHP sort()，原地修改）
+    pub fn sort(self: *Array) void {
+        c.phpglue_array_sort(self.zv.ptr);
+    }
+
     pub fn iterator(self: *Array) Iterator {
         return Iterator.init(self.hashTable());
+    }
+
+    // —— v0.6.0: foreach 语法糖 ——
+
+    /// 遍历每个元素执行回调（不修改数组）。
+    /// ctx 为可选上下文指针，回调内部可 `@ptrCast` 恢复成自己的状态类型，
+    /// 从而在遍历过程中累积可变状态。
+    ///
+    /// ```zig
+    /// const Ctx = struct { sum: i64 = 0 };
+    /// var ctx = Ctx{};
+    /// arr.each(&ctx, struct {
+    ///     fn cb(ctx: ?*anyopaque, v: Zval) void {
+    ///         const c: *Ctx = @ptrCast(@alignCast(ctx.?));
+    ///         c.sum += v.toLong();
+    ///     }
+    /// }.cb);
+    /// ```
+    pub fn each(self: *Array, ctx: ?*anyopaque, cb: fn (?*anyopaque, Zval) void) void {
+        var iter = self.iterator();
+        if (self.count() == 0) return;
+        if (iter.value()) |v| cb(ctx, v);
+        while (iter.next()) {
+            if (iter.value()) |v| cb(ctx, v);
+        }
     }
 
     // ＝＝ 数组算法（纯 Zig，无 C glue，结果落入调用者提供的 zval） ＝＝

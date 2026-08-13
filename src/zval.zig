@@ -83,6 +83,45 @@ pub const Zval = struct {
         return !self.eql(other);
     }
 
+    // ＝＝ 比较运算符（v0.6.0，基于 PHP 三值比较） ＝＝
+
+    /// 三值比较：返回 -1（小于）/ 0（等于）/ 1（大于），等价 PHP <=>
+    pub fn cmp(self: Zval, other: Zval) i8 {
+        return @intCast(c.phpglue_zval_compare(self.ptr, other.ptr));
+    }
+
+    /// 小于 <
+    pub fn lt(self: Zval, other: Zval) bool { return self.cmp(other) < 0; }
+    /// 小于等于 <=
+    pub fn le(self: Zval, other: Zval) bool { return self.cmp(other) <= 0; }
+    /// 大于 >
+    pub fn gt(self: Zval, other: Zval) bool { return self.cmp(other) > 0; }
+    /// 大于等于 >=
+    pub fn ge(self: Zval, other: Zval) bool { return self.cmp(other) >= 0; }
+
+    // ＝＝ 算术运算符（v0.6.0，结果写入调用者提供的 zval） ＝＝
+
+    /// 加法，成功返回 true；失败（类型不兼容）result 未定义
+    pub fn add(self: Zval, other: Zval, result: *T.Zval) bool {
+        return c.phpglue_zval_add(result, self.ptr, other.ptr) != 0;
+    }
+    /// 减法
+    pub fn sub(self: Zval, other: Zval, result: *T.Zval) bool {
+        return c.phpglue_zval_sub(result, self.ptr, other.ptr) != 0;
+    }
+    /// 乘法
+    pub fn mul(self: Zval, other: Zval, result: *T.Zval) bool {
+        return c.phpglue_zval_mul(result, self.ptr, other.ptr) != 0;
+    }
+    /// 除法
+    pub fn div(self: Zval, other: Zval, result: *T.Zval) bool {
+        return c.phpglue_zval_div(result, self.ptr, other.ptr) != 0;
+    }
+    /// 取模
+    pub fn mod_(self: Zval, other: Zval, result: *T.Zval) bool {
+        return c.phpglue_zval_mod(result, self.ptr, other.ptr) != 0;
+    }
+
     // ＝＝ 引用计数与复制 ＝＝
 
     pub fn addRef(self: Zval) void { c.phpglue_zval_add_ref(self.ptr); }

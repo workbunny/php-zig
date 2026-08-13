@@ -153,6 +153,23 @@ int    phpglue_hash_get_current_key_ex(zend_array *ht, zend_string **str_index, 
 
 int    phpglue_array_pop(zval *zv, zval *retval);
 
+/* — v0.6.0: 数组高级操作 — */
+
+/** 移除并返回第一个元素（遍历顺序），空数组返回 0 */
+int    phpglue_array_shift(zval *zv, zval *retval);
+/** 头部插入元素（数字键重索引） */
+void   phpglue_array_unshift(zval *zv, zval *val);
+/** 合并两个数组，结果写入 dst */
+void   phpglue_array_merge(zval *dst, zval *src1, zval *src2);
+/** 收集所有键到 dst */
+void   phpglue_array_keys(zval *src, zval *dst);
+/** 收集所有值到 dst */
+void   phpglue_array_values(zval *src, zval *dst);
+/** 切片：从 offset 起取 len 个元素（len<0 表示到末尾），结果写入 dst */
+void   phpglue_array_slice(zval *src, zval *dst, zend_long offset, zend_long len);
+/** 值排序 + 重索引（等价 PHP sort()） */
+void   phpglue_array_sort(zval *zv);
+
 /* ================================================================
  * 对象操作
  * ================================================================ */
@@ -255,6 +272,20 @@ int phpglue_call_method(zval *obj, const char *name, size_t name_len, zval *retv
  * ================================================================ */
 
 int phpglue_zval_is_true(zval *zv);
+
+/* ================================================================
+ * zval 算术运算符（v0.6.0）
+ * 返回值：SUCCESS / FAILURE
+ * ================================================================ */
+
+int phpglue_zval_add(zval *result, zval *op1, zval *op2);
+int phpglue_zval_sub(zval *result, zval *op1, zval *op2);
+int phpglue_zval_mul(zval *result, zval *op1, zval *op2);
+int phpglue_zval_div(zval *result, zval *op1, zval *op2);
+int phpglue_zval_mod(zval *result, zval *op1, zval *op2);
+
+/** 三值比较：返回 -1 / 0 / 1（等价 PHP <=> 飞船运算符） */
+int phpglue_zval_compare(zval *op1, zval *op2);
 
 #ifdef __cplusplus
 }

@@ -247,29 +247,6 @@ PHP 8.4 中 `zend_read_property(NULL, ...)` 和 `zend_update_property(NULL, ...)
 - **读属性**：改用 `zend_hash_find(obj->properties, zend_string*)` 直接查找 HashTable，绕过 `zend_read_property` 的 scope 校验。因为 `object_init` 创建的 stdClass 的 `properties` 是一个普通 HashTable，不需要复杂的继承链查找。
 - **创建对象**：用 `object_init(zv)` 替代 `call_user_function("stdClass", ...)`。前者直接分配 zend_object，后者需要函数表查找和调用栈开销，且在模块加载早期可能尚未注册。
 
-## 类属性声明：`zend_declare_property` 而非 `_ex` 版本
-
-### 问题
-
-类属性声明需要设置默认值。PHP 提供 `zend_declare_property`（接收 `char*/size_t` 对）和 `zend_declare_property_ex`（接收 `zend_string*`）。与类常量类似，属性声明必须在 `zend_register_internal_class` **之后**调用——`ce` 在注册前是临时变量，`properties` 表未初始化。
-
-### 解决方案
-
-统一使用 `zend_declare_property`（非 `_ex` 版本）在已注册的 `ce_ptr` 上声明。5 种默认值类型：
-
-```c
-ZVAL_LONG(&zv, val);       // long
-ZVAL_DOUBLE(&zv, val);     // double
-ZVAL_STRINGL(&zv, s, l);   // string
-ZVAL_BOOL(&zv, val);       // bool
-ZVAL_NULL(&zv);            // null
-zend_declare_property(ce_ptr, name, name_len, &zv, ZEND_ACC_PUBLIC);
-```
-
-访问修饰符通过 `access` 参数传递：`ZEND_ACC_PUBLIC | ZEND_ACC_PROTECTED | ZEND_ACC_PRIVATE | ZEND_ACC_STATIC`。
-
-**时序**：先 `zend_register_internal_class` → 再 `zend_declare_class_constant`（类常量） → 再 `zend_declare_property`（类属性）。三者顺序不可颠倒。
-
 ## 类继承时父类查找：CG(class_table) 键小写
 
 ### 问题
@@ -330,21 +307,7 @@ zend_declare_property_null(ce_ptr,   name, nlen, access);
 
 这些函数全部为 `void` 返回，内部自管理所有 zval/zend_string 生命周期，shutdown 时 PHP 统一清理。
 
-## 类继承父类查找：CG(class_table) 小写键
-
-### 问题
-
-PHP 内部 `CG(class_table)` 中所有类名以**小写** zend_string 存储。`zend_hash_str_find_ptr` 直接用原始大小写名称查找 → NULL。
-
-### 解决方案
-
-```c
-char buf[128];
-for (size_t i = 0; i < len; i++) buf[i] = tolower(name[i]);
-zend_hash_str_find_ptr(CG(class_table), buf, len);
-```
-
-`zend_lookup_class` 在 MINIT 阶段行为不稳定，直接操作 HashTable 更可靠。
+**时序**（不可颠倒）：先 `zend_register_internal_class` → 再 `zend_declare_class_constant`（类常量） → 再 `zend_declare_property_*`（类属性）。三者都必须在已注册的 `ce_ptr` 上调用，不能作用于 `INIT_CLASS_ENTRY_EX` 的临时 `ce`（此时 `properties`/`constants_table` 未初始化）。
 
 ## Zig 0.16 comptime: marker 值冲突
 
@@ -378,3 +341,62 @@ zend_hash_str_find_ptr(CG(class_table), buf, len);
 
 comptime 逻辑「看似不生效」时，优先排查输入样本是否正确（前缀、拼写、大小写），
 不要急于断言编译器/语言层有 bug。真正影响行为的只有 marker 值冲突这一处。
+
+## 数组 merge：zend_hash_merge 丢失数字键元素
+
+### 问题
+
+初次用 `zend_hash_merge` 实现 `array_merge`：
+
+```c
+zend_hash_merge(Z_ARRVAL_P(dst), Z_ARRVAL_P(src1), zval_add_ref, 0);
+zend_hash_merge(Z_ARRVAL_P(dst), Z_ARRVAL_P(src2), zval_add_ref, 0);
+```
+
+第二个数组 `[3,4]` 的数字键 `0`/`1` 与第一个数组 `[1,2]` 已存在的键冲突，`overwrite=0` 时 `zend_hash_merge` 直接**跳过**冲突键——结果 `[1,2]` 而不是预期的 `[1,2,3,4]`。
+
+### 解决方案
+
+手动遍历两个源数组，模拟 PHP `array_merge` 语义：数字键 → 追加（重新索引），字符串键 → 覆盖/新增。
+
+```c
+ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(src1), num_key, str_key, data) {
+    if (str_key) add_assoc_zval(dst, ZSTR_VAL(str_key), data);
+    else         add_next_index_zval(dst, data);
+} ZEND_HASH_FOREACH_END();
+// 对 src2 重复同样流程
+```
+
+`zend_hash_merge` 只适合「键不冲突」的合并场景，不适用 `array_merge` 的「数字键重索引」语义。
+
+## each 语法糖：comptime 回调无法捕获运行时状态
+
+### 问题
+
+`Array.each` 最初设计为 comptime 回调：
+
+```zig
+pub fn each(self: *Array, comptime cb: fn (Zval) void) void { ... }
+```
+
+但 comptime 函数指针**不能引用运行时变量**——想遍历累加 `sum` 时，`cb` 无法捕获 `&sum`。comptime 回调只能做无状态的纯处理。
+
+### 解决方案
+
+改为 runtime 回调 + context 指针，允许回调内部 `@ptrCast` 恢复成自己的状态类型：
+
+```zig
+pub fn each(self: *Array, ctx: ?*anyopaque, cb: fn (?*anyopaque, Zval) void) void { ... }
+
+// 调用方
+const SumCtx = struct { sum: c_long = 0 };
+var ctx = SumCtx{};
+arr.each(&ctx, struct {
+    fn cb(ud: ?*anyopaque, v: Zval) void {
+        const s: *SumCtx = @ptrCast(@alignCast(ud.?));
+        s.sum += v.toLong();
+    }
+}.cb);
+```
+
+`?*anyopaque` 作为不透明上下文，把「状态捕获」从编译期下放到运行时，是 Zig 中遍历回调的惯用模式（类似 C 的 `qsort` ctx）。

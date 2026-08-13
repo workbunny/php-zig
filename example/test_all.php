@@ -70,7 +70,7 @@ echo "\n=== 1. 模块级函数 ===\n";
 test('hello_world() 返回字符串', 'Hello from Zig!', hello_world());
 test('hello_name("Bob") 返回问候语', 'Hello, Bob!', hello_name('Bob'));
 test('hello_name() 无参返回 null', null, @hello_name());
-test('version() 返回版本字符串', 'php-zig v0.5.0', version());
+test('version() 返回版本字符串', 'php-zig v0.6.0', version());
 
 // ============================================================
 // 2. 返回值类型 — 9种全覆盖
@@ -275,6 +275,50 @@ test('Calculator::add(1,1) 仍正常', 2, Calculator::add(1, 1));
 $rSA = new ReflectionClass('SavingsAccount');
 test('SavingsAccount 父类为 BankAccount', 'BankAccount', $rSA->getParentClass()->getName());
 test('SavingsAccount 有 interest 方法', true, $rSA->hasMethod('interest'));
+
+// ============================================================
+// 19. v0.6.0: 数组高级操作 + Zval 运算符
+// ============================================================
+echo "\n=== 19. v0.6.0: 数组高级操作 + Zval 运算符 ===\n";
+
+// shift — 移除并返回第一个元素
+test('hello_array_shift([1,2,3]) → 1', 1, hello_array_shift([1, 2, 3]));
+test('hello_array_shift([]) → null', null, hello_array_shift([]));
+
+// unshift — 头部插入
+test('hello_array_unshift([2,3], 1) → [1,2,3]', [1, 2, 3], hello_array_unshift([2, 3], 1));
+
+// merge — 合并两个数组
+test('hello_array_merge([1,2],[3,4]) → [1,2,3,4]', [1, 2, 3, 4], hello_array_merge([1, 2], [3, 4]));
+test('hello_array_merge 关联键覆盖', ['a' => 1, 'b' => 2], hello_array_merge(['a' => 1], ['b' => 2]));
+
+// keys
+test('hello_array_keys 数字键', [0, 1, 2], hello_array_keys([10, 20, 30]));
+test('hello_array_keys 关联键', ['x', 'y'], hello_array_keys(['x' => 1, 'y' => 2]));
+
+// values
+test('hello_array_values 关联数组 → 值列表', [1, 2, 3], hello_array_values(['a' => 1, 'b' => 2, 'c' => 3]));
+
+// slice
+test('hello_array_slice([1,2,3,4],1,2) → [2,3]', [2, 3], hello_array_slice([1, 2, 3, 4], 1, 2));
+test('hello_array_slice([1,2,3,4],2,-1) → [3,4]', [3, 4], hello_array_slice([1, 2, 3, 4], 2, -1));
+
+// sort
+test('hello_array_sort([3,1,2]) → [1,2,3]', [1, 2, 3], hello_array_sort([3, 1, 2]));
+
+// each — foreach 语法糖（求和）
+test('hello_array_each([1,2,3,4]) → 10', 10, hello_array_each([1, 2, 3, 4]));
+
+// Zval 算术运算符
+test('hello_zval_add(1,2) → 3', 3, hello_zval_add(1, 2));
+test('hello_zval_add(1.5, 2) → 3.5', 3.5, hello_zval_add(1.5, 2));
+test('hello_zval_add(5,7) → 12', 12, hello_zval_add(5, 7));
+
+// Zval 比较运算符
+test('hello_zval_cmp(1,2) → -1', -1, hello_zval_cmp(1, 2));
+test('hello_zval_cmp(2,1) → 1', 1, hello_zval_cmp(2, 1));
+test('hello_zval_cmp(1,1) → 0', 0, hello_zval_cmp(1, 1));
+test('hello_zval_cmp("a","b") → -1', -1, hello_zval_cmp('a', 'b'));
 
 // ============================================================
 // 结果汇总
