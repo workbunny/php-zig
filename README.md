@@ -57,7 +57,7 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
 - **`defer` + 明确所有权**：引用计数、动态分配的释放路径显式但无噪声，不会漏也不会 double-free。
 - **原生交叉编译**：`zig build -Dphp=/path/to/arm-php` 直接产出目标架构的 `.so`。
 
-**代价**：必须保留约 300 行 C 胶水层。Zend Engine 的核心 API 以"语句级宏"的形式存在（`ZVAL_STRINGL` 内部包含 `return` 语句），`@cImport` 无法翻译。这部分 C 代码是刚性依赖，无法消除。
+**代价**：必须保留 C 胶水层（`glue/`）。Zend Engine 的核心 API 以"语句级宏"的形式存在（`ZVAL_STRINGL` 内部包含 `return` 语句），`@cImport` 无法翻译。这部分 C 代码是刚性依赖，无法消除。
 
 ## 架构
 

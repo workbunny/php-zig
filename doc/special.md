@@ -37,9 +37,48 @@ C 头文件 ──Zig cc──► php_glue.c（宏正常展开为普通函数）
 - Zig 侧类型边界干净，无隐式转换烦恼
 - 版本适配在 C glue 内部用运行时查询完成
 
-**代价**：约 300 行手写 C 胶水层是刚性依赖，每加一个能力要同步写 C + Zig 两端。但相比 translate-c 不可控的翻译结果，这是可接受、确定性的成本。
+**代价**：手写 C 胶水层（`glue/`）是刚性依赖，每加一个能力要同步写 C + Zig 两端。但相比 translate-c 不可控的翻译结果，这是可接受、确定性的成本。
 
 > 本决策为 php-zig 的架构基石，后续所有「Zig 写不了的宏」都遵循此原则在 C glue 侧封装。
+
+## glue 分类：哪些必须 C、哪些可 Zig
+
+glue 现状约 1285 行（`php_glue.c` 873 + `php_glue.h` 412）。随着能力增长，需要厘清哪些是「刚性依赖」，哪些是「薄包装」。分类标准如下：
+
+### A 类：必须 C 实现（约占 90%）—— glue 存在的根本原因
+
+这些是 Zig 在**语法层面无法表达**的，必须由 C 编译器处理：
+
+| 类别 | 代表符号 | 为什么 Zig 做不了 |
+|------|---------|------------------|
+| 语句级宏 | `ZVAL_*`、`Z_TYPE_P`、`Z_LVAL_P`、`Z_STRVAL_P`、`Z_ARRVAL_P` | 是 `do-while` 块/union 成员解引用，非表达式 |
+| 提前返回宏 | `RETVAL_*` | 依赖 C 函数参数名 `return_value`（`RETVAL_STRING` 内引用该名） |
+| 遍历宏 | `ZEND_HASH_FOREACH_VAL/KEY_VAL` | 依赖指针运算 + `for` 块展开 |
+| 编译期常量 | `ZEND_ACC_*`、`sizeof(zval)`、`sizeof(zend_internal_arg_info)`、`USING_ZTS`、`ZEND_MODULE_API_NO` | Zig 无法从 PHP 头文件读取宏/`sizeof` 值 |
+| arg_info 模板 | `ZEND_BEGIN_ARG_INFO_EX`、`ZEND_ARG_INFO`、`ZEND_TYPE_INIT_CODE`、`_ZEND_ARG_INFO_FLAGS` | translate-c 完全无法还原，必须 C 宏展开 |
+| 结构体布局 | `zend_internal_function`（闭包）、`Bucket`（排序）、`zend_ini_entry_def`（INI） | 跨版本布局不稳定，Zig 侧不定义 |
+| 容器宏 | `INIT_CLASS_ENTRY_EX`、`CG(class_table)`、`Z_OBJ_P`、`Z_OBJCE_P` | 线程局部全局 + 结构体初始化 |
+| 回调宏 | `ZEND_INI_MH`、`getThis()`、`XtOffsetOf` | 依赖特定变量名 / `offsetof` 技巧 |
+| 可变参数函数 | `php_error_docref` | Zig extern fn 无法安全封装 C 可变参数 |
+
+### B 类：纯函数薄包装（约占 10%）—— 技术上 Zig 可 extern fn 直接调，但保留 glue 更优
+
+这些本质是「普通 Zend 函数」的 1:1 转发，没有任何宏。Zig 理论上可以 `extern fn` 直接声明调用：
+
+- `zend_hash_num_elements` / `zend_hash_str_find` / `zend_hash_index_find` / `zend_hash_str_exists` / `zend_hash_index_exists` / `zend_hash_str_del` / `zend_hash_index_del`（7 个查询）
+- `zend_hash_internal_pointer_reset` / `zend_hash_move_forward` / `zend_hash_get_current_data` / `zend_hash_get_current_key`（4 个遍历）
+- `zend_is_true` / `zend_is_callable` / `zend_is_iterable`
+- `add_function` / `sub_function` / `mul_function` / `div_function` / `mod_function` / `compare_function`
+- `zend_register_*_constant`
+- `zend_throw_exception` / `zend_fetch_resource`
+
+**为何仍保留 glue**：这些函数的**符号名/签名跨 PHP 版本可能变化**（如 `call_user_function_ex` → PHP 8.4 的 `call_user_function`）。若 Zig 直接 extern fn，则每个 PHP 版本都要维护一套 extern 声明；保留 glue 把版本差异隔离在 C 层，Zig 侧永远只看到稳定的 `phpglue_*` ABI。
+
+### 结论
+
+glue 的膨胀是**必然的**——每加一个能力（数组/对象/闭包/INI/序列化/异常）都要同步写 C + Zig 两端。但膨胀的根源是 A 类（宏刚性依赖），B 类薄包装是「有意为之的版本隔离」，不是冗余。**当前 glue 基本符合第一轮的「最小原则」**：没有「本可 Zig 实现却放在 C」的冗余代码。
+
+唯一可讨论的优化是把 B 类的 12 个 `zend_hash_*` 薄包装移到 Zig 侧直接 extern fn，但会破坏「版本差异隔离在 C 层」的架构原则，得不偿失——**不建议精简**。
 
 ## arg_info 的 C 端模板策略
 
