@@ -5,6 +5,7 @@
 const c = @import("php_c.zig");
 const T = @import("php_types.zig");
 const Array = @import("array.zig").Array;
+const Object = @import("object.zig").Object;
 
 pub const Zval = struct {
     ptr: *T.Zval,
@@ -55,6 +56,12 @@ pub const Zval = struct {
     pub fn toArray(self: Zval) ?Array {
         if (!self.isArray()) return null;
         return Array.fromZval(self);
+    }
+
+    /// 转换为 PHP 对象包装（仅当 IS_OBJECT 时有效）
+    pub fn toObject(self: Zval) ?Object {
+        if (!self.isObject()) return null;
+        return Object.fromZval(self);
     }
 
     // ＝＝ 设值 ＝＝

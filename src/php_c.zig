@@ -153,6 +153,8 @@ pub extern fn phpglue_get_empty_arg_info()                                      
 pub extern fn phpglue_fill_arg_info(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, name_count: usize, out_entry_count: *usize) void;
 /// 类型化版本 — types/allow_null 各为 name_count 个 u8 的数组
 pub extern fn phpglue_fill_arg_info_typed(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, name_count: usize, out_entry_count: *usize) void;
+/// 完整版 — 在 typed 基础上增加 variadic 与 default_values（均可传 null 表示无）
+pub extern fn phpglue_fill_arg_info_full(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, variadic: [*c]const u8, default_values: [*c]const ?[*:0]const u8, name_count: usize, out_entry_count: *usize) void;
 
 // ＝＝＝＝ 类注册 ＝＝＝＝
 
@@ -185,6 +187,7 @@ pub extern fn phpglue_register_constant_null(name: [*c]const u8, name_len: usize
 // ＝＝＝＝ 异常 / 错误 ＝＝＝＝
 
 pub extern fn phpglue_throw_exception(message: [*c]const u8, message_len: usize) void;
+pub extern fn phpglue_throw_exception_class(class_name: [*c]const u8, class_len: usize, message: [*c]const u8, message_len: usize, code: T.zend_long) c_int;
 
 // ＝＝＝＝ PHP 函数调用（Facade） ＝＝＝＝
 
@@ -227,3 +230,28 @@ pub extern fn phpglue_create_closure(res: *T.Zval, handler: T.FunctionHandler, n
 // ＝＝＝＝ 错误报告 ＝＝＝＝
 
 pub extern fn phpglue_error_docref(docref: ?[*:0]const u8, type: c_int, msg: [*c]const u8) void;
+
+// ＝＝＝＝ 序列化 ＝＝＝＝
+
+pub extern fn phpglue_var_serialize(zv: *T.Zval, return_value: *T.Zval) void;
+pub extern fn phpglue_var_unserialize(s: [*c]const u8, len: usize, return_value: *T.Zval) c_int;
+
+// ＝＝＝＝ INI 配置 ＝＝＝＝
+
+/// INI 项类型：0=long 1=string 2=bool
+pub const IniType = enum(u8) { long = 0, string = 1, bool = 2 };
+/// INI 可修改级别（对应 ZEND_INI_USER/PERDIR/SYSTEM/ALL）
+pub const IniModifiable = enum(u8) { user = 1, perdir = 2, system = 4, all = 7 };
+
+pub extern fn phpglue_register_ini_entries(names: [*c]const [*c]const u8, name_lens: [*c]usize, default_values: [*c]const [*c]const u8, types: [*c]const u8, modifiables: [*c]const u8, count: usize, module_number: c_int) c_int;
+pub extern fn phpglue_ini_get_long(name: [*c]const u8, name_len: usize, dflt: T.zend_long) T.zend_long;
+pub extern fn phpglue_ini_get_string(name: [*c]const u8, name_len: usize) [*c]u8;
+pub extern fn phpglue_ini_get_bool(name: [*c]const u8, name_len: usize, dflt: bool) bool;
+pub extern fn phpglue_unregister_ini_entries(module_number: c_int) void;
+pub extern fn phpglue_set_ini_notify(cb: ?*const fn (name: [*c]const u8, name_len: usize) callconv(.c) void) void;
+
+// ＝＝＝＝ 对象存储（extern struct 绑定） ＝＝＝＝
+
+pub extern fn phpglue_register_object_class(name: [*c]const u8, name_len: usize, methods: ?*anyopaque, extra_size: usize, init: ?*const fn (extra: ?*anyopaque) callconv(.c) void, dtor: ?*const fn (extra: ?*anyopaque) callconv(.c) void) ?*T.ZendClassEntry;
+pub extern fn phpglue_object_get_extra(obj: *T.Zval) ?*anyopaque;
+pub extern fn phpglue_get_this(execute_data: *T.ZendExecuteData) ?*T.Zval;

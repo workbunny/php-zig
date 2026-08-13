@@ -1,6 +1,9 @@
 //! php-zig 框架构建文件
 const std = @import("std");
 
+/// 构建辅助：让下游 build 脚本通过 `@import("phpzig").build_php_ext` 复用扩展构建逻辑
+pub const build_php_ext = @import("build_php_ext.zig");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});

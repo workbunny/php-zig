@@ -1,11 +1,11 @@
 .{
-    .name = .example,
-    .fingerprint = 0x6eec9b9f7306b56d,
-    .version = "0.1.0",
+    .name = .hello,
+    .fingerprint = 0x3610a68618314fbb,
+    .version = "1.0.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .phpzig = .{
-            .path = "..",
+            .path = "../..",
         },
     },
     .paths = .{

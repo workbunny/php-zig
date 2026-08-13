@@ -32,40 +32,56 @@ myext/
 
 ## build.zig
 
+php-zig 提供 `addPhpExtension` 构建辅助，一行完成扩展编译的全部通用工作
+（target/optimize 注册、phpzig 依赖、PHP 头文件、C glue 编译、动态库输出）：
+
 ```zig
 const std = @import("std");
+const build_php_ext = @import("phpzig").build_php_ext;
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
     const php_prefix = b.option([]const u8, "php", "PHP prefix path") orelse {
         @panic("-Dphp is required");
     };
-    const phpzig_dep = b.dependency("phpzig", .{ .target = target, .optimize = optimize });
-    const phpzig_mod = phpzig_dep.module("phpzig");
 
-    const ext_mod = b.addModule("myext_root", .{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
+    // 返回 *Step.Compile，可继续追加 step 依赖
+    const ext = build_php_ext.addPhpExtension(b, "myext", b.path("src/main.zig"), .{
+        .php_prefix = php_prefix,
     });
-    ext_mod.addImport("phpzig", phpzig_mod);
-
-    const subdirs = [_][]const u8{
-        "include/php/main", "include/php", "include/php/Zend",
-        "include/php/ext", "include/php/TSRM",
-    };
-    for (subdirs) |sub| ext_mod.addIncludePath(.{
-        .cwd_relative = b.pathJoin(&.{ php_prefix, sub }),
-    });
-    ext_mod.addIncludePath(phpzig_dep.path("glue"));
-    ext_mod.linkSystemLibrary("c", .{});
-    ext_mod.addCSourceFile(.{ .file = phpzig_dep.path("glue/php_glue.c"), .flags = &.{} });
-
-    const ext = b.addLibrary(.{ .linkage = .dynamic, .name = "myext", .root_module = ext_mod });
-    b.installArtifact(ext);
 }
 ```
+
+### 注册透传：自定义构建参数
+
+`standardTargetOptions` / `standardOptimizeOption` 只能注册一次（重复会 panic），
+由 `addPhpExtension` 统一注册。下游若有自己的 `-D` 参数或额外构建逻辑，
+通过 `configure` 回调透传：
+
+```zig
+const ext = build_php_ext.addPhpExtension(b, "myext", b.path("src/main.zig"), .{
+    .php_prefix = php_prefix,
+    .configure = struct {
+        fn cfg(ctx: *build_php_ext.ExtContext) void {
+            // 解析自定义 -D 参数
+            const extra = ctx.b.option(bool, "extra", "enable extra feature") orelse false;
+            if (extra) {
+                // 追加模块配置：额外头文件 / 链接库 / 宏
+                ctx.module.addIncludePath(.{ .cwd_relative = ctx.b.pathJoin(&.{ ctx.php_prefix, "include" }) });
+                ctx.module.linkSystemLibrary("curl", .{});
+                ctx.module.defineCMacro("MYEXT_EXTRA", null);
+            }
+        }
+    }.cfg,
+});
+```
+
+`ExtContext` 提供：`b`（Build）、`module`（扩展模块）、`target`、`optimize`、`php_prefix`。
+注意回调是普通函数，无法捕获外层局部变量，所需上下文均由 `ExtContext` 提供。
+
+### 手动构建（可选）
+
+若需完全手动控制构建流程，可参照 `example/hello/build.zig` 早期写法，但通常推荐
+直接用 `addPhpExtension`。
 
 ## 第一个扩展
 
@@ -110,7 +126,7 @@ phpzig.FunctionDesc.createWithParams("add", add, &.{
 }),
 ```
 
-### 参数元信息（comptime struct 反射）★ v0.4.0 新增
+### 参数元信息（comptime struct 反射）
 
 Zig 惯用方式：定义一个 struct，字段名 = 参数名，字段类型 → PHP 类型标注。
 编译期自动推导 arg_info，零手写：
@@ -153,6 +169,34 @@ phpzig.FunctionDesc.createFrom("query", query, OptArgs),
 
 声明式 `createWithParams` 完全保留，与 comptime 反射双轨并行——
 C/C++ 开发者习惯声明式，Zig 开发者习惯类型推导，各取所需。
+
+### 参数默认值 + 可变参数
+
+`ParamDesc` 支持默认值与可变参数，Reflection 可完整读取：
+
+```zig
+phpzig.FunctionDesc.createWithParams("greet", greet, &.{
+    phpzig.ParamDesc.create("name"),
+    // 默认值以 PHP 源码字符串形式给出
+    phpzig.ParamDesc.createTypedWithDefault("greeting", .string, "\"Hello\""),
+}),
+
+phpzig.FunctionDesc.createWithParams("sum_all", sumAll, &.{
+    phpzig.ParamDesc.create("first"),
+    phpzig.ParamDesc.createVariadic("rest"),        // ...$rest
+    // 带类型的可变参数：createVariadicTyped("rest", .long)
+}),
+```
+
+```php
+greet("Bob");            // → "Hello, Bob!"（使用默认 greeting）
+greet("Bob", "Hi");      // → "Hi, Bob!"
+sum_all(1, 2, 3);        // → 6
+```
+
+`default_value` 是**源码文本**，字符串默认值需写 `"\"Hello\""`，
+数值/布尔/null 写字面量（`"0"`、`"1"`、`"NULL"`、`"[]"`）。
+可变参数不计入必填参数数（`getNumberOfRequiredParameters`）。
 
 ### 返回值类型
 
@@ -225,7 +269,7 @@ if (a.eql(b)) { /* 按 PHP 类型值比较相等 */ }
 if (a.neq(b)) { /* 不等 */ }
 ```
 
-### zval 关系比较 ★ v0.6.0
+### zval 关系比较
 
 ```zig
 const a = phpzig.Return.callArg(execute_data, 1);
@@ -238,7 +282,7 @@ if (a.gt(b)) { /* a > b */ }
 if (a.ge(b)) { /* a >= b */ }
 ```
 
-### zval 算术运算符 ★ v0.6.0
+### zval 算术运算符
 
 ```zig
 const a = phpzig.Return.callArg(execute_data, 1);
@@ -255,7 +299,7 @@ if (a.mod_(b, &result)) { /* result = a % b */ }
 算术运算符结果写入调用者提供的 `*T.Zval`（成功返回 `true`），遵循 Zig 显式所有权哲学。
 类型不兼容（如 PHP 8 中字符串 `+` 字符串）时返回 `false`，`result` 未定义。
 
-### zval 到数组
+### zval -> 数组
 
 ```zig
 const arg = phpzig.Return.callArg(execute_data, 1);
@@ -265,8 +309,30 @@ const arr = arg.toArray() orelse { phpzig.Return.returnNull(return_value); retur
 ### 异常抛出
 
 ```zig
+// 抛出 \Exception（最常用）
 phpzig.Throw.throwException("Division by zero");
+
+// 按类名抛出任意异常/错误类（自定义异常类 + Error 家族）
+phpzig.Throw.throwClass("MyAppException", "custom error");
+phpzig.Throw.throwClassCode("MyAppError", "with code", 42);
+
+// 内置 Error 家族快捷方法
+phpzig.Throw.throwError("generic error");          // \Error
+phpzig.Throw.typeError("type mismatch");           // \TypeError
+phpzig.Throw.valueError("invalid value");          // \ValueError
+phpzig.Throw.divisionByZeroError("div zero");      // \DivisionByZeroError
 ```
+
+自定义异常/错误类用普通继承注册（不自定义 `create_object`，
+message/code/trace 由父类 handler 正确初始化）：
+
+```zig
+phpzig.ClassDesc.createExtends("MyAppException", "Exception", &.{}),
+phpzig.ClassDesc.createExtends("MyAppError", "Error", &.{}),
+```
+
+注意：`warning`/`notice` 是错误报告（`Error.warning/notice`），
+不中断执行、也不属于异常/错误对象体系，勿混淆。
 
 ### 调用 PHP 函数
 
@@ -345,7 +411,7 @@ const M = phpzig.Module(.{
 });
 ```
 
-### 类属性 ★ v0.5.0
+### 类属性
 
 声明式创建属性，5 种类型 + 访问修饰符：
 
@@ -363,7 +429,7 @@ phpzig.ClassDesc.createWithProperties("BankAccount", &.{
 }),
 ```
 
-### 类属性 comptime struct 反射 ★ v0.5.0
+### 类属性 comptime struct 反射
 
 ```zig
 const BankProps = struct {
@@ -378,7 +444,7 @@ phpzig.ClassDesc.createWithPropsFrom("Bank", &.{
 }, BankProps)
 ```
 
-### 类继承 ★ v0.5.0
+### 类继承
 
 ```zig
 phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
@@ -390,7 +456,7 @@ phpzig.ClassDesc.createExtends("SavingsAccount", "BankAccount", &.{
 父类必须是先于子类在同一个 `.classes` 数组中声明的类。
 ```
 
-### 类全反射 ★ v0.5.1 — struct 即 class
+### 类全反射 — struct 即 class
 
 一个 struct 同时定义方法 + 属性 + 魔术方法，编译期全自动推导。
 
@@ -473,7 +539,7 @@ while (iter.next()) {
 const n: u32 = arr.count();
 ```
 
-### 数组高级操作 ★ v0.6.0
+### 数组高级操作
 
 ```zig
 // shift — 移除并返回首元素（空数组返回 null）
@@ -562,6 +628,107 @@ if (phpzig.Object.call(&obj, "someMethod", &retval, &.{})) {
 }
 ```
 
+### zval -> 对象（toObject）
+
+面向对象风格的对象包装：
+
+```zig
+fn readName(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const arg = phpzig.Return.callArg(ed, 1);
+    const obj = arg.toObject() orelse { phpzig.Return.returnNull(rv); return; };
+    if (obj.readProperty("name")) |v| {
+        phpzig.Return.returnString(rv, v.toStringVal());
+    } else {
+        phpzig.Return.returnNull(rv);
+    }
+}
+```
+
+`Object` 结构体包装提供 `readProperty/writeProperty/call/instanceOf`，
+由 `Zval.toObject()` 构造（非对象返回 null）。
+
+### extern struct 对象绑定
+
+将 Zig struct 生命周期绑定到 PHP 对象——每个对象实例持有独立的
+struct 数据区，对象销毁时自动调用 dtor：
+
+```zig
+const Counter = struct { count: i64 = 0 };
+
+fn counterInit(extra: ?*anyopaque) callconv(.c) void {
+    const c: *Counter = @ptrCast(@alignCast(extra.?));
+    c.count = 0;
+}
+fn counterDtor(extra: ?*anyopaque) callconv(.c) void {
+    _ = extra; // 无堆资源可不清理
+}
+
+fn counterIncrement(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const this = phpzig.Return.getThis(ed) orelse { phpzig.Return.returnNull(rv); return; };
+    const extra = phpzig.Object.getExtra(this.ptr) orelse { phpzig.Return.returnNull(rv); return; };
+    const c: *Counter = @ptrCast(@alignCast(extra));
+    c.count += 1;
+    phpzig.Return.returnLong(rv, c.count);
+}
+
+// 注册：Data 类型决定 extra_size，init/dtor 为可选生命周期回调
+phpzig.ClassDesc.createObject("Counter", &.{
+    phpzig.FunctionDesc.create("increment", counterIncrement),
+}, Counter, counterInit, counterDtor),
+```
+
+```php
+$c = new Counter();
+$c->increment();   // → 1
+$c->increment();   // → 2（每个实例独立状态）
+```
+
+### 序列化
+
+等价 PHP `serialize()` / `unserialize()`：
+
+```zig
+fn doSerialize(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const arg = phpzig.Return.callArg(ed, 1);
+    phpzig.Serialize.serialize(arg.ptr, rv);
+}
+
+fn doUnserialize(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const s = phpzig.Return.callArg(ed, 1).toStringVal();
+    var out: T.Zval = undefined;
+    if (phpzig.Serialize.unserialize(s, &out)) {
+        phpzig.Return.returnZval(rv, &out);
+    } else {
+        phpzig.Return.returnNull(rv);
+    }
+}
+```
+
+### INI 配置
+
+声明式注册 INI 项（MINIT 自动注册 / MSHUTDOWN 自动注销），并支持变更通知：
+
+```zig
+const M = phpzig.Module(.{
+    // ...
+    .ini = &.{
+        phpzig.IniEntry.createLong("myext.max_items", "100"),
+        phpzig.IniEntry.createString("myext.greeting", "Hi"),
+        phpzig.IniEntry.createBool("myext.enabled", "1"),
+    },
+    .ini_notify = onIniChange,   // 可选：任一 INI 项变更时触发
+});
+
+fn onIniChange(name: [*c]const u8, name_len: usize) callconv(.c) void {
+    // name/name_len 为变更项名（C 字符串 + 长度）
+}
+
+// 读取
+const max = phpzig.Ini.getLong("myext.max_items", 0);
+if (phpzig.Ini.getString("myext.greeting")) |g| { /* ... */ }
+const enabled = phpzig.Ini.getBool("myext.enabled", false);
+```
+
 ### 资源类型
 
 ```zig
@@ -644,21 +811,55 @@ fn warn(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
 
 ### 模块入口
 
+在 `comptime` 块中调用 `phpzig.moduleInit(@This(), meta)`——扫描当前文件，
+按命名约定自动发现函数与类，并导出 `get_module` 符号。
+
+命名约定（声明须为 `pub`）：
+
+| 声明 | 含义 |
+|------|------|
+| `pub fn php_<name>` | 模块函数 `<name>` |
+| `pub fn php_<name>` + `pub const <name>Args` | 有参函数（Args 字段 = 参数名/类型） |
+| `pub const Class_<name>` | 类 `<name>`（内部用 public_/static_ 等前缀） |
+
 ```zig
-const M = phpzig.Module(.{
-    .name      = "myext",
-    .version   = "1.0.0",
-    .functions = &.{ /* ... */ },
-    .classes   = &.{ /* ... */ },
-    .constants = &.{ /* ... */ },
-    .minit     = myMinit,
-    .rinit     = myRinit,
-    .info_func = myInfo,
-});
+const phpzig = @import("phpzig");
+const T = phpzig.php_types;
+
+// 无参函数——自动发现
+pub fn php_hello(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnString(rv, "Hello");
+}
+
+// 有参函数——参数由伴生 struct 反射
+pub fn php_add(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const a = phpzig.Return.callArg(ed, 1).toLong();
+    const b = phpzig.Return.callArg(ed, 2).toLong();
+    phpzig.Return.returnLong(rv, a + b);
+}
+pub const addArgs = struct { a: i64, b: i64 };   // php_add 的参数
 
 comptime {
-    @export(&M.get_module, .{ .name = "get_module" });
+    phpzig.moduleInit(@This(), .{
+        .name    = "myext",
+        .version = "1.0.0",
+        // 复杂场景用 .functions/.classes 显式补充（与自动发现合并）
+        .classes = &.{ /* 继承/接口/常量/对象绑定等 */ },
+        .constants = &.{ /* 模块常量 */ },
+        .minit   = myMinit,
+    });
 }
+```
+
+**为何不能 100% 只写 `@This()`**：Zig 函数签名没有参数名（`@typeInfo(fn)` 拿不到
+`fn add(a,b)` 的 a/b），所以有参函数必须用 `<name>Args` struct 提供参数名；
+默认值/可变参数也无法从字段推导，需 `meta.functions` 显式。
+
+`moduleInit(@This(), meta)` 的底层仍是 `Module()`（供需要持有 Module type 引用的高级用法）：
+
+```zig
+const M = phpzig.Module(.{ /* opts */ });
+comptime { @export(&M.get_module, .{ .name = "get_module" }); }
 ```
 
 ## 运行测试
@@ -671,11 +872,20 @@ zig build test
 # 57/57 通过
 ```
 
-示例扩展编译后运行 PHP 集成测试：
+集成测试扩展（`example/tests/`）编译后运行 PHP 集成测试：
 
 ```bash
-cd example
+cd example/tests
 zig build -Dphp=/usr/local
-php -d extension=zig-out/lib/libhello.so test_all.php
-# 115/115 通过
+php -d extension=zig-out/lib/libext-tests.so test_all.php
+# 154/154 通过
+```
+
+最小示例（`example/hello/`）构建与运行：
+
+```bash
+cd example/hello
+zig build -Dphp=/usr/local
+php -d extension=zig-out/lib/libhello.so hello.php
+# Hello from php-zig!
 ```

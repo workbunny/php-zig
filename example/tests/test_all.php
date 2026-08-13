@@ -51,6 +51,24 @@ function testException(string $name, callable $fn, string $expectedMsg): void {
     }
 }
 
+// 通用：捕获 \Throwable（覆盖 Error 家族 + 自定义异常/错误类）
+function testThrowable(string $name, callable $fn, string $expectedClass, string $expectedMsg): void {
+    global $passed, $failed;
+    try {
+        $fn();
+        $failed++;
+        echo "  ✗ $name  FAILED: no throwable thrown\n";
+    } catch (\Throwable $e) {
+        if (get_class($e) === $expectedClass && $e->getMessage() === $expectedMsg) {
+            $passed++;
+            echo "  ✓ $name\n";
+        } else {
+            $failed++;
+            echo "  ✗ $name  FAILED: expected {$expectedClass}('{$expectedMsg}'), got " . get_class($e) . "('{$e->getMessage()}')\n";
+        }
+    }
+}
+
 function testTruthy(string $name, $actual): void {
     global $passed, $failed;
     if ($actual) {
@@ -70,7 +88,7 @@ echo "\n=== 1. 模块级函数 ===\n";
 test('hello_world() 返回字符串', 'Hello from Zig!', hello_world());
 test('hello_name("Bob") 返回问候语', 'Hello, Bob!', hello_name('Bob'));
 test('hello_name() 无参返回 null', null, @hello_name());
-test('version() 返回版本字符串', 'php-zig v0.7.0', version());
+test('version() 返回版本字符串', 'php-zig v0.8.0', version());
 
 // ============================================================
 // 2. 返回值类型 — 9种全覆盖
@@ -114,6 +132,32 @@ echo "\n=== 5. 异常抛出 ===\n";
 testException('除零异常', fn() => hello_divide(10, 0), 'Division by zero');
 testException('类型错误异常', fn() => hello_divide('a', 3), 'Both arguments must be integers');
 testException('参数不足异常', fn() => hello_divide(5), 'Need 2 arguments');
+
+// v0.8：自定义异常类 + Error 家族
+echo "\n=== 5b. 异常抛出扩展（自定义异常 + Error 家族） ===\n";
+
+testThrowable('抛自定义异常 MyAppException', fn() => hello_throw_custom('boom'), 'MyAppException', 'boom');
+
+// 抛出的对象是 Exception 实例（运行时 instanceof 验证）
+$myEx = null;
+try { hello_throw_custom('boom'); } catch (\Throwable $e) { $myEx = $e; }
+test('MyAppException instanceof Exception', true, $myEx instanceof \Exception);
+
+// 自定义 Error（继承 Error）
+$myErr = null;
+try { hello_throw_custom_code(42); } catch (\Throwable $e) { $myErr = $e; }
+test('自定义错误 MyAppError 类名', 'MyAppError', $myErr ? get_class($myErr) : null);
+test('自定义错误 code = 42', 42, $myErr ? $myErr->getCode() : -1);
+test('自定义错误 instanceof Error', true, $myErr instanceof \Error);
+
+// 内置 Error 家族
+testThrowable('TypeError', fn() => hello_throw_type_error('bad type'), 'TypeError', 'bad type');
+testThrowable('ValueError', fn() => hello_throw_value_error(), 'ValueError', 'invalid value');
+testThrowable('DivisionByZeroError', fn() => hello_throw_div_zero(), 'DivisionByZeroError', 'division by zero');
+
+// 自定义异常继承关系验证
+test('MyAppException 继承 Exception', true, is_subclass_of('MyAppException', 'Exception'));
+test('MyAppError 继承 Error', true, is_subclass_of('MyAppError', 'Error'));
 
 // ============================================================
 // 6. 模块常量
@@ -349,6 +393,76 @@ $c = hello_make_closure();
 test('$c instanceof Closure', true, $c instanceof Closure);
 test('$c() → "closure result"', 'closure result', $c());
 test('hello_call_closure($c) → "closure result"', 'closure result', hello_call_closure($c));
+
+// ============================================================
+// 21. v0.8 — 参数默认值 + 可变参数
+// ============================================================
+echo "\n=== 21. v0.8 参数默认值 + 可变参数 ===\n";
+
+test('hello_greet("Bob") 使用默认 greeting', 'Hello, Bob!', hello_greet('Bob'));
+test('hello_greet("Bob","Hi") 自定义 greeting', 'Hi, Bob!', hello_greet('Bob', 'Hi'));
+
+$rGreet = new ReflectionFunction('hello_greet');
+test('hello_greet 参数2有默认值', true, $rGreet->getParameters()[1]->isDefaultValueAvailable());
+test('hello_greet 参数2默认值为 Hello', 'Hello', $rGreet->getParameters()[1]->getDefaultValue());
+
+test('hello_sum_all(1,2,3) → 6', 6, hello_sum_all(1, 2, 3));
+test('hello_sum_all(10) → 10', 10, hello_sum_all(10));
+test('hello_sum_all() → 0', 0, hello_sum_all());
+
+$rSumAll = new ReflectionFunction('hello_sum_all');
+test('hello_sum_all 参数2为可变参数', true, $rSumAll->getParameters()[1]->isVariadic());
+test('hello_sum_all 必填参数数为1', 1, $rSumAll->getNumberOfRequiredParameters());
+
+// ============================================================
+// 22. v0.8 — 序列化
+// ============================================================
+echo "\n=== 22. v0.8 序列化 ===\n";
+
+test('hello_serialize([1,2,3])', 'a:3:{i:0;i:1;i:1;i:2;i:2;i:3;}', hello_serialize([1, 2, 3]));
+test('hello_serialize("hello")', 's:5:"hello";', hello_serialize('hello'));
+test('hello_serialize(42)', 'i:42;', hello_serialize(42));
+test('hello_unserialize → 还原数组', [1, 2, 3], hello_unserialize('a:3:{i:0;i:1;i:1;i:2;i:2;i:3;}'));
+test('hello_unserialize → 还原字符串', 'hello', hello_unserialize('s:5:"hello";'));
+test('hello_unserialize 非法输入 → null', null, @hello_unserialize('not-valid'));
+
+// toObject 对象包装
+$obj = new stdClass();
+$obj->name = 'zig';
+test('hello_to_object($obj) 读取 name 属性', 'zig', hello_to_object($obj));
+test('hello_to_object(非对象) → null', null, @hello_to_object('not-an-object'));
+
+// ============================================================
+// 23. v0.8 — INI 配置 + 变更通知
+// ============================================================
+echo "\n=== 23. v0.8 INI 配置 ===\n";
+
+test('hello_get_ini_max 默认 100', 100, hello_get_ini_max());
+test('hello_get_ini_greeting 默认 Hi', 'Hi', hello_get_ini_greeting());
+test('hello_get_ini_enabled 默认 true', true, hello_get_ini_enabled());
+
+// ini_set 修改后读取 + 变更通知计数
+$before = hello_ini_change_count();
+ini_set('hello.max_items', '200');
+test('ini_set 后 hello_get_ini_max → 200', 200, hello_get_ini_max());
+test('INI 变更通知已触发', true, hello_ini_change_count() > $before);
+
+// ============================================================
+// 24. v0.8 — extern struct 对象绑定
+// ============================================================
+echo "\n=== 24. v0.8 extern struct 对象绑定 ===\n";
+
+$ctr = new Counter();
+test('Counter->get() 初始 0', 0, $ctr->get());
+test('Counter->increment() → 1', 1, $ctr->increment());
+test('Counter->increment() → 2', 2, $ctr->increment());
+$ctr->set(10);
+test('Counter->set(10) 后 get() → 10', 10, $ctr->get());
+test('Counter->increment() → 11', 11, $ctr->increment());
+
+$ctr2 = new Counter();
+test('新 Counter 独立状态 get() → 0', 0, $ctr2->get());
+test('新 Counter 不受旧实例影响', 0, $ctr2->get());
 
 // ============================================================
 // 结果汇总

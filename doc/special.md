@@ -489,3 +489,161 @@ else
 ```
 
 `phpglue_acc_abstract()` 与 `phpglue_acc_public()` 同模式，运行时从编译时 PHP 头文件查询 `ZEND_ACC_ABSTRACT`，避免硬编码位值。
+
+## callconv(.c) 回调禁用 Zig 切片参数
+
+### 问题
+
+`Module` 的 `ini_notify` 回调若声明为 `fn (name: []const u8) callconv(.c) void`，编译报错：`parameter of type '[]const u8' not allowed in function with calling convention`。
+
+### 根因
+
+`callconv(.c)` 强制 C ABI，而 Zig 切片（slice）没有固定的内存表示（指针 + 长度两个字段），不能作为 C 函数参数。
+
+### 解决方案
+
+跨 C 边界的回调统一用 C 风格签名，切片转换由 wrapper 完成：
+
+```zig
+// opts 里的回调类型（C ABI）
+ini_notify: ?*const fn (name: [*c]const u8, name_len: usize) callconv(.c) void = null,
+
+// C glue 收到的回调签名（一致）
+void phpglue_set_ini_notify(void (*cb)(const char *name, size_t name_len));
+```
+
+## INI 注册：2 参数 + NULL 哨兵 + zend_atol 废弃
+
+### 问题
+
+实现 INI 注册时踩了三个 PHP 8.4 API 细节坑：
+
+1. `zend_register_ini_entries` 签名仅 **2 参数**（`ini_entry` 数组 + `module_number`），**不接受 count**——`zend_ini_entry_def` 数组以 `name=NULL` 哨兵结尾。3 参数版本是 `zend_register_ini_entries_ex`（多了 `module_type`）。
+2. `zend_atol` 在 PHP 8.4 被标记 `ZEND_ATTRIBUTE_DEPRECATED`，编译报 deprecation 错误。
+
+### 解决方案
+
+```c
+zend_ini_entry_def defs[65];           // +1 哨兵
+for (i < count) { /* 填充 defs[i] */ }
+memset(&defs[count], 0, sizeof(zend_ini_entry_def));  // name=NULL 哨兵
+return zend_register_ini_entries(defs, module_number) == SUCCESS ? 1 : 0;
+
+// 字符串转数值改用 ZEND_STRTOL
+return ZEND_STRTOL(v, NULL, 10);       // 替代废弃的 zend_atol(v, len)
+```
+
+## extern struct 对象绑定：create_object/free_obj + 归属判断
+
+### 问题
+
+要让 Zig struct 生命周期绑定到 PHP 对象，需要自定义 `zend_object` 的分配与释放，但必须避免与原生对象（stdClass 等）冲突。
+
+### 解决方案
+
+自定义 `create_object` 分配 `zend_object + extra` 连续内存，`free_obj` 时通过 `handlers.offset`（`XtOffsetOf`）反推结构体指针并调用 dtor：
+
+```c
+typedef struct { zend_object std; void *extra; } phpglue_object;
+
+static zend_object *phpglue_object_create(zend_class_entry *ce) {
+    phpglue_object *obj = emalloc(sizeof(phpglue_object) + extra_size);
+    zend_object_std_init(&obj->std, ce);
+    object_properties_init(&obj->std, ce);
+    obj->std.handlers = &phpglue_object_handlers;   // 指向自定义 handlers
+    obj->extra = (extra_size > 0) ? (void *)(obj + 1) : NULL;
+    if (init) init(obj->extra);
+    return &obj->std;
+}
+
+static void phpglue_object_free(zend_object *object) {
+    phpglue_object *obj = (phpglue_object *)((char *)object - XtOffsetOf(phpglue_object, std));
+    if (dtor && obj->extra) dtor(obj->extra);
+    zend_object_std_dtor(object);
+}
+```
+
+**归属判断**：`phpglue_object_get_extra` 通过「`zobj->handlers` 是否等于自定义 handlers」判断对象是否由本框架创建——stdClass 等原生对象 handler 不同，返回 NULL 安全兜底。
+
+## getThis() 宏依赖局部变量名 execute_data
+
+### 问题
+
+`getThis()` 宏展开为 `(hasThis() ? ZEND_THIS : NULL)`，而 `ZEND_THIS` = `(&EX(This))`，`EX(element)` = `((execute_data)->element)`——**依赖 C 函数局部变量名 `execute_data`**。
+
+### 解决方案
+
+C glue 封装函数的参数名必须正好是 `execute_data`，否则宏展开引用未定义标识符：
+
+```c
+zval *phpglue_get_this(zend_execute_data *execute_data) {
+    return getThis();   // 依赖参数名 execute_data
+}
+```
+
+## 可变参数：variadic 位 + required_num_args 统计
+
+### 问题
+
+1. 可变参数的 `is_variadic` 位需写入 `zend_type` 的 extra_flags，用 `ZEND_TYPE_INIT_CODE(code, allow_null, _ZEND_ARG_INFO_FLAGS(0, 1, 0))` 传入。
+2. arg_info 头部的 `required_num_args` 应为**非 variadic 参数个数**——variadic 可传 0 个，不能算必填。
+
+### 解决方案
+
+```c
+// C 侧：extra_flags 携带 variadic 位
+const uint32_t extra_flags = (uint32_t)_ZEND_ARG_INFO_FLAGS(0, variadic_flag, 0);
+entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG, allow_null_flag, extra_flags);
+// mixed（无类型）+ variadic 时：
+entry->type = (zend_type)ZEND_TYPE_INIT_NONE(extra_flags);
+```
+
+```zig
+// Zig 侧：required 单独统计非 variadic
+var required: usize = 0;
+for (desc.params) |p| { if (!p.is_variadic) required += 1; }
+```
+
+## 参数默认值：default_value 是源码字符串
+
+### 问题
+
+`zend_internal_arg_info.default_value` 存的是**源码文本**（而非解析后的值），Reflection 据此 `getDefaultValue()` 解析。
+
+### 解决方案
+
+字符串默认值需带引号转义：
+
+```zig
+// "Hello" 默认值 → 源码文本 "\"Hello\""
+ParamDesc.createTypedWithDefault("greeting", .string, "\"Hello\""),
+```
+
+数值/布尔/null 直接写源码字面量（`"0"`、`"1"`、`"NULL"`、`"[]"`）。
+
+## 无参模块触发 param_entries_buf 空数组编译错误
+
+### 问题
+
+当模块**没有任何带参函数**时（如最小示例只有一个无参的 `hello_world`），编译报错：
+
+```
+src/module.zig:678:48: error: cannot index into empty array
+    @ptrCast(&param_entries_buf[byte_off]),
+```
+
+### 根因
+
+`param_entries_buf: [total_param_bytes]u8` 的尺寸由 comptime 统计「带参函数的参数条目总数」得出。当所有函数都无参时 `total_param_entries = 0`，数组退化为 `[0]u8`。即使 `resolveArgInfo` 对无参函数会提前返回 `get_empty_arg_info()`、运行时不会执行到索引语句，但 **Zig 对空数组的索引/取地址是编译期语义错误**，与运行时是否执行无关。
+
+### 解决方案
+
+数组尺寸至少保留 1 字节，避免空数组：
+
+```zig
+// 至少保留 1 字节：模块无带参函数时 total_param_entries 为 0，
+// 否则 param_entries_buf 退化为 [0]u8 空数组，无法索引/取地址。
+const total_param_bytes = @max(1, total_param_entries) * ARGINFO_ENTRY_SIZE_MAX;
+```
+
+这 1 字节在「无带参函数」场景下永远不会被真正访问，仅用于满足编译期语义。

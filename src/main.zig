@@ -13,37 +13,48 @@
 //! - PhpFunc      PHP 函数调用 Facade（从 Zig 调用 PHP 内置/用户函数）
 //! - Throw        PHP 异常抛出
 //! - Iterator     数组/哈希表迭代器
-//! - Object       PHP 对象属性读写 + instanceof
+//! - Object       PHP 对象属性读写 + instanceof + extern struct 绑定
 //! - Resource     PHP 资源类型封装
 //! - Closure      PHP 闭包创建（Zig 函数 → PHP Closure）
 //! - Error        PHP 错误报告（php_error_docref）
+//! - Serialize    PHP 序列化（serialize/unserialize）
+//! - Ini          PHP INI 配置（声明式注册 + 读取 + 变更通知）
 //! - mod          模块注册核心（comptime Module 泛型、生命周期钩子、类注册、接口、arg_info、常量、phpinfo）
 
-pub const php_c      = @import("php_c.zig");
-pub const php_types  = @import("php_types.zig");
+pub const php_c = @import("php_c.zig");
+pub const php_types = @import("php_types.zig");
 pub const php_config = @import("php_config.zig");
-pub const Zval       = @import("zval.zig").Zval;
-pub const Array      = @import("array.zig").Array;
-pub const Return     = @import("return.zig");
-pub const mod        = @import("module.zig");
-pub const PhpFunc    = @import("php_func.zig");
-pub const Throw      = @import("throw.zig");
-pub const Iterator   = @import("iterator.zig").Iterator;
-pub const Object     = @import("object.zig");
-pub const Resource   = @import("resource.zig").Resource;
-pub const Closure    = @import("closure.zig");
-pub const Error      = @import("error.zig");
+pub const Zval = @import("zval.zig").Zval;
+pub const Array = @import("array.zig").Array;
+pub const Return = @import("return.zig");
+pub const mod = @import("module.zig");
+pub const PhpFunc = @import("php_func.zig");
+pub const Throw = @import("throw.zig");
+pub const Iterator = @import("iterator.zig").Iterator;
+pub const Object = @import("object.zig");
+pub const ObjectRef = @import("object.zig").Object;
+pub const Resource = @import("resource.zig").Resource;
+pub const Closure = @import("closure.zig");
+pub const Error = @import("error.zig");
+pub const Serialize = @import("serialize.zig");
+pub const Ini = @import("ini.zig");
 
 // 常用类型别名 — 避免下游写完整路径
-pub const FunctionDesc       = mod.FunctionDesc;
-pub const ClassDesc          = mod.ClassDesc;
-pub const ParamDesc          = mod.ParamDesc;
-pub const ParamType          = mod.ParamType;
-pub const ClassPropertyDesc  = mod.ClassPropertyDesc;
-pub const PropertyType       = mod.PropertyType;
-pub const ConstantDesc       = mod.ConstantDesc;
-pub const ClassConstantDesc  = mod.ClassConstantDesc;
-pub const Module             = mod.Module;
-pub const FunctionHandler    = php_types.FunctionHandler;
-pub const ModuleLifecycleFn  = php_types.ModuleLifecycleFn;
-pub const zigTypeToPhpType   = mod.zigTypeToPhpType;
+pub const FunctionDesc = mod.FunctionDesc;
+pub const ClassDesc = mod.ClassDesc;
+pub const ParamDesc = mod.ParamDesc;
+pub const ParamType = mod.ParamType;
+pub const ClassPropertyDesc = mod.ClassPropertyDesc;
+pub const PropertyType = mod.PropertyType;
+pub const ConstantDesc = mod.ConstantDesc;
+pub const ClassConstantDesc = mod.ClassConstantDesc;
+pub const ObjectBinding = mod.ObjectBinding;
+pub const ObjectDataFn = mod.ObjectDataFn;
+pub const IniEntry = Ini.IniEntry;
+pub const Module = mod.Module;
+pub const ModuleOptions = mod.ModuleOptions;
+pub const ModuleMeta = mod.ModuleMeta;
+pub const moduleInit = mod.moduleInit;
+pub const FunctionHandler = php_types.FunctionHandler;
+pub const ModuleLifecycleFn = php_types.ModuleLifecycleFn;
+pub const zigTypeToPhpType = mod.zigTypeToPhpType;

@@ -22,6 +22,10 @@
 #include "zend_closures.h"
 #include "zend_compile.h"
 #include "zend_operators.h"
+#include "zend_ini.h"
+#include "zend_smart_str.h"
+#include "zend_objects.h"
+#include "ext/standard/php_var.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -227,6 +231,14 @@ void phpglue_fill_arg_info_typed(void *dst, uint32_t required_count,
     const char **names, const uint8_t *types, const uint8_t *allow_null,
     size_t name_count, size_t *out_entry_count);
 
+/* 完整版 — 在 typed 基础上增加可变参数与默认值。
+ * variadic[i]：非零表示该参数为可变参数（...$args），仅对最后一个参数有意义
+ * default_values[i]：默认值源码字符串（如 "NULL"、"0"、"[]"），可传 NULL 表示无默认值  */
+void phpglue_fill_arg_info_full(void *dst, uint32_t required_count,
+    const char **names, const uint8_t *types, const uint8_t *allow_null,
+    const uint8_t *variadic, const char **default_values,
+    size_t name_count, size_t *out_entry_count);
+
 /* ================================================================
  * 模块常量注册
  * ================================================================ */
@@ -242,6 +254,11 @@ void phpglue_register_constant_null(const char *name, size_t name_len, int modul
  * ================================================================ */
 
 void phpglue_throw_exception(const char *message, size_t message_len);
+
+/** 按类名抛出异常/错误。类须已注册（内置 Error 家族或自定义继承 Exception/Error 的类）。
+ *  成功返回 1，类不存在返回 0。message 按 message_len 复制（支持非 NUL 结尾）。 */
+int phpglue_throw_exception_class(const char *class_name, size_t class_len,
+    const char *message, size_t message_len, zend_long code);
 
 /* ================================================================
  * 类注册
@@ -324,6 +341,69 @@ void phpglue_error_docref(const char *docref, int type, const char *msg);
 
 /** 按 zval 调用（闭包/可调用对象），等价 call_user_function(NULL, NULL, callable, ...) */
 int phpglue_call_zval(zval *callable, zval *retval, uint32_t argc, const zval *argv);
+
+/* ================================================================
+ * 序列化 — PHP serialize/unserialize
+ * ================================================================ */
+
+/** 将 zval 序列化为 PHP serialize 格式字符串，结果写入 return_value */
+void phpglue_var_serialize(zval *zv, zval *return_value);
+/** 将 serialize 格式字符串反序列化为 zval，成功返回 1，失败返回 0 */
+int  phpglue_var_unserialize(const char *s, size_t len, zval *return_value);
+
+/* ================================================================
+ * INI 配置
+ * ================================================================ */
+
+/** INI 项类型：0=long 1=string 2=bool */
+typedef enum {
+    PHPGLUE_INI_LONG = 0,
+    PHPGLUE_INI_STRING = 1,
+    PHPGLUE_INI_BOOL = 2,
+} phpglue_ini_type;
+
+/**
+ * 注册一组 INI 项。
+ * names/name_lens：项名及长度
+ * default_values：默认值字符串（long/bool 用十进制，string 用原文）
+ * types：phpglue_ini_type 数组
+ * modifiables：PHP_INI_* 位组合（ZEND_INI_USER/PERDIR/SYSTEM/ALL）
+ * 成功返回 1，失败返回 0。 */
+int phpglue_register_ini_entries(const char **names, size_t *name_lens,
+    const char **default_values, const uint8_t *types, const uint8_t *modifiables,
+    size_t count, int module_number);
+
+/** 读取 long 型 INI 值，未找到返回 dflt */
+zend_long phpglue_ini_get_long(const char *name, size_t name_len, zend_long dflt);
+/** 读取 string 型 INI 值（返回内部字符串，勿释放），未找到返回 NULL */
+char *phpglue_ini_get_string(const char *name, size_t name_len);
+/** 读取 bool 型 INI 值，未找到返回 dflt */
+bool phpglue_ini_get_bool(const char *name, size_t name_len, bool dflt);
+/** 注销当前模块全部 INI 项 */
+void phpglue_unregister_ini_entries(int module_number);
+
+/** 设置 INI 变更通知回调（任一 INI 项值变更时触发，name/name_len 为项名） */
+void phpglue_set_ini_notify(void (*cb)(const char *name, size_t name_len));
+
+/* ================================================================
+ * 对象存储（extern struct 绑定）
+ * ================================================================ */
+
+/**
+ * 注册一个带额外存储（Zig struct 数据区）的内部类。
+ * extra_size：每个对象额外分配的字节数（应 >= Zig struct 大小）
+ * init：对象创建时初始化额外数据（可空）
+ * dtor：对象销毁时清理额外数据（可空）
+ * 返回 zend_class_entry*，失败返回 NULL。 */
+zend_class_entry *phpglue_register_object_class(const char *name, size_t name_len,
+    const zend_function_entry *methods, size_t extra_size,
+    void (*init)(void *extra), void (*dtor)(void *extra));
+
+/** 获取对象额外数据指针（对象须由 phpglue_register_object_class 创建），否则返回 NULL */
+void *phpglue_object_get_extra(zval *obj);
+
+/** 获取当前方法调用的 $this 对象（非方法调用返回 NULL） */
+zval *phpglue_get_this(zend_execute_data *execute_data);
 
 #ifdef __cplusplus
 }

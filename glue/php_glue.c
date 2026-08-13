@@ -7,6 +7,7 @@
 
 #include "php_glue.h"
 #include <string.h>
+#include <strings.h>
 
 /* ================================================================
  * 模块版本信息
@@ -349,21 +350,33 @@ void phpglue_fill_arg_info(void *dst, uint32_t required_count, const char **name
 
 /* — 类型化版本：逐参数设置 PHP 类型标注 — */
 
-static void fill_typed_param_entry(zend_internal_arg_info *entry, const char *name, uint8_t php_type, uint8_t allow_null_flag) {
+static void fill_typed_param_entry(zend_internal_arg_info *entry, const char *name,
+    uint8_t php_type, uint8_t allow_null_flag, uint8_t variadic_flag, const char *default_value)
+{
     /* 从无类型模板起步（正确的 zend_type 初始化状态） */
     memcpy(entry, &__phpglue_arg_param_template[0], sizeof(zend_internal_arg_info));
     entry->name = name;
 
-    /* ZEND_TYPE_INIT_CODE 在各 PHP 8.x 版本中处理了 allow_null 的位编码差异 */
+    /* ZEND_TYPE_INIT_CODE 在各 PHP 8.x 版本中处理了 allow_null 的位编码差异。
+     * extra_flags 通过 _ZEND_ARG_INFO_FLAGS 携带 is_variadic 位 */
+    const uint32_t extra_flags = (uint32_t)_ZEND_ARG_INFO_FLAGS(0, variadic_flag, 0);
     switch (php_type) {
-        case 0: /* mixed — 保持模板默认 */ break;
-        case 1: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG,   allow_null_flag, 0); break;
-        case 2: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_DOUBLE, allow_null_flag, 0); break;
-        case 3: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_STRING, allow_null_flag, 0); break;
-        case 4: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL,  allow_null_flag, 0); break;
-        case 5: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_ARRAY,  allow_null_flag, 0); break;
-        case 6: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_OBJECT, allow_null_flag, 0); break;
+        case 0: /* mixed — 保留模板默认（无类型提示），可变参数仍需写入 variadic 位 */
+            if (variadic_flag) {
+                entry->type = (zend_type)ZEND_TYPE_INIT_NONE(extra_flags);
+            }
+            break;
+        case 1: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_LONG,   allow_null_flag, extra_flags); break;
+        case 2: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_DOUBLE, allow_null_flag, extra_flags); break;
+        case 3: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_STRING, allow_null_flag, extra_flags); break;
+        case 4: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(_IS_BOOL,  allow_null_flag, extra_flags); break;
+        case 5: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_ARRAY,  allow_null_flag, extra_flags); break;
+        case 6: entry->type = (zend_type)ZEND_TYPE_INIT_CODE(IS_OBJECT, allow_null_flag, extra_flags); break;
         default: break;
+    }
+
+    if (default_value != NULL) {
+        entry->default_value = default_value;
     }
 }
 
@@ -381,7 +394,35 @@ void phpglue_fill_arg_info_typed(void *dst, uint32_t required_count,
     for (size_t i = 0; i < name_count; i++) {
         fill_typed_param_entry(&entries[i + 1], names[i],
             types ? types[i] : 0,
-            allow_null ? allow_null[i] : 0);
+            allow_null ? allow_null[i] : 0,
+            0, NULL);
+    }
+
+    /* 末尾哨兵 */
+    memcpy(&entries[name_count + 1], &__phpglue_arg_param_template[0], sizeof(zend_internal_arg_info));
+    entries[name_count + 1].name = NULL;
+
+    *out_entry_count = name_count;
+}
+
+void phpglue_fill_arg_info_full(void *dst, uint32_t required_count,
+    const char **names, const uint8_t *types, const uint8_t *allow_null,
+    const uint8_t *variadic, const char **default_values,
+    size_t name_count, size_t *out_entry_count)
+{
+    zend_internal_arg_info *entries = (zend_internal_arg_info *)dst;
+
+    /* Header — 同 typed 版本 */
+    memcpy(&entries[0], &__phpglue_arg_header_template[0], sizeof(zend_internal_arg_info));
+    entries[0].name = (const char *)(uintptr_t)(required_count);
+
+    /* 逐参数填充：类型 + allow_null + variadic + default_value */
+    for (size_t i = 0; i < name_count; i++) {
+        fill_typed_param_entry(&entries[i + 1], names[i],
+            types ? types[i] : 0,
+            allow_null ? allow_null[i] : 0,
+            variadic ? variadic[i] : 0,
+            default_values ? default_values[i] : NULL);
     }
 
     /* 末尾哨兵 */
@@ -396,7 +437,22 @@ void phpglue_fill_arg_info_typed(void *dst, uint32_t required_count,
  * ================================================================ */
 
 void phpglue_throw_exception(const char *message, size_t message_len) {
-    zend_throw_exception(zend_ce_exception, message, 0);
+    /* zend_throw_exception 内部按 strlen 取长度，故先复制为 NUL 结尾的 zend_string，
+     * 以支持非 NUL 结尾的 message（message_len 精确控制）。 */
+    zend_string *msg = zend_string_init(message, message_len, 0);
+    zend_throw_exception(zend_ce_exception, ZSTR_VAL(msg), 0);
+    zend_string_release(msg);
+}
+
+int phpglue_throw_exception_class(const char *class_name, size_t class_len,
+    const char *message, size_t message_len, zend_long code)
+{
+    zend_class_entry *ce = phpglue_lookup_class(class_name, class_len);
+    if (ce == NULL) return 0;
+    zend_string *msg = zend_string_init(message, message_len, 0);
+    zend_throw_exception(ce, ZSTR_VAL(msg), code);
+    zend_string_release(msg);
+    return 1;
 }
 
 /* ================================================================
@@ -608,4 +664,210 @@ void phpglue_create_closure(zval *res, zif_handler handler, const char *name, si
 
 void phpglue_error_docref(const char *docref, int type, const char *msg) {
     php_error_docref(docref, type, "%s", msg);
+}
+
+/* ================================================================
+ * 序列化 — PHP serialize/unserialize
+ * ================================================================ */
+
+void phpglue_var_serialize(zval *zv, zval *return_value) {
+    smart_str buf = {0};
+    php_serialize_data_t var_hash;
+    PHP_VAR_SERIALIZE_INIT(var_hash);
+    php_var_serialize(&buf, zv, &var_hash);
+    PHP_VAR_SERIALIZE_DESTROY(var_hash);
+    smart_str_0(&buf);
+    if (buf.s != NULL) {
+        RETVAL_STRINGL(ZSTR_VAL(buf.s), ZSTR_LEN(buf.s));
+    } else {
+        RETVAL_EMPTY_STRING();
+    }
+    smart_str_free(&buf);
+}
+
+int phpglue_var_unserialize(const char *s, size_t len, zval *return_value) {
+    const unsigned char *p = (const unsigned char *)s;
+    const unsigned char *max = p + len;
+    php_unserialize_data_t var_hash;
+    PHP_VAR_UNSERIALIZE_INIT(var_hash);
+    if (php_var_unserialize(return_value, &p, max, &var_hash)) {
+        PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+        return 1;
+    }
+    PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+    return 0;
+}
+
+/* ================================================================
+ * INI 配置
+ *
+ * 采用「无 globals」方案：INI 值由 Zend 的 ini_entry->value 存储，
+ * on_modify 仅负责触发变更通知（mh_arg 不使用，因为无需更新 globals）。
+ * 读取通过 zend_ini_string_ex 直接读 ini_entry->value。
+ * ================================================================ */
+
+static void (*phpglue_ini_notify)(const char *name, size_t name_len) = NULL;
+
+void phpglue_set_ini_notify(void (*cb)(const char *name, size_t name_len)) {
+    phpglue_ini_notify = cb;
+}
+
+static ZEND_INI_MH(phpglue_ini_on_modify) {
+    (void)mh_arg1;
+    (void)mh_arg2;
+    (void)mh_arg3;
+    (void)stage;
+    if (phpglue_ini_notify != NULL) {
+        phpglue_ini_notify(ZSTR_VAL(entry->name), ZSTR_LEN(entry->name));
+    }
+    return SUCCESS;
+}
+
+int phpglue_register_ini_entries(const char **names, size_t *name_lens,
+    const char **default_values, const uint8_t *types, const uint8_t *modifiables,
+    size_t count, int module_number)
+{
+    zend_ini_entry_def defs[65];
+    if (count > 64) return 0;
+    (void)types; /* 值类型不影响注册，读取时再解析 */
+    for (size_t i = 0; i < count; i++) {
+        defs[i].name = names[i];
+        defs[i].name_length = (uint16_t)name_lens[i];
+        defs[i].value = default_values[i];
+        defs[i].value_length = (uint32_t)strlen(default_values[i]);
+        defs[i].modifiable = modifiables[i];
+        defs[i].on_modify = phpglue_ini_on_modify;
+        defs[i].mh_arg1 = NULL;
+        defs[i].mh_arg2 = NULL;
+        defs[i].mh_arg3 = NULL;
+        defs[i].displayer = NULL;
+    }
+    /* 数组以 name=NULL 哨兵结尾 */
+    memset(&defs[count], 0, sizeof(zend_ini_entry_def));
+    return zend_register_ini_entries(defs, module_number) == SUCCESS ? 1 : 0;
+}
+
+zend_long phpglue_ini_get_long(const char *name, size_t name_len, zend_long dflt) {
+    bool exists = false;
+    char *v = zend_ini_string_ex(name, name_len, 0, &exists);
+    if (!exists || v == NULL) return dflt;
+    return ZEND_STRTOL(v, NULL, 10);
+}
+
+char *phpglue_ini_get_string(const char *name, size_t name_len) {
+    return zend_ini_string(name, name_len, 0);
+}
+
+bool phpglue_ini_get_bool(const char *name, size_t name_len, bool dflt) {
+    bool exists = false;
+    char *v = zend_ini_string_ex(name, name_len, 0, &exists);
+    if (!exists || v == NULL) return dflt;
+    if (strcasecmp(v, "on") == 0 || strcasecmp(v, "yes") == 0 ||
+        strcasecmp(v, "true") == 0 || strcasecmp(v, "1") == 0) {
+        return true;
+    }
+    if (strcasecmp(v, "off") == 0 || strcasecmp(v, "no") == 0 ||
+        strcasecmp(v, "false") == 0 || strcasecmp(v, "0") == 0 || v[0] == '\0') {
+        return false;
+    }
+    return ZEND_STRTOL(v, NULL, 10) != 0;
+}
+
+void phpglue_unregister_ini_entries(int module_number) {
+    zend_unregister_ini_entries(module_number);
+}
+
+/* ================================================================
+ * 对象存储（extern struct 绑定）
+ *
+ * 自定义 create_object 分配 zend_object + 额外数据区（Zig struct），
+ * free_obj 时调用 dtor 清理额外数据。通过 handler 指针判断对象归属。
+ * ================================================================ */
+
+#define PHPGLUE_MAX_OBJECT_CLASSES 64
+
+typedef struct {
+    zend_object std;
+    void *extra;
+} phpglue_object;
+
+typedef struct {
+    zend_class_entry *ce;
+    size_t extra_size;
+    void (*init)(void *extra);
+    void (*dtor)(void *extra);
+} phpglue_object_class_info;
+
+static phpglue_object_class_info phpglue_obj_infos[PHPGLUE_MAX_OBJECT_CLASSES];
+static int phpglue_obj_info_count = 0;
+static zend_object_handlers phpglue_object_handlers;
+static bool phpglue_handlers_ready = false;
+
+static phpglue_object_class_info *phpglue_find_obj_info(zend_class_entry *ce) {
+    for (int i = 0; i < phpglue_obj_info_count; i++) {
+        if (phpglue_obj_infos[i].ce == ce) return &phpglue_obj_infos[i];
+    }
+    return NULL;
+}
+
+static zend_object *phpglue_object_create(zend_class_entry *ce) {
+    phpglue_object_class_info *info = phpglue_find_obj_info(ce);
+    size_t extra_size = info ? info->extra_size : 0;
+    phpglue_object *obj = emalloc(sizeof(phpglue_object) + extra_size);
+    zend_object_std_init(&obj->std, ce);
+    object_properties_init(&obj->std, ce);
+    obj->std.handlers = &phpglue_object_handlers;
+    obj->extra = (extra_size > 0) ? (void *)(obj + 1) : NULL;
+    if (info != NULL && info->init != NULL && obj->extra != NULL) {
+        info->init(obj->extra);
+    }
+    return &obj->std;
+}
+
+static void phpglue_object_free(zend_object *object) {
+    phpglue_object *obj = (phpglue_object *)((char *)object - XtOffsetOf(phpglue_object, std));
+    phpglue_object_class_info *info = phpglue_find_obj_info(object->ce);
+    if (info != NULL && info->dtor != NULL && obj->extra != NULL) {
+        info->dtor(obj->extra);
+    }
+    zend_object_std_dtor(object);
+}
+
+zend_class_entry *phpglue_register_object_class(const char *name, size_t name_len,
+    const zend_function_entry *methods, size_t extra_size,
+    void (*init)(void *extra), void (*dtor)(void *extra))
+{
+    if (phpglue_obj_info_count >= PHPGLUE_MAX_OBJECT_CLASSES) return NULL;
+
+    if (!phpglue_handlers_ready) {
+        memcpy(&phpglue_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
+        phpglue_object_handlers.offset = XtOffsetOf(phpglue_object, std);
+        phpglue_object_handlers.free_obj = phpglue_object_free;
+        phpglue_handlers_ready = true;
+    }
+
+    zend_class_entry ce;
+    INIT_CLASS_ENTRY_EX(ce, name, name_len, methods);
+    ce.create_object = phpglue_object_create;
+    zend_class_entry *ce_ptr = zend_register_internal_class(&ce);
+    if (ce_ptr == NULL) return NULL;
+
+    phpglue_object_class_info *info = &phpglue_obj_infos[phpglue_obj_info_count++];
+    info->ce = ce_ptr;
+    info->extra_size = extra_size;
+    info->init = init;
+    info->dtor = dtor;
+    return ce_ptr;
+}
+
+void *phpglue_object_get_extra(zval *obj) {
+    if (Z_TYPE_P(obj) != IS_OBJECT) return NULL;
+    zend_object *zobj = Z_OBJ_P(obj);
+    if (zobj->handlers != &phpglue_object_handlers) return NULL;
+    phpglue_object *pobj = (phpglue_object *)((char *)zobj - XtOffsetOf(phpglue_object, std));
+    return pobj->extra;
+}
+
+zval *phpglue_get_this(zend_execute_data *execute_data) {
+    return getThis();
 }

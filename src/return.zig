@@ -65,3 +65,10 @@ pub fn callArg(execute_data: *T.ZendExecuteData, n: u32) Zval {
     const ptr = c.phpglue_call_arg(execute_data, n);
     return Zval.fromPtr(ptr);
 }
+
+/// 获取当前方法调用的 $this 对象，非方法调用（模块级函数）返回 null
+pub fn getThis(execute_data: *T.ZendExecuteData) ?Zval {
+    const ptr = c.phpglue_get_this(execute_data);
+    if (ptr) |p| return Zval.fromPtr(p);
+    return null;
+}

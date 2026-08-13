@@ -1,0 +1,17 @@
+.{
+    .name = .ext_tests,
+    .fingerprint = 0xbef51f3962a0e13b,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .phpzig = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "test_all.php",
+    },
+}
