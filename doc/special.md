@@ -2,6 +2,45 @@
 
 本文档记录 php-zig 中非常规的 C glue 和 Zig 实现决策及其原因。
 
+## 为什么用 extern fn ABI 而非 translate-c（最早期的架构决策）
+
+### 问题
+
+项目早期曾尝试用 Zig 的 `translate-c`（`@cImport`）直接把 Zend Engine 的头文件翻译成 Zig 声明，但遇到大量**类型问题**——这是决定整个架构走向的最早踩坑。
+
+### 根因
+
+Zend Engine 是写给 GCC/Clang/MSVC 的 C89 代码，头文件充满依赖 C 编译器「宽容」行为的宏：
+
+| Zend 宏类别 | 特性 | translate-c 的类型问题 |
+|------------|------|----------------------|
+| 语句级宏 | `ZVAL_STRINGL` 内含 `do-while` 块 | 无法翻译成 Zig 表达式 |
+| 提前返回宏 | `RETURN_STRING` 内含 `return` | 破坏 Zig 控制流 |
+| 类型双关宏 | `Z_TYPE_P` 解引用 union 成员 | Zig 严格类型拒绝隐式转换 |
+| 遍历宏 | `ZEND_HASH_FOREACH_*` 依赖指针运算 | 类型推导失败 |
+| 跨位数类型 | `zend_long` 32/64 位不同 | 翻译结果平台相关 |
+| 复杂初始化 | `INIT_CLASS_ENTRY_EX` | 布局推导易错 |
+
+Zig 的严格类型系统（无隐式类型转换）无法还原 C 宏的宽松语义——这是**两种语言类型哲学的本质冲突**，而非工具实现问题（Zig 0.10 后 translate-c 改为自研翻译器，矛盾不变）。
+
+### 解决方案：extern fn ABI
+
+在 C 侧完成所有宏展开和类型转换，Zig 侧只面对「普通 C 函数」的 ABI：
+
+```
+C 头文件 ──Zig cc──► php_glue.c（宏正常展开为普通函数）
+                          ↓
+                    Zig 只看到 extern fn ABI（类型边界清晰）
+```
+
+- 宏由 C 编译器原生展开，零兼容问题
+- Zig 侧类型边界干净，无隐式转换烦恼
+- 版本适配在 C glue 内部用运行时查询完成
+
+**代价**：约 300 行手写 C 胶水层是刚性依赖，每加一个能力要同步写 C + Zig 两端。但相比 translate-c 不可控的翻译结果，这是可接受、确定性的成本。
+
+> 本决策为 php-zig 的架构基石，后续所有「Zig 写不了的宏」都遵循此原则在 C glue 侧封装。
+
 ## arg_info 的 C 端模板策略
 
 ### 问题
