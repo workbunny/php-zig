@@ -297,8 +297,8 @@ pub fn methodsFromStruct(comptime Cls: type) []const FunctionDesc {
                                   else if (std.mem.startsWith(u8, name, "static_"))  "static_"
                                   else @compileError("BUG: " ++ name);
 
-            // 2. 去掉前缀 (Zig 0.16: name[prefix.len..] 有 bug，显式指定结束位置)
-            const rest: [:0]const u8 = name[prefix.len..name.len];
+            // 2. 去掉前缀
+            const rest: [:0]const u8 = name[prefix.len..];
             const php_name: [:0]const u8 = if (std.mem.eql(u8, rest, "magic_construct"))    "__construct"
             else if (std.mem.eql(u8, rest, "magic_destruct"))   "__destruct"
             else if (std.mem.eql(u8, rest, "magic_call"))       "__call"

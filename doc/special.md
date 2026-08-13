@@ -346,27 +346,6 @@ zend_hash_str_find_ptr(CG(class_table), buf, len);
 
 `zend_lookup_class` 在 MINIT 阶段行为不稳定，直接操作 HashTable 更可靠。
 
-## Zig 0.16 comptime: `name[prefix.len..]` 切片 bug
-
-### 问题
-
-Zig 0.16 的 comptime 求值中，`"public_magic_construct"["public_".len..]` 切片操作行为异常：
-实际返回的是 `name[0..prefix.len]`（前缀）而非 `name[prefix.len..]`（剩余部分）。
-
-例如 `"public_magic_construct"[7..]` 应该返回 `"magic_construct"`，实际返回 `"public_"`。
-
-### 解决方案
-
-显式指定结束位置：
-
-```zig
-// 错误（Zig 0.16）
-const rest: [:0]const u8 = name[prefix.len..];
-
-// 正确
-const rest: [:0]const u8 = name[prefix.len..name.len];
-```
-
 ## Zig 0.16 comptime: marker 值冲突
 
 ### 问题
@@ -379,22 +358,23 @@ const rest: [:0]const u8 = name[prefix.len..name.len];
 区分 marker 值：`publicz_marker = 0xDEADBEE0`，`static_marker = 0xDEADBEEF`。
 同时在 `resolveFlags` 中显式处理 `publicz_marker` 分支（返回 `phpglue_acc_public()`），与用户自设 `flags=0` 的默认逻辑分开。
 
-## Zig 0.16 comptime: 函数传回 `[:0]const u8` 字面量失效
+## 调试教训：先核对测试样本，再怀疑编译器
 
 ### 问题
 
-在 `inline for` 循环内部，调用外部 `fn foo()` 返回的 `[:0]const u8` 字面量（如 `return "__construct"`），
-传到 `FunctionDesc{ .name = ... }` 后，实际存储的是原始声明名而非映射后的名。
+实现 `createFromStruct` 的魔术方法映射时，一度怀疑 Zig 0.16 存在两个编译器 bug：
+「comptime 切片 `name[prefix.len..]` 返回错误值」「函数传回 `[:0]const u8` 字面量失效」。
+据此做了 `name[prefix.len..name.len]` 显式切片、以及 17 条映射全内联等「绕过」处理。
 
-### 解决方案
+### 真相
 
-不通过函数调用传 comptime 字面量——在调用现场（`inline for` 循环内）直接内联 if-else 链：
+真正的根因是测试样本写错了：example 里写的是 `public_construct`（少了 `magic_` 前缀），
+导致 `rest` 等于 `"construct"`，既不匹配任何 magic 映射、也根本不会进入映射函数——
+方法名自然变成 `"construct"` 而非 `"__construct"`。
 
-```zig
-const php_name: [:0]const u8 = if (std.mem.eql(u8, rest, "magic_construct")) "__construct"
-    else if (std.mem.eql(u8, rest, "magic_destruct")) "__destruct"
-    // ...
-    else rest;
-```
+改回正确的 `public_magic_construct` 后，一切正常。切片 `name[prefix.len..]` 与函数传值均无问题。
 
-17 条魔术方法映射全部内联到 `methodsFromStruct` 中，零函数调用，零传值。
+### 教训
+
+comptime 逻辑「看似不生效」时，优先排查输入样本是否正确（前缀、拼写、大小写），
+不要急于断言编译器/语言层有 bug。真正影响行为的只有 marker 值冲突这一处。
