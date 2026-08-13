@@ -104,7 +104,7 @@ pub const Array = struct {
         return Zval.fromPtr(&retval);
     }
 
-    // —— v0.6.0: 队列/栈操作 ——
+    // ＝＝ 队列 / 栈操作 ＝＝
 
     /// 移除并返回第一个元素（等价 PHP array_shift），空数组返回 null
     pub fn shift(self: *Array) ?Zval {
@@ -118,7 +118,7 @@ pub const Array = struct {
         c.phpglue_array_unshift(self.zv.ptr, zv.ptr);
     }
 
-    // —— v0.6.0: 集合操作 ——
+    // ＝＝ 集合操作 ＝＝
 
     /// 合并另一个数组，结果写入 out_zv（等价 PHP array_merge，本数组在前）
     pub fn merge(self: *Array, other: Array, out_zv: *T.Zval) void {
@@ -149,7 +149,7 @@ pub const Array = struct {
         return Iterator.init(self.hashTable());
     }
 
-    // —— v0.6.0: foreach 语法糖 ——
+    // ＝＝ foreach 遍历 ＝＝
 
     /// 遍历每个元素执行回调（不修改数组）。
     /// ctx 为可选上下文指针，回调内部可 `@ptrCast` 恢复成自己的状态类型，

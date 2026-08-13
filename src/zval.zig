@@ -27,6 +27,19 @@ pub const Zval = struct {
         return t == T.IS_TRUE or t == T.IS_FALSE;
     }
 
+    // ＝＝ 语义类型判断（依赖 Zend 运行时） ＝＝
+
+    /// 是否可调用（函数名/闭包/可调用对象）
+    pub fn isCallable(self: Zval) bool { return c.phpglue_zval_is_callable(self.ptr) != 0; }
+    /// 是否可迭代（数组/可遍历对象）
+    pub fn isIterable(self: Zval) bool { return c.phpglue_zval_is_iterable(self.ptr) != 0; }
+    /// 是否标量（int/float/string/bool）
+    pub fn isScalar(self: Zval) bool { return c.phpglue_zval_is_scalar(self.ptr) != 0; }
+    /// 是否空值（等价 PHP empty()）
+    pub fn isEmpty(self: Zval) bool { return c.phpglue_zval_is_empty(self.ptr) != 0; }
+    /// 是否数值（int/float，或可解析为数值的字符串）
+    pub fn isNumeric(self: Zval) bool { return c.phpglue_zval_is_numeric(self.ptr) != 0; }
+
     // ＝＝ 取值 ＝＝
 
     pub fn toLong(self: Zval) T.zend_long    { return c.phpglue_zval_get_long(self.ptr); }
@@ -83,7 +96,7 @@ pub const Zval = struct {
         return !self.eql(other);
     }
 
-    // ＝＝ 比较运算符（v0.6.0，基于 PHP 三值比较） ＝＝
+    // ＝＝ 关系比较（基于 PHP 三值比较） ＝＝
 
     /// 三值比较：返回 -1（小于）/ 0（等于）/ 1（大于），等价 PHP <=>
     pub fn cmp(self: Zval, other: Zval) i8 {
@@ -99,7 +112,7 @@ pub const Zval = struct {
     /// 大于等于 >=
     pub fn ge(self: Zval, other: Zval) bool { return self.cmp(other) >= 0; }
 
-    // ＝＝ 算术运算符（v0.6.0，结果写入调用者提供的 zval） ＝＝
+    // ＝＝ 算术运算符（结果写入调用者提供的 zval） ＝＝
 
     /// 加法，成功返回 true；失败（类型不兼容）result 未定义
     pub fn add(self: Zval, other: Zval, result: *T.Zval) bool {

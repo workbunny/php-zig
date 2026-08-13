@@ -1,18 +1,18 @@
 <?php
 /**
- * php-zig v0.4.0 集成测试套件
- * 覆盖 100% 公开 API：
+ * php-zig 集成测试套件
+ * 覆盖全部公开 API：
  *   - 模块级函数
  *   - 返回值类型（9种）
- *   - zval 类型判断 + 取值 + 设值（全 IS_* 覆盖）
+ *   - zval 类型判断 + 取值 + 设值 + 语义判断
  *   - 参数 arg_info（反射验证，含 comptime struct 反射类型标注）
- *   - 异常抛出
+ *   - 异常抛出、错误报告
  *   - 模块常量（5种类型）
- *   - PHP Facade 调用
- *   - 类注册（静态方法 + comptime struct 反射）
- *   - 数组操作（append/set/setAssoc/find/del/count/separate/pop）
+ *   - PHP Facade 调用、闭包
+ *   - 类注册（静态方法 + comptime struct 反射）、接口、继承
+ *   - 数组操作（增删查 + 高级操作）
  *   - HashTable 遍历（迭代器）
- *   - 对象属性读写
+ *   - 对象属性读写、instanceof
  *   - 生命周期钩子（MINIT）
  *   - phpinfo 输出
  */
@@ -70,7 +70,7 @@ echo "\n=== 1. 模块级函数 ===\n";
 test('hello_world() 返回字符串', 'Hello from Zig!', hello_world());
 test('hello_name("Bob") 返回问候语', 'Hello, Bob!', hello_name('Bob'));
 test('hello_name() 无参返回 null', null, @hello_name());
-test('version() 返回版本字符串', 'php-zig v0.6.0', version());
+test('version() 返回版本字符串', 'php-zig v0.7.0', version());
 
 // ============================================================
 // 2. 返回值类型 — 9种全覆盖
@@ -202,7 +202,7 @@ testTruthy('phpinfo 模块输出中包含 php-zig', strpos($output, 'php-zig') !
 // ============================================================
 // 14. 边界情况
 // ============================================================
-echo "=== 15. v0.3.0: Zval 运算符 + Array 算法 ===\n";
+echo "=== 15. Zval 运算符 + Array 算法 ===\n";
 
 test('hello_zip(42,42) → equal', 'equal', hello_zip(42, 42));
 test('hello_zip(1,2) → not-equal', 'not-equal', hello_zip(1, 2));
@@ -220,9 +220,9 @@ test('hello_name 非字符串 → null', null, @hello_name(123));
 test('hello_iterate 非数组 → null', null, @hello_iterate('not_array'));
 
 // ============================================================
-// 17. v0.4.0: comptime struct 反射 arg_info
+// 17. comptime struct 反射 arg_info
 // ============================================================
-echo "\n=== 17. v0.4.0: comptime struct 反射 arg_info ===\n";
+echo "\n=== 17. comptime struct 反射 arg_info ===\n";
 
 test('hello_sum(5,3) → 8', 8, hello_sum(5, 3));
 test('hello_sum(0,0) → 0', 0, hello_sum(0, 0));
@@ -248,9 +248,9 @@ test('subtract 参数1名为 a', 'a', $rSub->getParameters()[0]->getName());
 test('subtract 参数1类型为 int', true, $rSub->getParameters()[0]->hasType() && (string)$rSub->getParameters()[0]->getType() === 'int');
 
 // ============================================================
-// 18. v0.5.0: OOP — 类属性 + 构造器 + 继承 + 访问修饰符
+// 18. OOP — 类属性 + 构造器 + 继承 + 访问修饰符
 // ============================================================
-echo "\n=== 18. v0.5.0: OOP ===\n";
+echo "\n=== 18. OOP ===\n";
 
 // BankAccount 属性默认值
 $rBA = new ReflectionClass('BankAccount');
@@ -277,9 +277,9 @@ test('SavingsAccount 父类为 BankAccount', 'BankAccount', $rSA->getParentClass
 test('SavingsAccount 有 interest 方法', true, $rSA->hasMethod('interest'));
 
 // ============================================================
-// 19. v0.6.0: 数组高级操作 + Zval 运算符
+// 19. 数组高级操作 + Zval 运算符
 // ============================================================
-echo "\n=== 19. v0.6.0: 数组高级操作 + Zval 运算符 ===\n";
+echo "\n=== 19. 数组高级操作 + Zval 运算符 ===\n";
 
 // shift — 移除并返回第一个元素
 test('hello_array_shift([1,2,3]) → 1', 1, hello_array_shift([1, 2, 3]));
@@ -319,6 +319,36 @@ test('hello_zval_cmp(1,2) → -1', -1, hello_zval_cmp(1, 2));
 test('hello_zval_cmp(2,1) → 1', 1, hello_zval_cmp(2, 1));
 test('hello_zval_cmp(1,1) → 0', 0, hello_zval_cmp(1, 1));
 test('hello_zval_cmp("a","b") → -1', -1, hello_zval_cmp('a', 'b'));
+
+// ============================================================
+// 20. 语义类型判断 + instanceof + 闭包 + 接口
+// ============================================================
+echo "\n=== 20. 语义类型判断 + instanceof + 闭包 + 接口 ===\n";
+
+// 类型补全（位掩码：bit0=callable bit1=iterable bit2=scalar bit3=empty bit4=numeric）
+test('hello_type_checks(42) → 标量+数值=20', 20, hello_type_checks(42));
+test('hello_type_checks([1,2,3]) → 可迭代=2', 2, hello_type_checks([1, 2, 3]));
+test('hello_type_checks(null) → 空=8', 8, hello_type_checks(null));
+test('hello_type_checks("") → 空+标量=12', 12, hello_type_checks(''));
+test('hello_type_checks("123") → 标量+数值=20', 20, hello_type_checks('123'));
+test('hello_type_checks(闭包) → 可调用=1', 1, hello_type_checks(hello_make_closure()));
+
+// instanceof
+$p = new Person();
+test('$p instanceof Person', true, $p instanceof Person);
+test('$p instanceof Greetable', true, $p instanceof Greetable);
+test('hello_instanceof($p, "Person")', true, hello_instanceof($p, 'Person'));
+test('hello_instanceof($p, "Greetable")', true, hello_instanceof($p, 'Greetable'));
+test('hello_instanceof($p, "NotExist")', false, hello_instanceof($p, 'NotExist'));
+
+// 接口方法
+test('$p->greet() → "hello"', 'hello', $p->greet());
+
+// 闭包
+$c = hello_make_closure();
+test('$c instanceof Closure', true, $c instanceof Closure);
+test('$c() → "closure result"', 'closure result', $c());
+test('hello_call_closure($c) → "closure result"', 'closure result', hello_call_closure($c));
 
 // ============================================================
 // 结果汇总

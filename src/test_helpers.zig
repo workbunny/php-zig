@@ -177,7 +177,7 @@ test "Module() with all options compiles" {
     _ = M;
 }
 
-// ＝＝ v0.4.0：comptime 类型反射 ＝＝
+// ＝＝ comptime 类型反射 ＝＝
 
 test "zigTypeToPhpType: i64 -> long, no allow_null" {
     const ti = mod.zigTypeToPhpType(i64);
@@ -278,7 +278,7 @@ test "Module() with createFrom compiles" {
     _ = M;
 }
 
-// ＝＝ v0.5.0：类属性 / 构造器 / 继承 / 访问修饰符（声明式） ＝＝
+// ＝＝ 类属性 / 构造器 / 继承 / 访问修饰符（声明式） ＝＝
 
 test "ClassPropertyDesc.createLong" {
     const p = mod.ClassPropertyDesc.createLong("count", 42);
@@ -359,7 +359,7 @@ test "Module() with properties and extends compiles" {
     _ = M;
 }
 
-// ＝＝ v0.5.0 补充：comptime struct 反射类属性 ＝＝
+// ＝＝ comptime struct 反射类属性 ＝＝
 
 test "createWithPropsFrom: long props" {
     const Props = struct { balance: i64 = 0, maxval: i64 = 99 };
@@ -408,7 +408,7 @@ test "Module() with createWithPropsFrom compiles" {
     _ = M;
 }
 
-// ＝＝ v0.5.1：comptime struct → 方法 + 属性全反射 ＝＝
+// ＝＝ comptime struct → 方法 + 属性全反射 ＝＝
 
 test "methodsFromStruct: parses public/protect/private/static" {
     const Bank = struct {
@@ -468,6 +468,39 @@ test "Module() with createFromStruct compiles" {
         .version = "0.5.1",
         .classes = &.{
             mod.ClassDesc.createFromStruct("Bank", Bank),
+        },
+    });
+    _ = M;
+}
+
+// ＝＝ 接口注册与实现 ＝＝
+
+test "ClassDesc.createInterface sets is_interface" {
+    const iface = mod.ClassDesc.createInterface("Greetable", &.{});
+    try std.testing.expectEqual(true, iface.is_interface);
+    try std.testing.expectEqualStrings("Greetable", iface.name);
+}
+
+test "ClassDesc.createImplements stores interfaces" {
+    const ifaces = [_][:0]const u8{ "Greetable", "Serializable" };
+    const cls = mod.ClassDesc.createImplements("Person", &.{}, &ifaces);
+    try std.testing.expectEqual(@as(usize, 2), cls.interfaces.len);
+    try std.testing.expectEqualStrings("Greetable", cls.interfaces[0]);
+    try std.testing.expectEqualStrings("Serializable", cls.interfaces[1]);
+    try std.testing.expectEqual(false, cls.is_interface);
+}
+
+test "Module() with interface and implements compiles" {
+    const M = mod.Module(.{
+        .name = "iface",
+        .version = "0.7.0",
+        .classes = &.{
+            mod.ClassDesc.createInterface("Greetable", &.{
+                mod.FunctionDesc.create("greet", @ptrCast(@alignCast(&dummyHandler))),
+            }),
+            mod.ClassDesc.createImplements("Person", &.{
+                mod.FunctionDesc.create("greet", @ptrCast(@alignCast(&dummyHandler))),
+            }, &.{"Greetable"}),
         },
     });
     _ = M;

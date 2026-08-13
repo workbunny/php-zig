@@ -195,6 +195,13 @@ if (arg.isNull()) { ... }
 if (arg.isArray()) { ... }
 if (arg.isObject()) { ... }
 if (arg.isResource()) { ... }
+
+// 语义判断（依赖 Zend 运行时）
+if (arg.isCallable()) { ... }   // 函数名/闭包/可调用对象
+if (arg.isIterable()) { ... }   // 数组/可遍历对象
+if (arg.isScalar()) { ... }     // int/float/string/bool
+if (arg.isEmpty()) { ... }      // 等价 PHP empty()
+if (arg.isNumeric()) { ... }    // int/float/数值字符串
 ```
 
 ### zval 设值
@@ -564,6 +571,77 @@ MyRes.store(fn, &/* ptr to anything */);
 const ptr: ?*anyopaque = MyRes.fetch(&arg_zval);
 ```
 
+### 接口与实现
+
+```zig
+fn greet(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnString(rv, "hello");
+}
+
+const M = phpzig.Module(.{
+    // ...
+    .classes = &.{
+        // 注册接口
+        phpzig.ClassDesc.createInterface("Greetable", &.{
+            phpzig.FunctionDesc.create("greet", greet),
+        }),
+        // 注册实现接口的类（接口须先声明）
+        phpzig.ClassDesc.createImplements("Person", &.{
+            phpzig.FunctionDesc.create("greet", greet),
+        }, &.{"Greetable"}),
+    },
+});
+```
+
+### instanceof 检查
+
+```zig
+fn check(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const obj = phpzig.Return.callArg(ed, 1);
+    const name = phpzig.Return.callArg(ed, 2).toStringVal();
+    // 判断对象是否属于指定类（或实现指定接口）
+    const is = phpzig.Object.instanceOf(obj.ptr, name);
+    phpzig.Return.returnBool(rv, is);
+}
+```
+
+### 闭包创建
+
+从 Zig 函数创建 PHP Closure，可传给 `array_map` 等 PHP 回调参数：
+
+```zig
+fn myCallback(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnString(rv, "from closure");
+}
+
+fn make(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    var closure_zv: T.Zval = undefined;
+    phpzig.Closure.create(myCallback, "my_closure", &closure_zv);
+    phpzig.Return.returnZval(rv, &closure_zv);
+}
+
+// 调用传入的闭包
+fn callIt(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const fn_arg = phpzig.Return.callArg(ed, 1);
+    _ = phpzig.PhpFunc.callZval(fn_arg.ptr, rv, &.{});
+}
+```
+
+### 错误报告
+
+与异常抛出互补——error 用于 WARNING/NOTICE 等非致命报告：
+
+```zig
+fn warn(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    // 带 docref 前缀
+    phpzig.Error.docref("warn", .warning, "something wrong");
+    // 或无 docref
+    phpzig.Error.warning("plain warning");
+    phpzig.Error.notice("plain notice");
+    phpzig.Return.returnNull(rv);
+}
+```
+
 ### 模块入口
 
 ```zig
@@ -590,7 +668,7 @@ comptime {
 ```bash
 cd php-zig
 zig build test
-# 54/54 通过（v0.6.0）
+# 57/57 通过
 ```
 
 示例扩展编译后运行 PHP 集成测试：
@@ -599,5 +677,5 @@ zig build test
 cd example
 zig build -Dphp=/usr/local
 php -d extension=zig-out/lib/libhello.so test_all.php
-# 100/100 通过（v0.6.0）
+# 115/115 通过
 ```

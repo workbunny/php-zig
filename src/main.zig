@@ -13,9 +13,11 @@
 //! - PhpFunc      PHP 函数调用 Facade（从 Zig 调用 PHP 内置/用户函数）
 //! - Throw        PHP 异常抛出
 //! - Iterator     数组/哈希表迭代器
-//! - Object       PHP 对象属性读写
+//! - Object       PHP 对象属性读写 + instanceof
 //! - Resource     PHP 资源类型封装
-//! - mod          模块注册核心（comptime Module 泛型、生命周期钩子、类注册、arg_info、常量、phpinfo）
+//! - Closure      PHP 闭包创建（Zig 函数 → PHP Closure）
+//! - Error        PHP 错误报告（php_error_docref）
+//! - mod          模块注册核心（comptime Module 泛型、生命周期钩子、类注册、接口、arg_info、常量、phpinfo）
 
 pub const php_c      = @import("php_c.zig");
 pub const php_types  = @import("php_types.zig");
@@ -29,6 +31,8 @@ pub const Throw      = @import("throw.zig");
 pub const Iterator   = @import("iterator.zig").Iterator;
 pub const Object     = @import("object.zig");
 pub const Resource   = @import("resource.zig").Resource;
+pub const Closure    = @import("closure.zig");
+pub const Error      = @import("error.zig");
 
 // 常用类型别名 — 避免下游写完整路径
 pub const FunctionDesc       = mod.FunctionDesc;

@@ -400,3 +400,53 @@ arr.each(&ctx, struct {
 ```
 
 `?*anyopaque` 作为不透明上下文，把「状态捕获」从编译期下放到运行时，是 Zig 中遍历回调的惯用模式（类似 C 的 `qsort` ctx）。
+
+## 闭包创建：zend_create_closure 的 function_name 引用计数
+
+### 问题
+
+从 Zig 函数创建 PHP Closure 时，需要构造 `zend_internal_function` 并传入 `zend_create_closure`。若对 `function_name` 的引用计数处理错误，会导致 shutdown 时 segfault 或内存泄漏。
+
+### 解决方案
+
+关键事实：`zend_create_closure` 内部会对 `function_name` 调用 `zend_string_addref`（闭包持有一份引用，析构时 `zend_string_release`）。因此 C glue 在创建闭包后必须释放自己持有的那一份：
+
+```c
+void phpglue_create_closure(zval *res, zif_handler handler, const char *name, size_t name_len) {
+    zend_internal_function func;
+    memset(&func, 0, sizeof(func));
+    func.type = ZEND_INTERNAL_FUNCTION;
+    func.function_name = zend_string_init(name, name_len, 0);  // 我们持有 1 份
+    func.fn_flags = 0;
+    func.handler = handler;
+    func.num_args = 0;
+    func.required_num_args = 0;
+    func.arg_info = NULL;
+
+    // zend_create_closure 内部 addref，闭包析构时 release
+    zend_create_closure(res, (zend_function *)&func, NULL, NULL, NULL);
+    zend_string_release(func.function_name);  // 释放我们这份
+}
+```
+
+其他字段（`fn_flags`、`arg_info`）设零即可——闭包无需参数元信息或特殊标志。
+
+## 接口方法需 abstract 标志
+
+### 问题
+
+用 `zend_register_internal_interface` 注册接口时，接口内的方法必须带 `ZEND_ACC_ABSTRACT` 标志。若沿用普通类方法的 `ZEND_ACC_PUBLIC`，接口注册会失败或产生非法的接口定义（接口方法本身就是抽象声明）。
+
+### 解决方案
+
+在生成类方法条目时，对接口类自动补上 abstract 标志：
+
+```zig
+// Zig 侧（module.zig 的 initClassMethodEntries）
+const flags = if (cls.is_interface)
+    resolveFlags(method) | c.phpglue_acc_abstract()
+else
+    resolveFlags(method);
+```
+
+`phpglue_acc_abstract()` 与 `phpglue_acc_public()` 同模式，运行时从编译时 PHP 头文件查询 `ZEND_ACC_ABSTRACT`，避免硬编码位值。

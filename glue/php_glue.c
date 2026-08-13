@@ -131,7 +131,7 @@ int phpglue_array_pop(zval *zv, zval *retval) {
     return 1;
 }
 
-/* — v0.6.0: 数组高级操作 — */
+/* — 数组高级操作 — */
 
 int phpglue_array_shift(zval *zv, zval *retval) {
     HashTable *ht = Z_ARRVAL_P(zv);
@@ -431,28 +431,20 @@ zend_class_entry *phpglue_lookup_class(const char *name, size_t n) {
     return zend_hash_str_find_ptr(CG(class_table), buf, len);
 }
 
-/* — 类常量 — */
+/* — 接口注册与实现 — */
 
-int phpglue_register_class_with_constants(const char *name, size_t name_len, const zend_function_entry *methods,
-    int const_count, const char **const_keys, size_t *const_key_lens,
-    const void **const_vals, size_t *const_val_lens, uint8_t *const_types)
-{
+int phpglue_register_interface(const char *name, size_t n, const zend_function_entry *methods) {
     zend_class_entry ce;
-    INIT_CLASS_ENTRY_EX(ce, name, name_len, methods);
-    zend_class_entry *ce_ptr = zend_register_internal_class(&ce);
-    if (ce_ptr == NULL) return 0;
+    INIT_CLASS_ENTRY_EX(ce, name, n, methods);
+    return zend_register_internal_interface(&ce) != NULL ? 1 : 0;
+}
 
-    // 在已注册的类上追加常量（匹配 PHPX Class::addConstant 流程）
-    for (int i = 0; i < const_count; i++) {
-        zval zv;
-        if (const_types[i] == 0) {
-            ZVAL_LONG(&zv, *(const zend_long *)const_vals[i]);
-        } else {
-            ZVAL_STRINGL(&zv, (const char *)const_vals[i], const_val_lens[i]);
-        }
-        zend_declare_class_constant(ce_ptr, const_keys[i], const_key_lens[i], &zv);
-        zval_ptr_dtor(&zv);
-    }
+int phpglue_class_implements_one(const char *name, size_t n, const char *iface_name, size_t iface_n) {
+    zend_class_entry *ce = phpglue_lookup_class(name, n);
+    if (ce == NULL) return 0;
+    zend_class_entry *iface = phpglue_lookup_class(iface_name, iface_n);
+    if (iface == NULL) return 0;
+    zend_class_implements(ce, 1, iface);
     return 1;
 }
 
@@ -531,6 +523,9 @@ int phpglue_call_method(zval *obj, const char *name, size_t n, zval *retval, uin
     if (call_user_function(NULL, obj, &mname, retval, argc, (zval *)argv) == SUCCESS) { zval_ptr_dtor(&mname); return 1; }
     zval_ptr_dtor(&mname); return 0;
 }
+int phpglue_call_zval(zval *callable, zval *retval, uint32_t argc, const zval *argv) {
+    return call_user_function(NULL, NULL, callable, retval, argc, (zval *)argv) == SUCCESS ? 1 : 0;
+}
 
 /* ================================================================
  * 逻辑判断
@@ -539,7 +534,7 @@ int phpglue_call_method(zval *obj, const char *name, size_t n, zval *retval, uin
 int phpglue_zval_is_true(zval *zv) { return zend_is_true(zv) ? 1 : 0; }
 
 /* ================================================================
- * zval 算术运算符（v0.6.0）
+ * zval 算术运算符
  * ================================================================ */
 
 int phpglue_zval_add(zval *result, zval *op1, zval *op2) { return add_function(result, op1, op2) == SUCCESS ? 1 : 0; }
@@ -552,4 +547,65 @@ int phpglue_zval_compare(zval *op1, zval *op2) {
     zval result;
     compare_function(&result, op1, op2);
     return (int)Z_LVAL(result);
+}
+
+/* ================================================================
+ * zval 语义类型判断
+ * ================================================================ */
+
+int phpglue_zval_is_callable(zval *zv) { return zend_is_callable(zv, 0, NULL) ? 1 : 0; }
+int phpglue_zval_is_iterable(zval *zv) { return zend_is_iterable(zv) ? 1 : 0; }
+int phpglue_zval_is_scalar(zval *zv) {
+    uint8_t t = Z_TYPE_P(zv);
+    return (t == IS_LONG || t == IS_DOUBLE || t == IS_STRING || t == IS_TRUE || t == IS_FALSE) ? 1 : 0;
+}
+int phpglue_zval_is_empty(zval *zv) { return zend_is_true(zv) ? 0 : 1; }
+int phpglue_zval_is_numeric(zval *zv) {
+    uint8_t t = Z_TYPE_P(zv);
+    if (t == IS_LONG || t == IS_DOUBLE) return 1;
+    if (t == IS_STRING) {
+        zend_long lval;
+        double dval;
+        return is_numeric_str_function(Z_STR_P(zv), &lval, &dval) != 0;
+    }
+    return 0;
+}
+
+/* ================================================================
+ * 对象 instanceof
+ * ================================================================ */
+
+int phpglue_object_instanceof(zval *obj, const char *name, size_t name_len) {
+    if (Z_TYPE_P(obj) != IS_OBJECT) return 0;
+    zend_class_entry *ce = phpglue_lookup_class(name, name_len);
+    if (ce == NULL) return 0;
+    return instanceof_function(Z_OBJCE_P(obj), ce) ? 1 : 0;
+}
+
+/* ================================================================
+ * 闭包创建
+ * ================================================================ */
+
+void phpglue_create_closure(zval *res, zif_handler handler, const char *name, size_t name_len) {
+    zend_internal_function func;
+    memset(&func, 0, sizeof(func));
+    func.type = ZEND_INTERNAL_FUNCTION;
+    func.function_name = zend_string_init(name, name_len, 0);
+    func.fn_flags = 0;
+    func.handler = handler;
+    func.num_args = 0;
+    func.required_num_args = 0;
+    func.arg_info = NULL;
+    /* zend_create_closure 会对 function_name zend_string_addref，
+     * 闭包析构时 zend_string_release，故此处释放我们持有的这一份 */
+    zend_create_closure(res, (zend_function *)&func, NULL, NULL, NULL);
+    zend_string_release(func.function_name);
+}
+
+/* ================================================================
+ * 错误报告
+ * ================================================================ */
+
+void phpglue_error_docref(const char *docref, int type, const char *msg) {
+    php_error_docref(docref, type, "%s", msg);
 }

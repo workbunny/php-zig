@@ -28,3 +28,8 @@ pub fn createStdClass(zv: *T.Zval) void {
 pub fn call(obj: *T.Zval, name: []const u8, retval: *T.Zval, args: []const T.Zval) bool {
     return PhpFunc.callMethod(obj, name, retval, args);
 }
+
+/// instanceof 检查：对象是否属于指定类（或实现指定接口）
+pub fn instanceOf(obj: *T.Zval, className: []const u8) bool {
+    return c.phpglue_object_instanceof(obj, className.ptr, className.len) != 0;
+}

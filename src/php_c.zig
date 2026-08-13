@@ -105,7 +105,7 @@ pub extern fn phpglue_hash_get_current_key_ex(ht: *T.ZendArray, str_index: *?*T.
 // —— 弹出 ——
 pub extern fn phpglue_array_pop(zv: *T.Zval, retval: *T.Zval)                                 c_int;
 
-// —— v0.6.0: 数组高级操作 ——
+// —— 数组高级操作 ——
 pub extern fn phpglue_array_shift(zv: *T.Zval, retval: *T.Zval)                               c_int;
 pub extern fn phpglue_array_unshift(zv: *T.Zval, val: *T.Zval)                                void;
 pub extern fn phpglue_array_merge(dst: *T.Zval, src1: *T.Zval, src2: *T.Zval)                 void;
@@ -160,12 +160,6 @@ pub extern fn phpglue_register_class(name: [*c]const u8, name_len: usize, method
 pub extern fn phpglue_register_class_ex(name: [*c]const u8, name_len: usize, methods: ?*anyopaque, parent: *T.ZendClassEntry)    c_int;
 pub extern fn phpglue_lookup_class(name: [*c]const u8, name_len: usize)                                                        ?*T.ZendClassEntry;
 
-pub extern fn phpglue_register_class_with_constants(
-    name: [*c]const u8, name_len: usize, methods: ?*anyopaque,
-    const_count: c_int, const_keys: [*c]const [*c]const u8, const_key_lens: [*c]usize,
-    const_vals: [*c]const ?*anyopaque, const_val_lens: [*c]usize, const_types: [*c]u8,
-) c_int;
-
 /// 注册类 + 常量 + 属性。prop_accesses[i]=ZEND_ACC_*，prop_types[i] 0=long 1=double 2=string 3=bool 4=null
 pub extern fn phpglue_register_class_full(
     name: [*c]const u8, name_len: usize, methods: ?*anyopaque,
@@ -174,6 +168,11 @@ pub extern fn phpglue_register_class_full(
     prop_count: c_int, prop_keys: [*c]const [*c]const u8, prop_key_lens: [*c]usize,
     prop_vals: [*c]const ?*anyopaque, prop_val_lens: [*c]usize, prop_accesses: [*c]u32, prop_types: [*c]u8,
 ) c_int;
+
+// ＝＝＝＝ 接口注册与实现 ＝＝＝＝
+
+pub extern fn phpglue_register_interface(name: [*c]const u8, name_len: usize, methods: ?*anyopaque) c_int;
+pub extern fn phpglue_class_implements_one(name: [*c]const u8, name_len: usize, iface_name: [*c]const u8, iface_n: usize) c_int;
 
 // ＝＝＝＝ 模块常量注册 ＝＝＝＝
 
@@ -191,12 +190,14 @@ pub extern fn phpglue_throw_exception(message: [*c]const u8, message_len: usize)
 
 pub extern fn phpglue_call_func(name: [*c]const u8, name_len: usize, retval: *T.Zval, argc: u32, argv: [*c]const T.Zval)              c_int;
 pub extern fn phpglue_call_method(obj: *T.Zval, name: [*c]const u8, name_len: usize, retval: *T.Zval, argc: u32, argv: [*c]const T.Zval) c_int;
+/// 按 zval 调用（闭包/可调用对象）
+pub extern fn phpglue_call_zval(callable: *T.Zval, retval: *T.Zval, argc: u32, argv: [*c]const T.Zval) c_int;
 
 // ＝＝＝＝ 逻辑判断 ＝＝＝＝
 
 pub extern fn phpglue_zval_is_true(zv: *T.Zval) c_int;
 
-// ＝＝＝＝ zval 算术运算符（v0.6.0） ＝＝＝＝
+// ＝＝＝＝ zval 算术运算符 ＝＝＝＝
 
 pub extern fn phpglue_zval_add(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
 pub extern fn phpglue_zval_sub(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_int;
@@ -206,3 +207,23 @@ pub extern fn phpglue_zval_mod(result: *T.Zval, op1: *T.Zval, op2: *T.Zval) c_in
 
 /// 三值比较：返回 -1 / 0 / 1
 pub extern fn phpglue_zval_compare(op1: *T.Zval, op2: *T.Zval) c_int;
+
+// ＝＝＝＝ zval 语义类型判断 ＝＝＝＝
+
+pub extern fn phpglue_zval_is_callable(zv: *T.Zval) c_int;
+pub extern fn phpglue_zval_is_iterable(zv: *T.Zval) c_int;
+pub extern fn phpglue_zval_is_scalar(zv: *T.Zval) c_int;
+pub extern fn phpglue_zval_is_empty(zv: *T.Zval) c_int;
+pub extern fn phpglue_zval_is_numeric(zv: *T.Zval) c_int;
+
+// ＝＝＝＝ 对象 instanceof ＝＝＝＝
+
+pub extern fn phpglue_object_instanceof(obj: *T.Zval, name: [*c]const u8, name_len: usize) c_int;
+
+// ＝＝＝＝ 闭包创建 ＝＝＝＝
+
+pub extern fn phpglue_create_closure(res: *T.Zval, handler: T.FunctionHandler, name: [*c]const u8, name_len: usize) void;
+
+// ＝＝＝＝ 错误报告 ＝＝＝＝
+
+pub extern fn phpglue_error_docref(docref: ?[*:0]const u8, type: c_int, msg: [*c]const u8) void;

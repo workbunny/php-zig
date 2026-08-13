@@ -55,17 +55,19 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
     导入 @import("phpzig")
     ────────────────
     php-zig 核心层
-    - Zval        : 类型安全的 zval 包装 + 运算符
+    - Zval        : 类型安全的 zval 包装 + 运算符 + 类型判断
     - Array       : 数组增删查 + filter/map/reduce + 迭代器
     - Return      : 返回值 + 参数获取
-    - PhpFunc     : 从 Zig 调用 PHP 函数
+    - PhpFunc     : 从 Zig 调用 PHP 函数 / 闭包
     - Throw       : 异常抛出
-    - Object      : 对象属性读写 + 方法调用
+    - Error       : 错误报告（php_error_docref）
+    - Object      : 对象属性读写 + 方法调用 + instanceof
     - Resource    : 资源类型注册
     - Iterator    : HashTable 遍历
-    - Module      : comptime 模块注册（函数/类/属性/常量/继承/生命周期）
+    - Closure     : 从 Zig 函数创建 PHP Closure
+    - Module      : comptime 模块注册（函数/类/接口/属性/常量/继承/生命周期）
     ────────────────
-    glue/php_glue.c (300行 C)
+    glue/php_glue.c (C 胶水层)
     ZVAL_* / RETVAL_* / array_init / class/property 等宏 → 普通 C 函数
 ```
 
@@ -102,21 +104,22 @@ Hello, Zig!
 | 类别 | 状态 | 说明 |
 |------|:--:|------|
 | 函数注册 | ✅ | 声明式 + comptime struct 反射 arg_info，参数名/类型/可选性全自动推导 |
-| 类型系统 | ✅ | IS_* 全类型判断（8 种）、取值（5 种）、设值（5 种）、eql/neq + **算术运算符**（add/sub/mul/div/mod）+ **关系比较**（cmp/lt/le/gt/ge） |
-| 数组 | ✅ | append / set / setAssoc / find / del / count / pop / **shift / unshift / merge / keys / values / slice / sort / each** / iterator / filter / map / reduce |
+| 类型系统 | ✅ | IS_* 全类型判断（8 种）+ isCallable/isIterable/isScalar/isEmpty/isNumeric、取值/设值、eql/neq、算术运算符（add/sub/mul/div/mod）、关系比较（cmp/lt/le/gt/ge） |
+| 数组 | ✅ | append / set / setAssoc / find / del / count / pop / shift / unshift / merge / keys / values / slice / sort / each / iterator / filter / map / reduce |
 | 返回值 | ✅ | 9 种返回类型 |
-| 调用 PHP | ✅ | `PhpFunc.call*` 系列 + `Object.call` 对象方法 |
-| 异常 | ✅ | `Throw.throwException(className, message)` |
+| 调用 PHP | ✅ | `PhpFunc.call*` 系列 + `Object.call` 对象方法 + `callZval` 闭包调用 |
+| 异常 / 错误 | ✅ | `Throw.throwException` + `Error.docref/warning/notice` |
 | 模块常量 | ✅ | long / double / string / bool / null 五种 |
-| 类注册 | ✅ | 方法（含 static/protected/private）+ 类常量 + **类属性**（5 种类型）+ **继承** + **构造器** |
-| 类属性 | ✅ | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` + **全反射 `createFromStruct`** |
+| 类注册 | ✅ | 方法（含 static/protected/private）+ 类常量 + 类属性（5 种类型）+ 继承 + 构造器 |
+| 接口 | ✅ | `createInterface` 注册 + `createImplements` 实现 |
+| 类属性 | ✅ | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` + 全反射 `createFromStruct` |
 | 生命周期 | ✅ | MINIT / MSHUTDOWN / RINIT / RSHUTDOWN |
-| 对象属性 | ✅ | `readProperty` / `writeProperty` |
+| 对象属性 | ✅ | `readProperty` / `writeProperty` + `instanceOf` |
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
+| 闭包导出 | ✅ | `Closure.create` 从 Zig 函数创建 PHP Closure |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 54 项 + PHP 集成测试 100 项 |
+| 测试 | ✅ | Zig 单元测试 57 项 + PHP 集成测试 115 项 |
 | INI 配置 | ❌ | 依赖 `PHP_INI_BEGIN/END` 编译期声明 |
-| 闭包导出 | ❌ | v0.7 规划中 |
 
 ### 两种注册哲学，并存
 
@@ -160,18 +163,18 @@ phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
 
 ## 与 PHPX 的取舍
 
-| | PHPX (C++) | php-zig v0.6 (Zig) |
+| | PHPX (C++) | php-zig v0.7 (Zig) |
 |--|-----------|---------------|
 | 函数注册 | 宏自注册 + 运行时分发 | comptime 泛型 + 直接函数指针 |
 | arg_info | 自动生成 | 声明式 + comptime struct 反射（双轨） |
-| 类导出 | Class / Interface / 继承 / 属性 / 常量 / 访问修饰符 | Class / 继承 / 属性（5 种类型）/ 常量 / public/protected/private |
+| 类导出 | Class / Interface / 继承 / 属性 / 常量 / 访问修饰符 | Class / Interface / 继承 / 属性（5 种类型）/ 常量 / public/protected/private |
 | 数组操作 | 完整（push/pop/shift/unshift/slice/merge/sort/keys/values） | 完整（对齐 PHPX）+ filter/map/reduce/each |
 | 运算符 | 算术 + 比较重载 | add/sub/mul/div/mod + cmp/lt/le/gt/ge |
-| 闭包导出 | 支持 | v0.7 规划 |
+| 闭包导出 | 支持 | 支持（Closure.create） |
 | 构建 | CMake + phpize | `zig build -Dphp=/path` |
-| 生产可用性 | 生产级 | 主体功能完成（v0.6），接近生产可用 |
+| 生产可用性 | 生产级 | 主体功能完成（v0.7），接近生产可用 |
 
-php-zig 的策略：优先覆盖 PHPX 主体功能（OOP 深度已达 v0.5，数组操作 v0.6 对齐），comptime 能力是 PHPX 不具备的差异优势。
+php-zig 的策略：优先覆盖 PHPX 主体功能（OOP、数组、闭包、接口均已对齐），comptime 能力是 PHPX 不具备的差异优势。
 
 ## 许可证
 

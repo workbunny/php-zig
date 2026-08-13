@@ -45,3 +45,8 @@ pub fn call2Str(name: []const u8, retval: *T.Zval, a: []const u8, b: []const u8)
 pub fn callMethod(obj: *T.Zval, name: []const u8, retval: *T.Zval, args: []const T.Zval) bool {
     return c.phpglue_call_method(obj, name.ptr, name.len, retval, @intCast(args.len), args.ptr) != 0;
 }
+
+/// 按 zval 调用可调用对象（闭包/函数名/可调用对象）
+pub fn callZval(callable: *T.Zval, retval: *T.Zval, args: []const T.Zval) bool {
+    return c.phpglue_call_zval(callable, retval, @intCast(args.len), args.ptr) != 0;
+}

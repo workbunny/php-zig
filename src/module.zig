@@ -392,12 +392,24 @@ pub const ClassDesc = struct {
     parent_name:     ?[:0]const u8 = null,
     class_constants: []const ClassConstantDesc = &.{},
     properties:      []const ClassPropertyDesc = &.{},
+    /// 是否为接口（true 时用 zend_register_internal_interface 注册）
+    is_interface:    bool = false,
+    /// 要实现的接口名列表（须先于本类注册）
+    interfaces:      []const [:0]const u8 = &.{},
 
     pub fn create(name: [:0]const u8, methods: []const FunctionDesc) ClassDesc {
         return .{ .name = name, .methods = methods };
     }
     pub fn createExtends(name: [:0]const u8, parent: [:0]const u8, methods: []const FunctionDesc) ClassDesc {
         return .{ .name = name, .methods = methods, .parent_name = parent };
+    }
+    /// 注册接口
+    pub fn createInterface(name: [:0]const u8, methods: []const FunctionDesc) ClassDesc {
+        return .{ .name = name, .methods = methods, .is_interface = true };
+    }
+    /// 注册类并实现指定接口（接口须先声明）
+    pub fn createImplements(name: [:0]const u8, methods: []const FunctionDesc, interfaces: []const [:0]const u8) ClassDesc {
+        return .{ .name = name, .methods = methods, .interfaces = interfaces };
     }
     pub fn createWithConstants(name: [:0]const u8, methods: []const FunctionDesc, constants: []const ClassConstantDesc) ClassDesc {
         return .{ .name = name, .methods = methods, .class_constants = constants };
@@ -621,12 +633,17 @@ pub fn Module(comptime opts: struct {
             inline for (opts.classes, 0..) |cls, i| {
                 inline for (cls.methods, 0..) |method, j| {
                     const ai = resolveArgInfo(method, &ps_off);
+                    // 接口方法须带 abstract 标志
+                    const flags = if (cls.is_interface)
+                        resolveFlags(method) | c.phpglue_acc_abstract()
+                    else
+                        resolveFlags(method);
                     class_method_entries[off + j] = .{
                         .fname    = method.name.ptr,
                         .handler  = method.handler,
                         .arg_info = ai.ptr,
                         .num_args = ai.num,
-                        .flags    = resolveFlags(method),
+                        .flags    = flags,
                     };
                 }
                 class_method_entries[off + cls.methods.len] = .{};
@@ -668,11 +685,6 @@ pub fn Module(comptime opts: struct {
         fn mshutdownPtr() ?T.ModuleLifecycleFn { return if (opts.mshutdown) |_| &phpzigMshutdown else null; }
         fn rinitPtr()     ?T.ModuleLifecycleFn { return if (opts.rinit) |_| &phpzigRinit else null; }
         fn rshutdownPtr() ?T.ModuleLifecycleFn { return if (opts.rshutdown) |_| &phpzigRshutdown else null; }
-
-        fn registerClassWithConstants(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
-            // registerClassFull 统一处理常量+属性（prop_count=0 时只注册常量）
-            return registerClassFull(cls, methods_ptr);
-        }
 
         fn registerClassFull(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
             // — 常量打包 —
@@ -739,7 +751,9 @@ pub fn Module(comptime opts: struct {
             }
             initClassMethodEntries();
             inline for (opts.classes, 0..) |cls, i| {
-                const result: c_int = if (cls.properties.len > 0 or cls.class_constants.len > 0)
+                const result: c_int = if (cls.is_interface)
+                    c.phpglue_register_interface(cls.name.ptr, cls.name.len, class_method_ptrs[i])
+                else if (cls.properties.len > 0 or cls.class_constants.len > 0)
                     registerClassFull(cls, class_method_ptrs[i])
                 else if (cls.parent_name) |parent_name|
                     c.phpglue_register_class_ex(cls.name.ptr, cls.name.len, class_method_ptrs[i],
@@ -748,6 +762,12 @@ pub fn Module(comptime opts: struct {
                     c.phpglue_register_class(cls.name.ptr, cls.name.len, class_method_ptrs[i]);
 
                 if (result == 0) return -1;
+
+                // 类实现接口（接口须先于本类注册）
+                inline for (cls.interfaces) |iface_name| {
+                    if (c.phpglue_class_implements_one(cls.name.ptr, cls.name.len, iface_name.ptr, iface_name.len) == 0)
+                        return -1;
+                }
             }
             if (opts.minit) |user_minit| return user_minit(type_, module_number);
             return 0;

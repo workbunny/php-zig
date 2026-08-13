@@ -19,6 +19,9 @@
 #include "zend_modules.h"
 #include "zend_hash.h"
 #include "zend_exceptions.h"
+#include "zend_closures.h"
+#include "zend_compile.h"
+#include "zend_operators.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -153,7 +156,7 @@ int    phpglue_hash_get_current_key_ex(zend_array *ht, zend_string **str_index, 
 
 int    phpglue_array_pop(zval *zv, zval *retval);
 
-/* — v0.6.0: 数组高级操作 — */
+/* — 数组高级操作 — */
 
 /** 移除并返回第一个元素（遍历顺序），空数组返回 0 */
 int    phpglue_array_shift(zval *zv, zval *retval);
@@ -248,17 +251,18 @@ int phpglue_register_class(const char *name, size_t name_len, const zend_functio
 int phpglue_register_class_ex(const char *name, size_t name_len, const zend_function_entry *methods, zend_class_entry *parent);
 zend_class_entry *phpglue_lookup_class(const char *name, size_t name_len);
 
-/** 注册类并添加常量。count 为常量个数，keys/vals 同为 arrays 长度为 count。type_ids[i]=0 表示 long，1 表示 string。 */
-int phpglue_register_class_with_constants(const char *name, size_t name_len, const zend_function_entry *methods,
-    int const_count, const char **const_keys, size_t *const_key_lens,
-    const void **const_vals, size_t *const_val_lens, uint8_t *const_types);
-
 /** 注册类并添加常量和属性。accesses[i] 为 ZEND_ACC_* 组合，prop_types[i] 0=long 1=double 2=string 3=bool 4=null。 */
 int phpglue_register_class_full(const char *name, size_t name_len, const zend_function_entry *methods,
     int const_count, const char **const_keys, size_t *const_key_lens,
     const void **const_vals, size_t *const_val_lens, uint8_t *const_types,
     int prop_count, const char **prop_keys, size_t *prop_key_lens,
     const void **prop_vals, size_t *prop_val_lens, uint32_t *prop_accesses, uint8_t *prop_types);
+
+/** 注册接口（等价 zend_register_internal_interface） */
+int phpglue_register_interface(const char *name, size_t name_len, const zend_function_entry *methods);
+
+/** 让类实现单个接口（接口须已注册） */
+int phpglue_class_implements_one(const char *name, size_t name_len, const char *iface_name, size_t iface_n);
 
 /* ================================================================
  * PHP 函数调用（Facade）
@@ -274,7 +278,7 @@ int phpglue_call_method(zval *obj, const char *name, size_t name_len, zval *retv
 int phpglue_zval_is_true(zval *zv);
 
 /* ================================================================
- * zval 算术运算符（v0.6.0）
+ * zval 算术运算符
  * 返回值：SUCCESS / FAILURE
  * ================================================================ */
 
@@ -286,6 +290,40 @@ int phpglue_zval_mod(zval *result, zval *op1, zval *op2);
 
 /** 三值比较：返回 -1 / 0 / 1（等价 PHP <=> 飞船运算符） */
 int phpglue_zval_compare(zval *op1, zval *op2);
+
+/* ================================================================
+ * zval 语义类型判断
+ * ================================================================ */
+
+int phpglue_zval_is_callable(zval *zv);
+int phpglue_zval_is_iterable(zval *zv);
+int phpglue_zval_is_scalar(zval *zv);
+int phpglue_zval_is_empty(zval *zv);
+int phpglue_zval_is_numeric(zval *zv);
+
+/* ================================================================
+ * 对象 instanceof
+ * ================================================================ */
+
+/** 判断对象是否属于指定类（或实现指定接口），非对象或类不存在返回 0 */
+int phpglue_object_instanceof(zval *obj, const char *name, size_t name_len);
+
+/* ================================================================
+ * 闭包创建
+ * ================================================================ */
+
+/** 从 Zig 函数处理器创建 PHP Closure，结果写入 res */
+void phpglue_create_closure(zval *res, zif_handler handler, const char *name, size_t name_len);
+
+/* ================================================================
+ * 错误报告
+ * ================================================================ */
+
+/** 带 docref 前缀的错误报告（等价 php_error_docref(docref, type, "%s", msg)） */
+void phpglue_error_docref(const char *docref, int type, const char *msg);
+
+/** 按 zval 调用（闭包/可调用对象），等价 call_user_function(NULL, NULL, callable, ...) */
+int phpglue_call_zval(zval *callable, zval *retval, uint32_t argc, const zval *argv);
 
 #ifdef __cplusplus
 }
