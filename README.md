@@ -167,7 +167,7 @@ php -d extension=zig-out/lib/libhello.so \
 Hello from php-zig!
 ```
 
-完整教程见 [doc/tutorial.md](doc/tutorial.md)。
+完整教程见 [doc/tutorial.md](doc/tutorial.md)，API 参考见 [doc/api.md](doc/api.md)。
 
 ## 能力
 

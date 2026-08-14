@@ -105,6 +105,9 @@ void phpglue_zval_del_ref(zval *zv);
 /** ZVAL_COPY 副本 */
 void phpglue_zval_copy(zval *dst, zval *src);
 
+/** 写时分离（SEPARATE_ZVAL）：引用计数 > 1 或引用类型时复制独立副本 */
+void phpglue_zval_separate(zval *zv);
+
 /* ================================================================
  * 数组操作 — 初始化与写时分离
  * ================================================================ */

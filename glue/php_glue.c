@@ -63,6 +63,7 @@ void phpglue_zval_ptr_dtor(zval *zv) { zval_ptr_dtor(zv); }
 
 void phpglue_zval_del_ref(zval *zv)  { Z_DELREF_P(zv); }
 void phpglue_zval_copy(zval *dst, zval *src) { ZVAL_COPY(dst, src); }
+void phpglue_zval_separate(zval *zv) { SEPARATE_ZVAL(zv); }
 
 /* ================================================================
  * 数组操作 — 初始化与写时分离

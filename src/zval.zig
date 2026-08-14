@@ -144,7 +144,12 @@ pub const Zval = struct {
 
     // ＝＝ 引用计数与复制 ＝＝
 
-    pub fn addRef(self: Zval) void { c.phpglue_zval_add_ref(self.ptr); }
+    /// 引用计数 +1（Z_ADDREF_P）；非引用类型为 no-op
+    pub fn incRef(self: Zval) void { c.phpglue_zval_add_ref(self.ptr); }
+    /// 引用计数 -1（Z_DELREF_P）
     pub fn decRef(self: Zval) void { c.phpglue_zval_del_ref(self.ptr); }
+    /// ZVAL_COPY 副本
     pub fn copy(self: Zval, dst: Zval) void { c.phpglue_zval_copy(dst.ptr, self.ptr); }
+    /// 写时分离（SEPARATE_ZVAL）：引用计数 > 1 或引用类型时复制独立副本，避免污染共享引用
+    pub fn separate(self: Zval) void { c.phpglue_zval_separate(self.ptr); }
 };

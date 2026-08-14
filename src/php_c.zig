@@ -53,6 +53,7 @@ pub extern fn phpglue_zval_add_ref(zv: *T.Zval)    void;
 pub extern fn phpglue_zval_ptr_dtor(zv: *T.Zval)   void;
 pub extern fn phpglue_zval_del_ref(zv: *T.Zval)    void;
 pub extern fn phpglue_zval_copy(dst: *T.Zval, src: *T.Zval) void;
+pub extern fn phpglue_zval_separate(zv: *T.Zval)    void;
 
 // ＝＝＝＝ 数组操作 ＝＝＝＝
 
