@@ -25,6 +25,8 @@
 #include "zend_ini.h"
 #include "zend_smart_str.h"
 #include "zend_objects.h"
+#include "zend_fibers.h"
+#include "zend_observer.h"
 #include "ext/standard/php_var.h"
 
 #ifdef __cplusplus
@@ -404,6 +406,60 @@ void *phpglue_object_get_extra(zval *obj);
 
 /** 获取当前方法调用的 $this 对象（非方法调用返回 NULL） */
 zval *phpglue_get_this(zend_execute_data *execute_data);
+
+/* ================================================================
+ * Fiber — 只读查询 + 构造（控制操作 suspend/resume/start/throw 由
+ * Zig 侧通过 PhpFunc 调用 PHP 原生 Fiber 方法完成，复用其校验与
+ * FiberError 抛出，避免直接包装 zend_fiber_* 内含 return 的陷阱）
+ * ================================================================ */
+
+/** 判断 zval 是否为 Fiber 实例（IS_OBJECT && instanceof zend_ce_fiber） */
+int phpglue_zval_is_fiber(zval *zv);
+
+/** 读取 Fiber 状态：0=INIT 1=RUNNING 2=SUSPENDED 3=DEAD；非 Fiber 返回 -1 */
+int phpglue_fiber_status(zval *zv);
+
+/** 获取当前活跃 Fiber 到 rv（ZVAL_OBJ_COPY），非 Fiber 上下文返回 0 */
+int phpglue_fiber_get_current(zval *rv);
+
+/** 读取 Fiber 返回值到 rv（仅 DEAD 且未抛异常），成功返回 1 */
+int phpglue_fiber_get_return(zval *zv, zval *rv);
+
+/** 用 callable 构造 Fiber 对象（等价 new Fiber($callable)），成功返回 1 */
+int phpglue_fiber_create(zval *callable, zval *rv);
+
+/* ================================================================
+ * Observer — 集中式观察代理（静态注册，MINIT 一次性）
+ *
+ * 观察点五类：fcall begin/end、error、function_declared、
+ * class_linked、fiber init/switch/destroy。
+ * glue 提供 C trampoline 将 Zend 类型转换为基础类型后转发给
+ * Zig 侧注册的回调（各回调可独立为 NULL，NULL 表示不观察该类）。
+ * ================================================================ */
+
+/** Zig 友好回调签名（glue 已将 Zend 类型转换为基础类型） */
+typedef void (*phpglue_observer_fcall_begin_fn)(zend_execute_data *execute_data);
+typedef void (*phpglue_observer_fcall_end_fn)(zend_execute_data *execute_data, zval *retval);
+typedef void (*phpglue_observer_error_fn)(int type, const char *filename, size_t filename_len, uint32_t lineno, const char *message, size_t message_len);
+typedef void (*phpglue_observer_declared_fn)(const char *name, size_t name_len);
+typedef void (*phpglue_observer_fiber_init_fn)(int status);
+typedef void (*phpglue_observer_fiber_switch_fn)(int from_status, int to_status);
+typedef void (*phpglue_observer_fiber_destroy_fn)(int status);
+
+/** 一次性注册所有观察点（各回调可 NULL）。须在 MINIT 调用。 */
+void phpglue_observer_register(
+    phpglue_observer_fcall_begin_fn fcall_begin,
+    phpglue_observer_fcall_end_fn fcall_end,
+    phpglue_observer_error_fn error,
+    phpglue_observer_declared_fn function_declared,
+    phpglue_observer_declared_fn class_linked,
+    phpglue_observer_fiber_init_fn fiber_init,
+    phpglue_observer_fiber_switch_fn fiber_switch,
+    phpglue_observer_fiber_destroy_fn fiber_destroy
+);
+
+/** 从 execute_data 提取当前函数名（仅 fcall begin/end 回调内有效），无函数名返回 NULL */
+const char *phpglue_observer_func_name(zend_execute_data *execute_data, size_t *len);
 
 #ifdef __cplusplus
 }

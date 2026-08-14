@@ -871,3 +871,183 @@ void *phpglue_object_get_extra(zval *obj) {
 zval *phpglue_get_this(zend_execute_data *execute_data) {
     return getThis();
 }
+
+/* ================================================================
+ * Fiber — 只读查询 + 构造
+ * ================================================================ */
+
+int phpglue_zval_is_fiber(zval *zv) {
+    if (Z_TYPE_P(zv) != IS_OBJECT) return 0;
+    return instanceof_function(Z_OBJCE_P(zv), zend_ce_fiber);
+}
+
+int phpglue_fiber_status(zval *zv) {
+    if (Z_TYPE_P(zv) != IS_OBJECT) return -1;
+    zend_object *obj = Z_OBJ_P(zv);
+    if (!instanceof_function(obj->ce, zend_ce_fiber)) return -1;
+    zend_fiber *fiber = (zend_fiber *) obj;
+    return (int) fiber->context.status;
+}
+
+int phpglue_fiber_get_current(zval *rv) {
+    zend_fiber *fiber = EG(active_fiber);
+    if (fiber == NULL) return 0;
+    ZVAL_OBJ_COPY(rv, &fiber->std);
+    return 1;
+}
+
+int phpglue_fiber_get_return(zval *zv, zval *rv) {
+    if (Z_TYPE_P(zv) != IS_OBJECT) return 0;
+    zend_object *obj = Z_OBJ_P(zv);
+    if (!instanceof_function(obj->ce, zend_ce_fiber)) return 0;
+    zend_fiber *fiber = (zend_fiber *) obj;
+    if (fiber->context.status != ZEND_FIBER_STATUS_DEAD) return 0;
+    if (fiber->flags & ZEND_FIBER_FLAG_THREW) return 0;
+    ZVAL_COPY(rv, &fiber->result);
+    return 1;
+}
+
+int phpglue_fiber_create(zval *callable, zval *rv) {
+    zend_fcall_info fci;
+    zend_fcall_info_cache fcc;
+    if (zend_fcall_info_init(callable, 0, &fci, &fcc, NULL, NULL) != SUCCESS) {
+        return 0;
+    }
+
+    object_init_ex(rv, zend_ce_fiber);
+    zend_fiber *fiber = (zend_fiber *) Z_OBJ_P(rv);
+
+    /* 复刻 Fiber::__construct 逻辑：设置 fci/fci_cache 并持有 callable 引用 */
+    fiber->fci = fci;
+    fiber->fci_cache = fcc;
+    Z_TRY_ADDREF(fiber->fci.function_name);
+    return 1;
+}
+
+/* ================================================================
+ * Observer — 集中式观察代理（静态注册）
+ * ================================================================ */
+
+/* Zig 侧注册的回调（全局单例，MINIT 一次性设置） */
+static phpglue_observer_fcall_begin_fn  g_obs_fcall_begin = NULL;
+static phpglue_observer_fcall_end_fn    g_obs_fcall_end = NULL;
+static phpglue_observer_error_fn        g_obs_error = NULL;
+static phpglue_observer_declared_fn     g_obs_function_declared = NULL;
+static phpglue_observer_declared_fn     g_obs_class_linked = NULL;
+static phpglue_observer_fiber_init_fn   g_obs_fiber_init = NULL;
+static phpglue_observer_fiber_switch_fn g_obs_fiber_switch = NULL;
+static phpglue_observer_fiber_destroy_fn g_obs_fiber_destroy = NULL;
+
+/* —— fcall begin/end trampoline —— */
+
+static void phpglue_observer_fcall_begin_trampoline(zend_execute_data *execute_data) {
+    if (g_obs_fcall_begin) g_obs_fcall_begin(execute_data);
+}
+
+static void phpglue_observer_fcall_end_trampoline(zend_execute_data *execute_data, zval *retval) {
+    if (g_obs_fcall_end) g_obs_fcall_end(execute_data, retval);
+}
+
+/* fcall init 回调：若注册了 begin/end 则观察全部函数。
+ * 定位为「集中式代理」——无条件汇聚，下游自行决定是否处理。 */
+static zend_observer_fcall_handlers phpglue_observer_fcall_init(zend_execute_data *execute_data) {
+    (void) execute_data;
+    zend_observer_fcall_handlers handlers = {NULL, NULL};
+    if (g_obs_fcall_begin) handlers.begin = phpglue_observer_fcall_begin_trampoline;
+    if (g_obs_fcall_end)   handlers.end   = phpglue_observer_fcall_end_trampoline;
+    return handlers;
+}
+
+/* —— error trampoline：zend_string* → char* + len —— */
+
+static void phpglue_observer_error_trampoline(int type, zend_string *error_filename, uint32_t error_lineno, zend_string *message) {
+    if (!g_obs_error) return;
+    g_obs_error(type,
+        error_filename ? ZSTR_VAL(error_filename) : "",
+        error_filename ? ZSTR_LEN(error_filename) : 0,
+        error_lineno,
+        message ? ZSTR_VAL(message) : "",
+        message ? ZSTR_LEN(message) : 0);
+}
+
+/* —— function_declared / class_linked trampoline —— */
+
+static void phpglue_observer_function_declared_trampoline(zend_op_array *op_array, zend_string *name) {
+    (void) op_array;
+    if (g_obs_function_declared) g_obs_function_declared(ZSTR_VAL(name), ZSTR_LEN(name));
+}
+
+static void phpglue_observer_class_linked_trampoline(zend_class_entry *ce, zend_string *name) {
+    (void) ce;
+    if (g_obs_class_linked) g_obs_class_linked(ZSTR_VAL(name), ZSTR_LEN(name));
+}
+
+/* —— fiber init/switch/destroy trampoline：context → status —— */
+
+static void phpglue_observer_fiber_init_trampoline(zend_fiber_context *initializing) {
+    if (g_obs_fiber_init) g_obs_fiber_init((int) initializing->status);
+}
+
+static void phpglue_observer_fiber_switch_trampoline(zend_fiber_context *from, zend_fiber_context *to) {
+    if (g_obs_fiber_switch) g_obs_fiber_switch((int) from->status, (int) to->status);
+}
+
+static void phpglue_observer_fiber_destroy_trampoline(zend_fiber_context *destroying) {
+    if (g_obs_fiber_destroy) g_obs_fiber_destroy((int) destroying->status);
+}
+
+/* —— 一次性注册全部观察点（MINIT） —— */
+
+void phpglue_observer_register(
+    phpglue_observer_fcall_begin_fn fcall_begin,
+    phpglue_observer_fcall_end_fn fcall_end,
+    phpglue_observer_error_fn error,
+    phpglue_observer_declared_fn function_declared,
+    phpglue_observer_declared_fn class_linked,
+    phpglue_observer_fiber_init_fn fiber_init,
+    phpglue_observer_fiber_switch_fn fiber_switch,
+    phpglue_observer_fiber_destroy_fn fiber_destroy
+) {
+    g_obs_fcall_begin = fcall_begin;
+    g_obs_fcall_end = fcall_end;
+    g_obs_error = error;
+    g_obs_function_declared = function_declared;
+    g_obs_class_linked = class_linked;
+    g_obs_fiber_init = fiber_init;
+    g_obs_fiber_switch = fiber_switch;
+    g_obs_fiber_destroy = fiber_destroy;
+
+    if (fcall_begin || fcall_end) {
+        zend_observer_fcall_register(phpglue_observer_fcall_init);
+    }
+    if (error) {
+        zend_observer_error_register(phpglue_observer_error_trampoline);
+    }
+    if (function_declared) {
+        zend_observer_function_declared_register(phpglue_observer_function_declared_trampoline);
+    }
+    if (class_linked) {
+        zend_observer_class_linked_register(phpglue_observer_class_linked_trampoline);
+    }
+    if (fiber_init) {
+        zend_observer_fiber_init_register(phpglue_observer_fiber_init_trampoline);
+    }
+    if (fiber_switch) {
+        zend_observer_fiber_switch_register(phpglue_observer_fiber_switch_trampoline);
+    }
+    if (fiber_destroy) {
+        zend_observer_fiber_destroy_register(phpglue_observer_fiber_destroy_trampoline);
+    }
+}
+
+/* —— 从 execute_data 提取当前函数名 —— */
+
+const char *phpglue_observer_func_name(zend_execute_data *execute_data, size_t *len) {
+    zend_function *func = execute_data ? execute_data->func : NULL;
+    if (!func || !func->common.function_name) {
+        if (len) *len = 0;
+        return NULL;
+    }
+    if (len) *len = ZSTR_LEN(func->common.function_name);
+    return ZSTR_VAL(func->common.function_name);
+}

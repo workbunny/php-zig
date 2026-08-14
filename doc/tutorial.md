@@ -808,6 +808,116 @@ phpzig.Cleanup.register(closeFd, @ptrCast(@as(usize, fd)));
 **4. `@memcpy` 不分配内存**：它只做字节复制，目标是调用者提供的内存
 （通常是栈数组）。泄漏的唯一根源是「堆分配了没释放」，与 `@memcpy` 无关。
 
+### Fiber 协程 ★ v0.9.1
+
+定位：**PHP 是调度器（event-loop），Zig 提供挂起/唤起/检测能力**，不自行构建 event-loop。
+Zig 扩展函数可在 Fiber 内挂起自己、把控制权交还 PHP 主协程，PHP 侧在合适时机
+resume 后从挂起点继续执行。
+
+**只读查询**（glue 直读 `zend_fiber` 结构体，零方法调用开销）：
+
+```zig
+phpzig.Fiber.isFiber(zv) -> bool          // instanceof Fiber
+phpzig.Fiber.getStatus(zv) -> ?Status     // INIT/RUNNING/SUSPENDED/DEAD，非 Fiber 返回 null
+phpzig.Fiber.getCurrent(&rv) -> bool      // 当前活跃 Fiber（EG(active_fiber)），非 Fiber 上下文 false
+phpzig.Fiber.getReturn(zv, &rv) -> bool   // 最终返回值（仅 DEAD 且未抛异常）
+phpzig.Fiber.create(callable, &rv) -> bool // 用 callable 构造 Fiber（等价 new Fiber($callable)）
+```
+
+**控制操作**（走 PHP 原生 `Fiber` 方法，复用校验 + `FiberError` 抛出）：
+
+```zig
+phpzig.Fiber.start(zv, &rv, args) -> bool        // 启动（须 Fiber 外，status == INIT）
+phpzig.Fiber.suspend_(zv, &value, &rv) -> bool   // 挂起自己（须 Fiber 内）
+phpzig.Fiber.resume_(zv, &value, &rv) -> bool    // 唤起（须 Fiber 外，SUSPENDED）
+phpzig.Fiber.throw(zv, &ex, &rv) -> bool         // 注入异常（须 Fiber 外，SUSPENDED）
+```
+
+> `suspend`/`resume` 是 Zig 保留关键字（async 语义），故命名加下划线 `suspend_`/`resume_`。
+
+**完整示例——Zig 闭包在 Fiber 内挂起自己，PHP event-loop 唤起**：
+
+```zig
+fn fiberBody(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    var cur: T.Zval = undefined;
+    if (!phpzig.Fiber.getCurrent(&cur)) { phpzig.Return.returnNull(rv); return; }
+
+    var value: T.Zval = undefined;
+    c.phpglue_zval_set_stringl(&value, "from-fiber", 10);
+    var ret: T.Zval = undefined;
+    _ = phpzig.Fiber.suspend_(phpzig.Zval.fromPtr(&cur), &value, &ret);  // 挂起，交还 PHP
+
+    // 被 resume 后从这里继续，ret 为 PHP 侧 resume 传入的值
+    phpzig.Return.returnZval(rv, &ret);
+}
+
+// PHP 侧：
+//   $fiber = hello_fiber_create(hello_fiber_body());  // Zig 用 callable 构造
+//   $startRet = $fiber->start();      // fiber 内部 suspend，start 返回 "from-fiber"
+//   $fiber->resume("from-php");       // 唤起，fiber 继续并返回 "from-php"
+```
+
+**关键语义**：`resume()` 返回「fiber **下一次 suspend** 交出的值」；若 fiber 直接完成
+（不再 suspend），`resume()` 返回 null，最终结果走 `getReturn()` 获取。
+控制操作是真正的栈切换（`swapcontext`），被挂起的 Zig 栈帧冻结在 fiber 栈上，
+若 fiber 未完成即被销毁，`defer` 不执行——由 `Cleanup`/`RequestArena` 兜底。
+
+### Observer 集中式观察代理 ★ v0.9.1
+
+定位：所有关键事件汇聚到一个「代理」入口，下游 handler 决定统计/监测等
+**旁路动作**（不拦截函数执行——拦截需走异常系统）。静态注册：MINIT 一次性，
+请求期不变。
+
+**五类观察点**：
+
+| 观察点 | 回调签名 | 触发时机 |
+|--------|---------|---------|
+| 函数调用 begin/end | `fn(execute_data)` / `fn(execute_data, retval)` | 每次函数调用（含内部函数） |
+| 错误 | `fn(type, filename+len, lineno, message+len)` | 每次 error 触发 |
+| 函数声明 | `fn(name+len)` | 编译期声明函数 |
+| 类链接 | `fn(name+len)` | 类链接时 |
+| fiber init/switch/destroy | `fn(status)` / `fn(from_status, to_status)` | fiber 创建/启动/切换/销毁 |
+
+**在 `moduleInit` 里注册**：
+
+```zig
+fn onFcallBegin(execute_data: *T.ZendExecuteData) callconv(.c) void {
+    if (phpzig.Observer.funcName(execute_data)) |name| {
+        // name 为被观察函数名，做统计/采样/插针
+    }
+}
+fn onFcallEnd(execute_data: *T.ZendExecuteData, retval: *T.Zval) callconv(.c) void {
+    _ = execute_data; _ = retval;
+}
+fn onError(type_: c_int, filename: [*c]const u8, filename_len: usize, lineno: u32,
+           message: [*c]const u8, message_len: usize) callconv(.c) void {
+    // error 观察（type_ 为 E_* 常量）
+}
+fn onFiberSwitch(from_status: c_int, to_status: c_int) callconv(.c) void {
+    // fiber 切换观察
+}
+
+comptime {
+    phpzig.moduleInit(@This(), .{
+        .name = "monitor",
+        .version = "1.0.0",
+        .observer = .{
+            .fcall_begin = onFcallBegin,
+            .fcall_end = onFcallEnd,
+            .@"error" = onError,        // error 是 Zig 保留字，须 @"error"
+            .fiber_switch = onFiberSwitch,
+            // 未设置的字段 = 不观察该类事件
+        },
+    });
+}
+```
+
+**注意**：
+- `error` 是 Zig 保留字，字段名须 `@"error"` 转义，访问时 `obs.@"error"`。
+- fcall observer 观察**所有函数**（含内部函数），下游自行过滤；测试用相对增量断言。
+- fiber 观察回调拿到的是 status（非 Fiber 对象），需要对象细节时配合 `Fiber.getCurrent()`。
+- 观察是旁路动作，不拦截执行；返回值改写/reject 不在 observer 能力内（用 `Throw`）。
+
 ### 接口与实现
 
 ```zig
@@ -948,7 +1058,7 @@ zig build test
 cd example/tests
 zig build -Dphp=/usr/local
 php -d extension=zig-out/lib/libext-tests.so test_all.php
-# 156/156 通过
+# 179/179 通过
 ```
 
 最小示例（`example/hello/`）构建与运行：

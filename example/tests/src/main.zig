@@ -629,6 +629,206 @@ fn helloCleanupRegister(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
     phpzig.Return.returnBool(return_value, true);
 }
 
+// ＝＝ v0.9.1 — Fiber（协程）能力 ＝＝
+
+// Fiber 执行体：在 fiber 内主动挂起自己，被 resume 后返回 resume 传入的值
+fn fiberBody(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    // 此时运行在 fiber 内，获取当前 fiber
+    var cur: T.Zval = undefined;
+    if (!phpzig.Fiber.getCurrent(&cur)) {
+        phpzig.Return.returnString(return_value, "no-active-fiber");
+        return;
+    }
+    // 挂起自己，把 "from-fiber" 交还 PHP 主协程
+    var value: T.Zval = undefined;
+    c.phpglue_zval_set_stringl(&value, "from-fiber", 10);
+    var ret: T.Zval = undefined;
+    _ = phpzig.Fiber.suspend_(phpzig.Zval.fromPtr(&cur), &value, &ret);
+    // 被 resume 后，ret 为 PHP 侧 resume 传入的值
+    const retz = phpzig.Zval.fromPtr(&ret);
+    if (retz.isString()) {
+        phpzig.Return.returnString(return_value, retz.toStringVal());
+    } else {
+        phpzig.Return.returnString(return_value, "resumed");
+    }
+}
+
+fn helloFiberBody(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    var closure_zv: T.Zval = undefined;
+    phpzig.Closure.create(fiberBody, "fiber_body", &closure_zv);
+    phpzig.Return.returnZval(return_value, &closure_zv);
+}
+
+fn helloFiberCreate(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnNull(return_value);
+        return;
+    }
+    const callable = phpzig.Return.callArg(execute_data, 1);
+    var fiber_zv: T.Zval = undefined;
+    if (phpzig.Fiber.create(callable, &fiber_zv)) {
+        phpzig.Return.returnZval(return_value, &fiber_zv);
+    } else {
+        phpzig.Return.returnNull(return_value);
+    }
+}
+
+fn helloFiberIs(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnBool(return_value, false);
+        return;
+    }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    phpzig.Return.returnBool(return_value, phpzig.Fiber.isFiber(arg));
+}
+
+fn helloFiberStatus(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnLong(return_value, -1);
+        return;
+    }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    if (phpzig.Fiber.getStatus(arg)) |s| {
+        phpzig.Return.returnLong(return_value, @intFromEnum(s));
+    } else {
+        phpzig.Return.returnLong(return_value, -1);
+    }
+}
+
+fn helloFiberGetReturn(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnNull(return_value);
+        return;
+    }
+    const arg = phpzig.Return.callArg(execute_data, 1);
+    var rv: T.Zval = undefined;
+    if (phpzig.Fiber.getReturn(arg, &rv)) {
+        phpzig.Return.returnZval(return_value, &rv);
+    } else {
+        phpzig.Return.returnNull(return_value);
+    }
+}
+
+// ＝＝ v0.9.1 — Observer 集中式观察代理 ＝＝
+//
+// 全局计数状态 + 观察回调。observer 在 MINIT 静态注册，所有函数调用
+// （含内部函数）都会走 begin/end 路径，故测试用「相对增量」而非绝对值断言。
+
+var obs_fcall_begin_count: i64 = 0;
+var obs_fcall_end_count: i64 = 0;
+var obs_error_count: i64 = 0;
+var obs_last_error_type: c_int = 0;
+var obs_func_declared_count: i64 = 0;
+var obs_class_linked_count: i64 = 0;
+var obs_fiber_init_count: i64 = 0;
+var obs_fiber_switch_count: i64 = 0;
+var obs_fiber_destroy_count: i64 = 0;
+
+// 最近观察到的函数名（固定缓冲，避免动态分配）
+var obs_last_func: [128]u8 = undefined;
+var obs_last_func_len: usize = 0;
+
+fn obsFcallBegin(execute_data: *T.ZendExecuteData) callconv(.c) void {
+    obs_fcall_begin_count += 1;
+    if (phpzig.Observer.funcName(execute_data)) |name| {
+        if (name.len <= obs_last_func.len) {
+            @memcpy(obs_last_func[0..name.len], name);
+            obs_last_func_len = name.len;
+        }
+    }
+}
+
+fn obsFcallEnd(execute_data: *T.ZendExecuteData, retval: *T.Zval) callconv(.c) void {
+    _ = execute_data;
+    _ = retval;
+    obs_fcall_end_count += 1;
+}
+
+fn obsError(type_: c_int, filename: [*c]const u8, filename_len: usize, lineno: u32, message: [*c]const u8, message_len: usize) callconv(.c) void {
+    _ = filename;
+    _ = filename_len;
+    _ = lineno;
+    _ = message;
+    _ = message_len;
+    obs_error_count += 1;
+    obs_last_error_type = type_;
+}
+
+fn obsFunctionDeclared(name: [*c]const u8, name_len: usize) callconv(.c) void {
+    _ = name;
+    _ = name_len;
+    obs_func_declared_count += 1;
+}
+
+fn obsClassLinked(name: [*c]const u8, name_len: usize) callconv(.c) void {
+    _ = name;
+    _ = name_len;
+    obs_class_linked_count += 1;
+}
+
+fn obsFiberInit(status: c_int) callconv(.c) void {
+    _ = status;
+    obs_fiber_init_count += 1;
+}
+
+fn obsFiberSwitch(from_status: c_int, to_status: c_int) callconv(.c) void {
+    _ = from_status;
+    _ = to_status;
+    obs_fiber_switch_count += 1;
+}
+
+fn obsFiberDestroy(status: c_int) callconv(.c) void {
+    _ = status;
+    obs_fiber_destroy_count += 1;
+}
+
+// —— getter / reset 测试函数 ——
+
+fn helloObsReset(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    obs_fcall_begin_count = 0;
+    obs_fcall_end_count = 0;
+    obs_error_count = 0;
+    obs_last_error_type = 0;
+    obs_func_declared_count = 0;
+    obs_class_linked_count = 0;
+    obs_fiber_init_count = 0;
+    obs_fiber_switch_count = 0;
+    obs_fiber_destroy_count = 0;
+    obs_last_func_len = 0;
+    phpzig.Return.returnBool(return_value, true);
+}
+
+fn helloObsBeginCount(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_fcall_begin_count);
+}
+fn helloObsEndCount(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_fcall_end_count);
+}
+fn helloObsErrorCount(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_error_count);
+}
+fn helloObsErrorType(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_last_error_type);
+}
+fn helloObsFuncDeclared(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_func_declared_count);
+}
+fn helloObsClassLinked(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_class_linked_count);
+}
+fn helloObsFiberInit(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_fiber_init_count);
+}
+fn helloObsFiberSwitch(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_fiber_switch_count);
+}
+fn helloObsFiberDestroy(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_fiber_destroy_count);
+}
+fn helloObsLastFunc(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnString(return_value, obs_last_func[0..obs_last_func_len]);
+}
+
 // ＝＝ OOP — 类属性 + 继承 + 构造器 + 访问修饰符 ＝＝
 
 fn bankGetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -754,6 +954,24 @@ comptime {
             // v0.9：请求级 arena + cleanup
             phpzig.FunctionDesc.create("hello_arena_sum", helloArenaSum),
             phpzig.FunctionDesc.create("hello_cleanup_register", helloCleanupRegister),
+            // v0.9.1：Fiber 协程能力
+            phpzig.FunctionDesc.create("hello_fiber_body", helloFiberBody),
+            phpzig.FunctionDesc.createWithParams("hello_fiber_create", helloFiberCreate, &.{phpzig.ParamDesc.create("callable")}),
+            phpzig.FunctionDesc.createWithParams("hello_fiber_is", helloFiberIs, &.{phpzig.ParamDesc.create("obj")}),
+            phpzig.FunctionDesc.createWithParams("hello_fiber_status", helloFiberStatus, &.{phpzig.ParamDesc.create("obj")}),
+            phpzig.FunctionDesc.createWithParams("hello_fiber_get_return", helloFiberGetReturn, &.{phpzig.ParamDesc.create("obj")}),
+            // v0.9.1：Observer 集中式观察代理
+            phpzig.FunctionDesc.create("hello_obs_reset", helloObsReset),
+            phpzig.FunctionDesc.create("hello_obs_begin_count", helloObsBeginCount),
+            phpzig.FunctionDesc.create("hello_obs_end_count", helloObsEndCount),
+            phpzig.FunctionDesc.create("hello_obs_error_count", helloObsErrorCount),
+            phpzig.FunctionDesc.create("hello_obs_error_type", helloObsErrorType),
+            phpzig.FunctionDesc.create("hello_obs_func_declared", helloObsFuncDeclared),
+            phpzig.FunctionDesc.create("hello_obs_class_linked", helloObsClassLinked),
+            phpzig.FunctionDesc.create("hello_obs_fiber_init", helloObsFiberInit),
+            phpzig.FunctionDesc.create("hello_obs_fiber_switch", helloObsFiberSwitch),
+            phpzig.FunctionDesc.create("hello_obs_fiber_destroy", helloObsFiberDestroy),
+            phpzig.FunctionDesc.create("hello_obs_last_func", helloObsLastFunc),
         },
         .minit = myMinit,
         .ini = &.{
@@ -819,6 +1037,16 @@ comptime {
             }, Counter, counterInit, counterDtor),
         },
         .info_func = helloInfo,
+        .observer = .{
+            .fcall_begin = obsFcallBegin,
+            .fcall_end = obsFcallEnd,
+            .@"error" = obsError,
+            .function_declared = obsFunctionDeclared,
+            .class_linked = obsClassLinked,
+            .fiber_init = obsFiberInit,
+            .fiber_switch = obsFiberSwitch,
+            .fiber_destroy = obsFiberDestroy,
+        },
     });
 }
 

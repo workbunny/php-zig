@@ -80,6 +80,8 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
     - Ini         : PHP INI 配置（声明式注册 + 读取 + 变更通知）
     - Arena       : 请求级内存池（bailout-safe，自动 RSHUTDOWN 回收）
     - Cleanup     : 清理注册表（bailout-safe，RSHUTDOWN 统一回收）
+    - Fiber       : PHP Fiber 协程（只读查询 + create/start/suspend_/resume_/throw）
+    - Observer    : 集中式观察代理（fcall/error/declared/class_linked/fiber 五类观察点静态注册）
     - Module      : comptime 模块注册（函数/类/接口/属性/常量/继承/生命周期/INI/对象绑定）
     ────────────────
     glue/php_glue.c (C 胶水层)
@@ -87,6 +89,61 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
 ```
 
 从下往上看：Zend Engine 提供 C API → glue 把宏转成函数 → php-zig 用 Zig 的类型系统和 comptime 封装 → 下游只写纯 Zig。
+
+一次 PHP 请求到响应的完整流转，以及各模块的生命周期归属：
+
+```
+                    一次 PHP 请求 -> 响应：php-zig 内部流转
+
+进程级 · 模块加载（一次）
+-------------------------------------------------------------------
+  get_module() -> initModule() -> MINIT
+    |- 函数表 / 类 / 常量 / INI 注册
+    '- Observer 五类观察点注册（fcall / error / declared / class_linked / fiber）
+
+请求级 · 每次请求
+-------------------------------------------------------------------
+  RINIT（可选）
+    |
+    v
+  PHP: hello_add(1, 2)
+    |
+    v
+  Zend Engine --zif_handler-->  php-zig handler (Zig)
+    |                              |
+    |  ① Observer.fcall_begin ----+  旁路：统计 / 监测（不拦截）
+    |                              |
+    |                              +- Return.callArg()          取参数
+    |                              +- RequestArena.init()       临时内存 -> RSHUTDOWN 回收
+    |                              +- Cleanup.register()        系统资源 -> RSHUTDOWN flush
+    |                              +- Array / Object / Zval     PHP emalloc 池（无需回收）
+    |                              +- Throw.throw*()            抛异常（仅设置 EG(exception)，defer 正常执行）
+    |                              +- PhpFunc.call / Closure    回调 PHP 函数
+    |                              +- Fiber.suspend_/resume_    协程挂起 / 唤起
+    |                              |
+    |                              '- Return.return*()          写返回值
+    |  ② Observer.fcall_end ----+  旁路：统计 / 监测（不拦截）
+    v
+  响应返回给 PHP
+    |
+    v
+  RSHUTDOWN（请求结束）
+    |- Cleanup.flush()             清理注册的系统资源
+    '- RequestArena 回收           请求级内存池
+
+进程级 · 模块卸载
+-------------------------------------------------------------------
+  MSHUTDOWN -> 注销 INI 项
+
+对象级 · extern struct 绑定（随对象生命周期，可跨请求）
+-------------------------------------------------------------------
+  对象创建 create_object -> init(extra) -> 方法操作 getExtra() -> dtor(extra)
+```
+
+图中三个生命周期层级：
+- **进程级**：`MINIT` 注册函数/类/常量/INI/Observer，`MSHUTDOWN` 注销 INI（一次）。
+- **请求级**：handler 内按内存归属分组——arena/cleanup 属 Zig 侧（RSHUTDOWN 兜底），Array/Zval 属 PHP emalloc 池（无需回收）；Observer 为旁路（不拦截）。普通 Throw 仅设置 `EG(exception)`、不 longjmp，defer 照常执行；真正跳过 defer 的是 bailout（OOM/超时/fatal/`exit`），此时由 arena/cleanup 在 RSHUTDOWN 兜底，故临时内存用 arena、系统资源用 cleanup，勿裸用 `c_allocator` 依赖 defer。
+- **对象级**：extern struct 绑定随对象创建/销毁，可跨请求存活。
 
 ## 起步
 
@@ -134,10 +191,12 @@ Hello from php-zig!
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
 | 请求级内存池 | ✅ | `RequestArena` + `Cleanup.register`（bailout-safe，RSHUTDOWN 回收） |
 | 闭包导出 | ✅ | `Closure.create` 从 Zig 函数创建 PHP Closure |
+| Fiber 协程 | ✅ | 只读查询（isFiber/getStatus/getCurrent/getReturn）+ 控制操作（create/start/suspend_/resume_/throw，走 PHP 原生方法复用校验） |
+| Observer 观察代理 | ✅ | 五类观察点静态注册（fcall begin/end、error、function_declared、class_linked、fiber init/switch/destroy）+ `funcName` |
 | INI 配置 | ✅ | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知 |
 | 序列化 | ✅ | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize() |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 59 项 + PHP 集成测试 156 项 |
+| 测试 | ✅ | Zig 单元测试 59 项 + PHP 集成测试 179 项 |
 
 ### 两种注册哲学，并存
 
@@ -242,7 +301,48 @@ comptime {
 }
 ```
 
-**5. 构建注册透传——下游 build.zig 约 5 行**
+**5. Fiber 协程——PHP 调度，Zig 参与**
+
+Zig 扩展函数可在 Fiber 内挂起自己、把控制权交还 PHP event-loop，PHP 侧在合适时机唤起后继续执行。定位是「PHP 是调度器，Zig 提供挂起/唤起/检测能力」，不自行构建 event-loop：
+
+```zig
+// fiber body：挂起自己，被 resume 后继续
+pub fn php_async_task(_: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void {
+    const cur = phpzig.Fiber.getCurrent().?;   // 当前活跃 Fiber
+    var value = ...;
+    var ret: phpzig.Zval = undefined;
+    _ = phpzig.Fiber.suspend_(cur, &value, &ret);  // 挂起，交还 PHP
+    phpzig.Return.returnZval(rv, &ret);            // 被 resume 后继续
+}
+```
+
+控制操作走 PHP 原生 `Fiber` 方法，复用其运行时校验与 `FiberError` 抛出，健壮产出。
+
+**6. Observer 集中式观察代理——五类事件静态注册**
+
+所有关键事件（函数调用 begin/end、错误、函数声明、类链接、fiber 切换）汇聚到一个代理入口，由下游 handler 决定统计/监测等旁路动作。静态注册（MINIT 一次性），请求期不变：
+
+```zig
+comptime {
+    phpzig.moduleInit(@This(), .{
+        .name = "monitor",
+        .version = "1.0.0",
+        .observer = .{
+            .fcall_begin = onFcallBegin,   // 观察函数调用
+            .@"error" = onError,           // 观察错误（error 是 Zig 保留字）
+            .fiber_switch = onFiberSwitch, // 观察 fiber 切换
+        },
+    });
+}
+
+fn onFcallBegin(execute_data: *phpzig.ZendExecuteData) callconv(.c) void {
+    if (phpzig.Observer.funcName(execute_data)) |name| {
+        // name 为被观察的函数名，可做统计/采样/插针
+    }
+}
+```
+
+**7. 构建注册透传——下游 build.zig 约 5 行**
 
 `addPhpExtension` 统一注册 target/optimize，自定义参数通过 `configure` 回调透传，无重复注册冲突。
 

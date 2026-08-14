@@ -19,6 +19,7 @@
 //! - Error        PHP 错误报告（php_error_docref）
 //! - Serialize    PHP 序列化（serialize/unserialize）
 //! - Ini          PHP INI 配置（声明式注册 + 读取 + 变更通知）
+//! - Fiber        PHP Fiber 协程（只读查询 + create/start/suspend_/resume_/throw）
 //! - mod          模块注册核心（comptime Module 泛型、生命周期钩子、类注册、接口、arg_info、常量、phpinfo）
 
 pub const php_c = @import("php_c.zig");
@@ -40,6 +41,8 @@ pub const Serialize = @import("serialize.zig");
 pub const Ini = @import("ini.zig");
 pub const Cleanup = @import("cleanup.zig");
 pub const RequestArena = @import("arena.zig").RequestArena;
+pub const Fiber = @import("fiber.zig");
+pub const Observer = @import("observer.zig");
 
 // 常用类型别名 — 避免下游写完整路径
 pub const FunctionDesc = mod.FunctionDesc;

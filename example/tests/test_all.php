@@ -473,6 +473,89 @@ test('hello_arena_sum() 用 arena 分配求和 → 60', 60, hello_arena_sum());
 test('hello_cleanup_register() 注册清理回调', true, hello_cleanup_register());
 
 // ============================================================
+// 26. v0.9.1 — Fiber（协程）能力
+// ============================================================
+echo "\n=== 26. v0.9.1 Fiber ===\n";
+
+// 只读查询：isFiber / status
+test('hello_fiber_is(普通对象) → false', false, hello_fiber_is(new stdClass()));
+test('hello_fiber_is(非对象) → false', false, @hello_fiber_is('not-an-object'));
+test('hello_fiber_status(非 fiber) → -1', -1, hello_fiber_status(new stdClass()));
+
+// 构造：Zig 用 callable 创建 Fiber 对象
+$fiber = hello_fiber_create(hello_fiber_body());
+test('hello_fiber_is($fiber) → true', true, hello_fiber_is($fiber));
+test('$fiber instanceof Fiber', true, $fiber instanceof Fiber);
+test('新 fiber 状态为 INIT(0)', 0, hello_fiber_status($fiber));
+
+// 启动 fiber：fiber 内部 suspend 自己，start() 返回 suspend 交出的值
+$startRet = $fiber->start();
+test('start() 返回 fiber suspend 交出的值', 'from-fiber', $startRet);
+test('suspend 后状态为 SUSPENDED(2)', 2, hello_fiber_status($fiber));
+
+// resume：PHP 侧唤起 fiber，fiber 继续执行，收到 resume 传入的 'from-php'，
+// 将其作为最终结果存入 fiber->result；fiber 直接完成时 resume() 返回 null
+$resumeRet = $fiber->resume('from-php');
+test('resume() 后 fiber 完成返回 null', null, $resumeRet);
+test('执行完毕后状态为 DEAD(3)', 3, hello_fiber_status($fiber));
+
+// getReturn：fiber 最终结果 = resume 传入的值（验证 suspend/resume 值传递链路）
+test('get_return 读到 fiber 返回值（= resume 传入值）', 'from-php', hello_fiber_get_return($fiber));
+
+// 第二个 fiber：验证独立状态
+$fiber2 = hello_fiber_create(hello_fiber_body());
+test('fiber2 初始状态独立 INIT(0)', 0, hello_fiber_status($fiber2));
+$fiber2->start();
+test('fiber2 suspend 后 SUSPENDED(2)', 2, hello_fiber_status($fiber2));
+
+// ============================================================
+// 27. v0.9.1 — Observer 集中式观察代理
+// ============================================================
+echo "\n=== 27. v0.9.1 Observer ===\n";
+
+// 重置后，观察一次函数调用：begin/end 计数应增长，且能读到函数名
+hello_obs_reset();
+$beginBefore = hello_obs_begin_count();
+$endBefore = hello_obs_end_count();
+hello_world();
+$beginAfter = hello_obs_begin_count();
+$endAfter = hello_obs_end_count();
+test('fcall begin 观察已触发（计数增长）', true, $beginAfter > $beginBefore);
+test('fcall end 观察已触发（计数增长）', true, $endAfter > $endBefore);
+test('能提取被观察函数名（last_func 非空）', true, strlen(hello_obs_last_func()) > 0);
+
+// error 观察：触发一个 warning（E_WARNING = 2）
+hello_obs_reset();
+$errBefore = hello_obs_error_count();
+@hello_error_docref();
+$errAfter = hello_obs_error_count();
+test('error 观察已触发（计数增长）', true, $errAfter > $errBefore);
+test('error type 为 E_WARNING(2)', 2, hello_obs_error_type());
+
+// function_declared / class_linked 观察：声明一个新函数和一个类
+hello_obs_reset();
+$funcBefore = hello_obs_func_declared();
+$clsBefore = hello_obs_class_linked();
+eval('function obs_declared_fn() {} class ObsDeclaredClass {}');
+$funcAfter = hello_obs_func_declared();
+$clsAfter = hello_obs_class_linked();
+test('function_declared 观察已触发', true, $funcAfter > $funcBefore);
+test('class_linked 观察已触发', true, $clsAfter > $clsBefore);
+
+// fiber 观察：创建 + start + suspend 应触发 fiber_init / fiber_switch
+hello_obs_reset();
+$fiberInitBefore = hello_obs_fiber_init();
+$fiberSwitchBefore = hello_obs_fiber_switch();
+$obsFiber = hello_fiber_create(hello_fiber_body());
+$obsFiber->start();
+$fiberInitAfter = hello_obs_fiber_init();
+$fiberSwitchAfter = hello_obs_fiber_switch();
+test('fiber_init 观察已触发（创建+启动）', true, $fiberInitAfter > $fiberInitBefore);
+test('fiber_switch 观察已触发（start 挂起切换）', true, $fiberSwitchAfter > $fiberSwitchBefore);
+$obsFiber->resume('done');
+test('fiber 观察回调不影响 fiber 正常执行', 'done', hello_fiber_get_return($obsFiber));
+
+// ============================================================
 // 结果汇总
 // ============================================================
 $total = $passed + $failed;

@@ -744,3 +744,139 @@ list.append(a, 10) catch unreachable;
 ```
 
 **教训**：Zig 0.16 是 std API 大变动版本，涉及 `ArrayList`、`fs` 的代码需按新 API 重写；单元测试因 cleanup/arena 用 `c_allocator`，`build.zig` 测试模块需 `link_libc = true`。
+
+## Fiber 控制操作：不直接包装 `zend_fiber_*`（return 宏陷阱）
+
+### 问题
+
+`zend_fiber_suspend/resume/start` 三个 API 看似可直接包装成「返回 bool 的 glue 函数」，但它们内部最终都调用 `zend_fiber_delegate_transfer_result`，该函数要求自己处于 **PHP 内部函数调用栈最内层**，并内含 `return`：
+
+```c
+static zend_always_inline void zend_fiber_delegate_transfer_result(
+    zend_fiber_transfer *transfer, INTERNAL_FUNCTION_PARAMETERS   // 需要 execute_data + return_value
+) {
+    if (transfer->flags & ZEND_FIBER_TRANSFER_FLAG_ERROR) {
+        zend_throw_exception_internal(Z_OBJ(transfer->value));
+        RETURN_THROWS();                    // ← 内含 return
+    }
+    if (return_value != NULL) {
+        RETURN_COPY_VALUE(&transfer->value); // ← 内含 return
+    }
+}
+```
+
+这三个 API 是为 `ZEND_METHOD(Fiber, xxx)` 设计的（`INTERNAL_FUNCTION_PARAMETERS` 展开需要 `execute_data` + `return_value` 两个宏变量名）。若 glue 用一个「返回 bool 的普通辅助函数」包它，这个 `return` 会提前中断 glue 函数、写错 return_value。
+
+### 解决方案
+
+控制操作（`start/suspend/resume/throw`）**不直接包装 `zend_fiber_*`**，改走 PHP 原生 `Fiber` 方法调用（`PhpFunc.callMethod`），因为：
+
+1. PHP 原生 `Fiber::start/suspend/resume/throw` 已内建全部运行时校验（状态检查、`FiberError` 抛出），天然满足「健壮产出」。
+2. 完美避开 `RETURN_THROWS/RETURN_COPY_VALUE` 的 return 宏陷阱。
+3. 与「PHP 是调度器」的定位一致——控制操作本质就是「Zig 调 PHP 的方法」。
+
+只读查询（`isFiber/getStatus/getCurrent/getReturn`）无此陷阱，由 glue 直读 `zend_fiber` 结构体（零方法调用开销）。
+
+## Fiber 控制操作是真正的栈切换（swapcontext/jump_fcontext）
+
+### 问题
+
+`zend_fiber_suspend` 内部是 `swapcontext` / `jump_fcontext`（真正的 C 栈切换），不是普通函数返回。对 Zig 而言：
+
+1. Zig 函数调用 `fiberSuspend()` 后**不会立刻返回**——切到 caller 栈继续跑，直到被 resume 才「返回」。
+2. `defer` 语义跨 suspend 是「对的」（suspend 期间函数未返回，resume 后继续，正常返回时才执行）。
+3. **但若 fiber 未完成即被销毁**（GC 掉未跑完的 fiber，或请求结束），栈帧永不返回，Zig `defer` 永不执行——这正是 `Cleanup`/`RequestArena` 兜底存在的意义，也是 observer `fiber_destroy` 观察点存在的意义。
+
+### 约束
+
+- `suspend` 只能在 fiber 内调用（挂起自己）；`resume`/`start` 只能在 fiber 外调用（唤起别人）。这是 Zend 源码 `ZEND_ASSERT` 硬约束。
+- fiber 执行体必须是 PHP callable（`zend_call_function` 走 VM），纯 Zig 函数指针不能直接当 body。路径：`Closure.create` → `Fiber.create` → `start`。
+
+## Fiber 结果传递语义：resume() 返回「下一次 suspend 的值」
+
+### 问题
+
+PHP Fiber 的 `resume()` 返回的是「fiber **下一次 suspend** 交出的值」；若 fiber 直接完成（不再 suspend），则返回 **NULL**。fiber 的最终结果通过 `getReturn()` 单独获取。初次写集成测试时，误以为 `resume()` 返回 fiber 的最终结果，导致断言错误。
+
+### 根因（源码依据）
+
+`zend_fiber_execute`（trampoline）执行完 body 后，把返回值存入 `fiber->result`，但 `transfer->value` 仍为 NULL（只有异常时才设置 `transfer->value`）。故 `resume()` 拿到的 transfer value 为 NULL，而 body 结果在 `fiber->result`。
+
+### 教训
+
+fiber 的「挂起值」和「最终返回值」是两条独立通道，测试须分别用 `resume()` 返回值和 `getReturn()` 断言。
+
+## Fiber 构造复刻：`__construct` 只设 fci，`start` 才 init_context
+
+### 问题
+
+`Fiber::__construct` 与 `Fiber::start` 职责分离：
+
+```c
+ZEND_METHOD(Fiber, __construct) {
+    // 只做：zend_fcall_info_init + fci/fci_cache 赋值 + Z_TRY_ADDREF
+    fiber->fci = fci;
+    fiber->fci_cache = fcc;
+    Z_TRY_ADDREF(fiber->fci.function_name);
+}
+
+ZEND_METHOD(Fiber, start) {
+    // 才做：zend_fiber_init_context + 状态检查 + resume_internal
+    if (zend_fiber_init_context(&fiber->context, zend_ce_fiber, zend_fiber_execute, EG(fiber_stack_size)) == FAILURE) ...
+}
+```
+
+`zend_fiber_init_context` 里触发 `zend_observer_fiber_init_notify`——故 **fiber_init 观察在 start 时触发，而非 create 时**。
+
+### 解决方案
+
+`phpglue_fiber_create` 复刻 `__construct` 逻辑（`zend_fcall_info_init(callable, 0, ...)` + `object_init_ex(rv, zend_ce_fiber)` + 设 fci/fci_cache + `Z_TRY_ADDREF`），不碰 init_context。`start` 走 PHP 原生方法，其内部完成 init_context。
+
+## Observer：fiber 观察点拿到 context 而非 zval
+
+### 问题
+
+`zend_observer_fiber_switch_register` 回调参数是 `zend_fiber_context* from/to`，不是 zval。要得到 PHP 侧 Fiber 对象需 `zend_fiber_from_context(ctx)`，但该函数有断言：
+
+```c
+static zend_always_inline zend_fiber *zend_fiber_from_context(zend_fiber_context *context) {
+    ZEND_ASSERT(context->kind == zend_ce_fiber && "Fiber context does not belong to a Zend fiber");
+    ...
+}
+```
+
+而**主 fiber context 的 kind 为 NULL**（`zend_fiber_init` 用 `ecalloc` 清零，未设 kind），不能盲目反推，否则 assert 失败。
+
+### 解决方案
+
+glue trampoline 只把 `context->status`（INIT/RUNNING/SUSPENDED/DEAD）转成 int 转发给 Zig，不反推对象。需要 fiber 对象细节时，在事件发生时配合 `Fiber.getCurrent()` 读取。
+
+## Observer：`error` 是 Zig 保留字
+
+### 问题
+
+`Observer.Config` 想加一个 `error` 字段（对应 Zend 的 error 观察回调），但 `error` 是 Zig 保留字（错误类型），直接作字段名/参数名会编译失败。
+
+### 解决方案
+
+用 `@"error"` 语法转义：
+
+```zig
+pub const Config = struct {
+    @"error": ?c.ObserverErrorFn = null,   // 定义
+};
+// 访问
+obs.@"error"
+```
+
+## Observer：集中式代理观察全部函数（含内部函数）
+
+### 问题
+
+fcall observer 的 `init` 回调若始终返回非空 begin/end handlers，则**所有函数调用（含内部函数）**都走 begin/end 路径，带来显著开销。
+
+### 定位（有意为之）
+
+php-zig 的 Observer 定位是「集中式代理」——无条件汇聚所有事件，由下游 handler 自行过滤（判断函数名、类型等）。这是「静态注册」约束下的简单模型：MINIT 一次性注册，请求期不变。若需按函数粒度精细控制，可后续用 `zend_observer_add_begin_handler`（运行时按函数添加）扩展。
+
+**测试注意**：因观察所有函数，集成测试须用「相对增量」断言（`after > before`），而非绝对值。

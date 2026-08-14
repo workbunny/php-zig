@@ -255,3 +255,33 @@ pub extern fn phpglue_set_ini_notify(cb: ?*const fn (name: [*c]const u8, name_le
 pub extern fn phpglue_register_object_class(name: [*c]const u8, name_len: usize, methods: ?*anyopaque, extra_size: usize, init: ?*const fn (extra: ?*anyopaque) callconv(.c) void, dtor: ?*const fn (extra: ?*anyopaque) callconv(.c) void) ?*T.ZendClassEntry;
 pub extern fn phpglue_object_get_extra(obj: *T.Zval) ?*anyopaque;
 pub extern fn phpglue_get_this(execute_data: *T.ZendExecuteData) ?*T.Zval;
+
+// ＝＝＝＝ Fiber ＝＝＝＝
+
+pub extern fn phpglue_zval_is_fiber(zv: *T.Zval) c_int;
+pub extern fn phpglue_fiber_status(zv: *T.Zval) c_int;
+pub extern fn phpglue_fiber_get_current(rv: *T.Zval) c_int;
+pub extern fn phpglue_fiber_get_return(zv: *T.Zval, rv: *T.Zval) c_int;
+pub extern fn phpglue_fiber_create(callable: *T.Zval, rv: *T.Zval) c_int;
+
+// ＝＝＝＝ Observer（集中式观察代理） ＝＝＝＝
+
+pub const ObserverFcallBeginFn = *const fn (execute_data: *T.ZendExecuteData) callconv(.c) void;
+pub const ObserverFcallEndFn = *const fn (execute_data: *T.ZendExecuteData, retval: *T.Zval) callconv(.c) void;
+pub const ObserverErrorFn = *const fn (type_: c_int, filename: [*c]const u8, filename_len: usize, lineno: u32, message: [*c]const u8, message_len: usize) callconv(.c) void;
+pub const ObserverDeclaredFn = *const fn (name: [*c]const u8, name_len: usize) callconv(.c) void;
+pub const ObserverFiberInitFn = *const fn (status: c_int) callconv(.c) void;
+pub const ObserverFiberSwitchFn = *const fn (from_status: c_int, to_status: c_int) callconv(.c) void;
+pub const ObserverFiberDestroyFn = *const fn (status: c_int) callconv(.c) void;
+
+pub extern fn phpglue_observer_register(
+    fcall_begin: ?ObserverFcallBeginFn,
+    fcall_end: ?ObserverFcallEndFn,
+    @"error": ?ObserverErrorFn,
+    function_declared: ?ObserverDeclaredFn,
+    class_linked: ?ObserverDeclaredFn,
+    fiber_init: ?ObserverFiberInitFn,
+    fiber_switch: ?ObserverFiberSwitchFn,
+    fiber_destroy: ?ObserverFiberDestroyFn,
+) void;
+pub extern fn phpglue_observer_func_name(execute_data: *T.ZendExecuteData, len: *usize) ?[*:0]const u8;

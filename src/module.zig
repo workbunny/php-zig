@@ -12,6 +12,7 @@ const Cleanup = @import("cleanup.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const IniEntry = @import("ini.zig").IniEntry;
+const ObserverConfig = @import("observer.zig").Config;
 
 // ＝＝ Zend 结构体布局（extern struct，必须与 C 布局一致） ＝＝
 // 字段顺序与 PHP 头文件定义严格对应。
@@ -558,6 +559,8 @@ pub const ModuleOptions = struct {
     /// INI 变更通知回调（任一 INI 项值变更时触发，name 为 C 字符串 + 长度）
     ini_notify: ?*const fn (name: [*c]const u8, name_len: usize) callconv(.c) void = null,
     info_func: ?*const fn (module: *ZendModuleEntry) callconv(.c) void = null,
+    /// Observer 观察点配置（MINIT 一次性静态注册）
+    observer: ?ObserverConfig = null,
 };
 
 /// 模块元信息 — 供 `moduleInit(@This(), meta)` 使用。
@@ -578,6 +581,8 @@ pub const ModuleMeta = struct {
     functions: []const FunctionDesc = &.{},
     /// 显式补充的类（与自动发现合并，用于继承/接口/常量/对象绑定等复杂场景）
     classes: []const ClassDesc = &.{},
+    /// Observer 观察点配置（MINIT 一次性静态注册）
+    observer: ?ObserverConfig = null,
 };
 
 pub fn Module(comptime opts: ModuleOptions) type {
@@ -605,7 +610,8 @@ pub fn Module(comptime opts: ModuleOptions) type {
     const total_param_bytes = @max(1, total_param_entries) * ARGINFO_ENTRY_SIZE_MAX;
     const has_classes = opts.classes.len > 0;
     const has_ini = opts.ini.len > 0;
-    const needs_minit_wrapper = has_classes or opts.constants.len > 0 or opts.minit != null or has_ini;
+    const has_observer = opts.observer != null;
+    const needs_minit_wrapper = has_classes or opts.constants.len > 0 or opts.minit != null or has_ini or has_observer;
     const needs_mshutdown_wrapper = opts.mshutdown != null or has_ini;
 
     return struct {
@@ -960,6 +966,18 @@ pub fn Module(comptime opts: ModuleOptions) type {
                 }
             }
             registerIniEntries(module_number);
+            if (opts.observer) |obs| {
+                c.phpglue_observer_register(
+                    obs.fcall_begin,
+                    obs.fcall_end,
+                    obs.@"error",
+                    obs.function_declared,
+                    obs.class_linked,
+                    obs.fiber_init,
+                    obs.fiber_switch,
+                    obs.fiber_destroy,
+                );
+            }
             initClassMethodEntries();
             inline for (opts.classes, 0..) |cls, i| {
                 const result: c_int = if (cls.is_interface)
@@ -1116,6 +1134,7 @@ pub fn moduleInit(comptime file: type, comptime meta: ModuleMeta) void {
         .ini = meta.ini,
         .ini_notify = meta.ini_notify,
         .info_func = meta.info_func,
+        .observer = meta.observer,
     });
     @export(&M.get_module, .{ .name = "get_module" });
 }
