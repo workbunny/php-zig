@@ -738,6 +738,76 @@ MyRes.store(fn, &/* ptr to anything */);
 const ptr: ?*anyopaque = MyRes.fetch(&arg_zval);
 ```
 
+### 请求级内存池 + 清理注册表 ★ v0.9.0
+
+bailout（`longjmp`）会跳过 Zig `defer`，但 RSHUTDOWN 仍执行，故用两层机制兜底：
+
+```zig
+// RequestArena：请求级内存池，自动注册 RSHUTDOWN 回收
+const arena = phpzig.RequestArena.init();
+defer arena.deinit();                 // 正常路径（幂等），bailout 时 RSHUTDOWN 兜底
+const a = arena.allocator();
+var list: std.ArrayList(i64) = .empty; // Zig 0.16：unmanaged，方法传 allocator
+defer list.deinit(a);
+list.append(a, 10) catch unreachable;
+const used = arena.bytesAllocated();   // 累计字节（预留统计接口）
+
+// Cleanup：绕过 arena 自行管理资源时，注册任意回收逻辑
+phpzig.Cleanup.register(myCleanupFn, data);
+```
+
+`defer` 负责正常路径，`Cleanup.register`/arena 负责 bailout 兜底，两者叠加。
+
+### 内存归属心智模型
+
+php-zig 遵循「PHP 用 PHP 的，Zig 用 Zig 的」，两类内存**边界清晰、互不重叠**：
+
+| 资源 | 归谁管 | bailout 后 | 需要 arena/cleanup？ |
+|------|--------|-----------|---------------------|
+| `zval` / `zend_array` / `zend_string`（`Zval`/`Array`/`Object` 操作的对象） | **PHP 请求级内存池（emalloc）** | PHP 请求结束自动清空整个池，**不泄漏** | ❌ 否 |
+| `c_allocator` 分配的内存 / fd / socket | **Zig 自己** | `defer` 被 longjmp 跳过 → **真泄漏** | ✅ 是 |
+
+**要点**：
+- `Array`/`Zval`/`Object` 等模块操作的是 PHP 的 `HashTable`（住在 emalloc 里），
+  即使 bailout 跳过某个 `defer zval_ptr_dtor`，也只是「晚释放到请求结束」，**不会泄漏**。
+- 这些模块里的 `defer zval_ptr_dtor` 是「提前归还引用计数」（性能优化），
+  **不是防泄漏**——正确性不依赖它。
+- 只有 **Zig 自己分配**（`c_allocator`）的内存/fd/socket 才会因 bailout 泄漏，
+  这部分由 `RequestArena` / `Cleanup` 兜底。
+
+### 内存最佳实践
+
+**1. 临时字符串：用 arena 或栈缓冲，勿用 `c_allocator`**
+
+```zig
+// ❌ 错误：allocPrint(c_allocator) 后未释放，正常路径也泄漏
+const msg = std.fmt.allocPrint(std.heap.c_allocator, "Hi {s}", .{name}) catch ...;
+phpzig.Return.returnString(return_value, msg);   // returnString 内部复制到 PHP 池，msg 泄漏
+
+// ✅ 正确：用请求级 arena（bailout-safe）
+const arena = phpzig.RequestArena.init();
+defer arena.deinit();
+const msg = std.fmt.allocPrint(arena.allocator(), "Hi {s}", .{name}) catch ...;
+phpzig.Return.returnString(return_value, msg);
+
+// ✅ 更轻量：固定长度场景用栈缓冲
+var buf: [128]u8 = undefined;
+const msg = std.fmt.bufPrint(&buf, "Hi {s}", .{name}) catch ...;
+phpzig.Return.returnString(return_value, msg);
+```
+
+**2. 长生命周期/跨请求数据：用 `c_allocator` 或 GeneralPurposeAllocator，并显式管理**
+
+**3. 系统资源（fd/socket）：用 `Cleanup.register` 兜底**
+
+```zig
+const fd = std.posix.open(...) catch ...;
+phpzig.Cleanup.register(closeFd, @ptrCast(@as(usize, fd)));
+```
+
+**4. `@memcpy` 不分配内存**：它只做字节复制，目标是调用者提供的内存
+（通常是栈数组）。泄漏的唯一根源是「堆分配了没释放」，与 `@memcpy` 无关。
+
 ### 接口与实现
 
 ```zig
@@ -878,7 +948,7 @@ zig build test
 cd example/tests
 zig build -Dphp=/usr/local
 php -d extension=zig-out/lib/libext-tests.so test_all.php
-# 154/154 通过
+# 156/156 通过
 ```
 
 最小示例（`example/hello/`）构建与运行：

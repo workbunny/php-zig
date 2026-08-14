@@ -14,11 +14,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // 纯 Zig 单元测试（无需 PHP 运行时）
+    // Zig 单元测试（无需 PHP 运行时；cleanup/arena 用 c_allocator，需链接 libc）
     const test_mod = b.addModule("test_helpers", .{
         .root_source_file = b.path("src/test_helpers.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     const run_unit_tests = b.addRunArtifact(unit_tests);

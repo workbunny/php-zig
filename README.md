@@ -78,6 +78,8 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
     - Closure     : 从 Zig 函数创建 PHP Closure
     - Serialize   : PHP 序列化（serialize/unserialize）
     - Ini         : PHP INI 配置（声明式注册 + 读取 + 变更通知）
+    - Arena       : 请求级内存池（bailout-safe，自动 RSHUTDOWN 回收）
+    - Cleanup     : 清理注册表（bailout-safe，RSHUTDOWN 统一回收）
     - Module      : comptime 模块注册（函数/类/接口/属性/常量/继承/生命周期/INI/对象绑定）
     ────────────────
     glue/php_glue.c (C 胶水层)
@@ -130,11 +132,12 @@ Hello from php-zig!
 | 生命周期 | ✅ | MINIT / MSHUTDOWN / RINIT / RSHUTDOWN |
 | 对象属性 | ✅ | `readProperty` / `writeProperty` + `instanceOf` + `toObject()` |
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
+| 请求级内存池 | ✅ | `RequestArena` + `Cleanup.register`（bailout-safe，RSHUTDOWN 回收） |
 | 闭包导出 | ✅ | `Closure.create` 从 Zig 函数创建 PHP Closure |
 | INI 配置 | ✅ | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知 |
 | 序列化 | ✅ | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize() |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 57 项 + PHP 集成测试 154 项 |
+| 测试 | ✅ | Zig 单元测试 59 项 + PHP 集成测试 156 项 |
 
 ### 两种注册哲学，并存
 
@@ -176,20 +179,72 @@ phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
 
 注意事项见 [special.md](doc/special.md)。
 
-## 与 PHPX 的取舍
+## 与 PHPX 的异同
 
-| | PHPX (C++) | php-zig v0.8 (Zig) |
+php-zig 以 PHPX 为功能对齐目标，主体能力（OOP、数组、闭包、接口、异常、资源）均已覆盖。
+
+| 维度 | PHPX (C++) | php-zig (Zig) |
 |--|-----------|---------------|
+| 语言 | C++（RAII、模板元编程） | Zig（comptime、defer） |
 | 函数注册 | 宏自注册 + 运行时分发 | comptime 泛型 + 直接函数指针 |
 | arg_info | 自动生成 | 声明式 + comptime struct 反射（双轨） |
-| 类导出 | Class / Interface / 继承 / 属性 / 常量 / 访问修饰符 | Class / Interface / 继承 / 属性（5 种类型）/ 常量 / public/protected/private |
-| 数组操作 | 完整（push/pop/shift/unshift/slice/merge/sort/keys/values） | 完整（对齐 PHPX）+ filter/map/reduce/each |
+| 类导出 | Class / Interface / 继承 / 属性 / 常量 / 访问修饰符 | 对齐 PHPX，另支持 extern struct 对象绑定 |
+| 数组操作 | 完整（push/pop/shift/unshift/slice/merge/sort/keys/values） | 完整 + filter/map/reduce/each |
 | 运算符 | 算术 + 比较重载 | add/sub/mul/div/mod + cmp/lt/le/gt/ge |
 | 闭包导出 | 支持 | 支持（Closure.create） |
-| 构建 | CMake + phpize | `zig build -Dphp=/path` |
-| 生产可用性 | 生产级 | 功能覆盖完成（v0.8），接近生产可用 |
+| 异常抛出 | Exception | Exception + 自定义异常类 + Error 家族 |
+| 内存管理 | PHP 内存池 + C++ RAII | 「PHP 用 PHP 的，Zig 用 Zig 的」+ arena/cleanup（bailout-safe） |
+| 构建 | CMake + phpize | `zig build -Dphp=/path`（注册透传，脚本 ~5 行） |
+| 交叉编译 | 依赖工具链 | Zig 原生，`-Dtarget` 一键切换 |
 
-php-zig 的策略：优先覆盖 PHPX 主体功能（OOP、数组、闭包、接口均已对齐），comptime 能力是 PHPX 不具备的差异优势。
+### 我们的特色
+
+除了对齐 PHPX 的主体能力，php-zig 在几个方向上有自己的差异化设计：
+
+**1. comptime 全反射——`struct 即 class`**
+
+函数参数元信息、类属性、方法（含访问修饰符）全部编译期推导，`struct` 定义本身即声明。运行时零反射开销：
+
+```zig
+const Bank = struct {
+    balance: i64 = 0,          // → 属性
+    pub fn public_deposit(_: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void {}  // → public 方法
+};
+phpzig.ClassDesc.createFromStruct("Bank", Bank);
+```
+
+**2. extern struct 对象绑定——Zig struct 生命周期绑定 PHP 对象**
+
+`ClassDesc.createObject` 把 Zig struct 直接挂到 PHP 对象上，对象创建/销毁时自动调用 Zig 侧 init/dtor，状态随对象生命周期管理：
+
+```zig
+const Counter = struct { count: i64 = 0 };
+phpzig.ClassDesc.createObject("Counter", &.{ /* methods */ }, Counter, counterInit, counterDtor);
+```
+
+**3. 请求级内存管理——bailout-safe**
+
+明确「PHP 用 PHP 的、Zig 用 Zig 的」边界：PHP 数据结构由 PHP 请求池兜底，Zig 自己分配的内存用 `RequestArena`（请求级内存池）或 `Cleanup.register` 兜底。两者在 bailout（`longjmp` 跳过 `defer`）后都保证回收：
+
+```zig
+const arena = phpzig.RequestArena.init();
+defer arena.deinit();          // 正常路径，bailout 时 RSHUTDOWN 兜底
+const a = arena.allocator();
+```
+
+**4. 极简注册入口——`moduleInit(@This())`**
+
+一行注册，按命名约定自动发现函数与类，无需手写注册表：
+
+```zig
+comptime {
+    phpzig.moduleInit(@This(), .{ .name = "hello", .version = "1.0.0" });
+}
+```
+
+**5. 构建注册透传——下游 build.zig 约 5 行**
+
+`addPhpExtension` 统一注册 target/optimize，自定义参数通过 `configure` 回调透传，无重复注册冲突。
 
 ## 许可证
 

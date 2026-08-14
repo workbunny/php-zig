@@ -38,6 +38,8 @@ pub const Closure = @import("closure.zig");
 pub const Error = @import("error.zig");
 pub const Serialize = @import("serialize.zig");
 pub const Ini = @import("ini.zig");
+pub const Cleanup = @import("cleanup.zig");
+pub const RequestArena = @import("arena.zig").RequestArena;
 
 // 常用类型别名 — 避免下游写完整路径
 pub const FunctionDesc = mod.FunctionDesc;

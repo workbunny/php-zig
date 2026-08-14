@@ -8,6 +8,7 @@
 
 const c = @import("php_c.zig");
 const T = @import("php_types.zig");
+const Cleanup = @import("cleanup.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const IniEntry = @import("ini.zig").IniEntry;
@@ -800,7 +801,8 @@ pub fn Module(comptime opts: ModuleOptions) type {
             return if (opts.rinit) |_| &phpzigRinit else null;
         }
         fn rshutdownPtr() ?T.ModuleLifecycleFn {
-            return if (opts.rshutdown) |_| &phpzigRshutdown else null;
+            // 始终注册：Cleanup 注册表需要在 RSHUTDOWN 统一回收（bailout-safe）
+            return &phpzigRshutdown;
         }
 
         fn registerClassFull(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
@@ -992,6 +994,7 @@ pub fn Module(comptime opts: ModuleOptions) type {
             return 0;
         }
         fn phpzigRshutdown(type_: c_int, module_number: c_int) callconv(.c) c_int {
+            Cleanup.flush();
             if (opts.rshutdown) |hook| return hook(type_, module_number);
             return 0;
         }

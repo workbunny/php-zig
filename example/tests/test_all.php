@@ -88,7 +88,7 @@ echo "\n=== 1. 模块级函数 ===\n";
 test('hello_world() 返回字符串', 'Hello from Zig!', hello_world());
 test('hello_name("Bob") 返回问候语', 'Hello, Bob!', hello_name('Bob'));
 test('hello_name() 无参返回 null', null, @hello_name());
-test('version() 返回版本字符串', 'php-zig v0.8.0', version());
+test('version() 返回版本字符串', 'php-zig v0.9.0', version());
 
 // ============================================================
 // 2. 返回值类型 — 9种全覆盖
@@ -463,6 +463,14 @@ test('Counter->increment() → 11', 11, $ctr->increment());
 $ctr2 = new Counter();
 test('新 Counter 独立状态 get() → 0', 0, $ctr2->get());
 test('新 Counter 不受旧实例影响', 0, $ctr2->get());
+
+// ============================================================
+// 25. v0.9 — 请求级 arena（内存池）+ cleanup 注册
+// ============================================================
+echo "\n=== 25. v0.9 arena + cleanup ===\n";
+
+test('hello_arena_sum() 用 arena 分配求和 → 60', 60, hello_arena_sum());
+test('hello_cleanup_register() 注册清理回调', true, hello_cleanup_register());
 
 // ============================================================
 // 结果汇总

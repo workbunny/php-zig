@@ -28,7 +28,10 @@ fn helloName(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
         return;
     }
     const name = arg.toStringVal();
-    const msg = std.fmt.allocPrint(std.heap.c_allocator, "Hello, {s}!", .{name}) catch {
+    // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）
+    const arena = phpzig.RequestArena.init();
+    defer arena.deinit();
+    const msg = std.fmt.allocPrint(arena.allocator(), "Hello, {s}!", .{name}) catch {
         phpzig.Return.returnNull(return_value);
         return;
     };
@@ -36,7 +39,7 @@ fn helloName(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
 }
 
 pub fn php_version(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    phpzig.Return.returnString(return_value, "php-zig v0.8.0");
+    phpzig.Return.returnString(return_value, "php-zig v0.9.0");
 }
 
 pub fn php_add(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -312,7 +315,10 @@ fn helloFormat(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv
     }
     const name = phpzig.Return.callArg(execute_data, 1);
     const age = phpzig.Return.callArg(execute_data, 2);
-    const msg = std.fmt.allocPrint(std.heap.c_allocator, "{s} is {d} years old", .{ name.toStringVal(), age.toLong() }) catch {
+    // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）
+    const arena = phpzig.RequestArena.init();
+    defer arena.deinit();
+    const msg = std.fmt.allocPrint(arena.allocator(), "{s} is {d} years old", .{ name.toStringVal(), age.toLong() }) catch {
         phpzig.Return.returnNull(return_value);
         return;
     };
@@ -590,6 +596,39 @@ fn helloThrowDivisionByZero(_: *T.ZendExecuteData, return_value: *T.Zval) callco
     phpzig.Return.returnNull(return_value);
 }
 
+// ＝＝ v0.9 — 请求级 arena（内存池） ＝＝
+
+fn helloArenaSum(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    // 实例化请求级 arena，自动注册 RSHUTDOWN 回收（bailout-safe）
+    const arena = phpzig.RequestArena.init();
+    defer arena.deinit(); // 正常路径提前释放（幂等）
+
+    const a = arena.allocator();
+    // Zig 0.16：ArrayList 为 unmanaged，用 .empty 初始化，方法显式传 allocator
+    var list: std.ArrayList(i64) = .empty;
+    defer list.deinit(a);
+    list.append(a, 10) catch unreachable;
+    list.append(a, 20) catch unreachable;
+    list.append(a, 30) catch unreachable;
+
+    var sum: i64 = 0;
+    for (list.items) |v| sum += v;
+    phpzig.Return.returnLong(return_value, sum);
+}
+
+// ＝＝ v0.9 — cleanup 注册（RSHUTDOWN 清理） ＝＝
+
+fn cleanupOnShutdown(data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    // 清理回调在 RSHUTDOWN 执行（bailout 后同样触发），此处输出 stderr 便于人工观察
+    std.debug.print("phpzig cleanup: request shutdown\n", .{});
+}
+
+fn helloCleanupRegister(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Cleanup.register(&cleanupOnShutdown, null);
+    phpzig.Return.returnBool(return_value, true);
+}
+
 // ＝＝ OOP — 类属性 + 继承 + 构造器 + 访问修饰符 ＝＝
 
 fn bankGetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -712,6 +751,9 @@ comptime {
             phpzig.FunctionDesc.createWithParams("hello_throw_type_error", helloThrowTypeError, &.{phpzig.ParamDesc.create("msg")}),
             phpzig.FunctionDesc.create("hello_throw_value_error", helloThrowValueError),
             phpzig.FunctionDesc.create("hello_throw_div_zero", helloThrowDivisionByZero),
+            // v0.9：请求级 arena + cleanup
+            phpzig.FunctionDesc.create("hello_arena_sum", helloArenaSum),
+            phpzig.FunctionDesc.create("hello_cleanup_register", helloCleanupRegister),
         },
         .minit = myMinit,
         .ini = &.{
@@ -827,7 +869,10 @@ fn helloGreet(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(
         const g = phpzig.Return.callArg(execute_data, 2);
         if (g.isString()) greeting = g.toStringVal();
     }
-    const msg = std.fmt.allocPrint(std.heap.c_allocator, "{s}, {s}!", .{ greeting, name.toStringVal() }) catch {
+    // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）
+    const arena = phpzig.RequestArena.init();
+    defer arena.deinit();
+    const msg = std.fmt.allocPrint(arena.allocator(), "{s}, {s}!", .{ greeting, name.toStringVal() }) catch {
         phpzig.Return.returnNull(return_value);
         return;
     };

@@ -686,3 +686,61 @@ const total_param_bytes = @max(1, total_param_entries) * ARGINFO_ENTRY_SIZE_MAX;
 ```
 
 这 1 字节在「无带参函数」场景下永远不会被真正访问，仅用于满足编译期语义。
+
+## ArenaAllocator.deinit 非幂等（double free 陷阱）
+
+### 问题
+
+`RequestArena` 设计为「正常路径 `defer arena.deinit()` + RSHUTDOWN 兜底再释放」双保险，但测试崩溃报 `integer overflow`（`free` 里 `total -= memory.len` 下溢）。
+
+### 根因
+
+`std.heap.ArenaAllocator.deinit` **不是幂等的**：它遍历 `used_list`/`free_list` 释放每个 node，但**不把链表指针置空**（源码 `for ([_]?*Node{ used_list, free_list }) ... rawFree(node)` 后无 `= null`）。第二次调用会遍历同一批已释放 node → double free → 计数下溢。
+
+### 解决方案
+
+`RequestArena` 用 `deinited` 布尔标志保护幂等：
+
+```zig
+pub fn deinit(self: *RequestArena) void {
+    if (self.deinited) return;   // 幂等保护
+    self.arena.deinit();
+    self.deinited = true;
+}
+fn rsDeinit(data: ?*anyopaque) callconv(.c) void {
+    const self: *RequestArena = @ptrCast(@alignCast(data.?));
+    self.deinit();               // 幂等入口
+    std.heap.c_allocator.destroy(self);
+}
+```
+
+**教训**：不要假设 Zig std 的 `deinit` 幂等；凡「正常路径 + 兜底路径」双释放的场景，必须自己加标志保护。
+
+## Zig 0.16 std API 迁移（ArrayList / fs）
+
+### 问题
+
+0.9.0 引入 arena/cleanup 后，example 编译报两类错：
+
+1. `struct 'array_list.Aligned(i64,null)' has no member named 'init'`
+2. `struct 'fs' has no member named 'cwd'`
+
+### 根因
+
+Zig 0.16 标准库 API 大迁移：
+
+1. **`std.ArrayList(T)` 变 unmanaged**：返回 `array_list.Aligned(T, null)`（unmanaged），**没有 `init(gpa)`**（`AlignedManaged` 已 deprecated）。需 `.empty` 初始化，方法显式传 allocator（`append(a, item)`、`deinit(a)`）。
+2. **`std.fs.cwd()` 迁移到 `std.Io.Dir.cwd()`**：文件系统 API 从 `std.fs` 迁到 `std.Io.Dir`，方法签名还需 `io: Io` 参数。
+
+### 解决方案
+
+```zig
+// ArrayList：unmanaged 用法
+var list: std.ArrayList(i64) = .empty;
+defer list.deinit(a);
+list.append(a, 10) catch unreachable;
+
+// 文件系统：std.Io.Dir.cwd()（或直接用 C 文件函数，已 link libc）
+```
+
+**教训**：Zig 0.16 是 std API 大变动版本，涉及 `ArrayList`、`fs` 的代码需按新 API 重写；单元测试因 cleanup/arena 用 `c_allocator`，`build.zig` 测试模块需 `link_libc = true`。
