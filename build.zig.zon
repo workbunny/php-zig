@@ -1,12 +1,19 @@
 .{
     .name = .phpzig,
-    .fingerprint = 0x4612f9e16f6c3538,
-    .version = "0.9.3",
+    .fingerprint = 0x4612f9e1ec0f5a90,
+    .version = "0.10.0",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
+        // 构建：build_php_ext.zig 供下游 `@import("phpzig").build_php_ext` 复用
         "build.zig",
+        "build_php_ext.zig",
         "build.zig.zon",
+        // 协议与文档
+        "LICENSE",
+        "README.md",
+        "doc",
+        // 源码与 C 胶水层
         "src",
         "glue",
     },

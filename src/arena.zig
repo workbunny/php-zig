@@ -128,3 +128,38 @@ test "request arena: 分配 + 计数 + 释放" {
     arena.deinit();
     Cleanup.flush();
 }
+
+// deinit 幂等是踩坑 19 的核心保护：ArenaAllocator.deinit 本身非幂等
+// （释放 node 后不置空链表，二次调用会 double free），靠 deinited 标志拦截。
+// 该保护此前无测试覆盖，此处补齐。
+test "request arena: deinit 幂等（二次调用不 double free）" {
+    const arena = RequestArena.init();
+    _ = arena.allocator().alloc(u8, 64) catch unreachable;
+
+    arena.deinit();
+    arena.deinit(); // 二次 deinit：应被 deinited 标志拦截
+    try testing.expectEqual(true, arena.deinited);
+
+    // RSHUTDOWN 路径再次 deinit（幂等）+ destroy，同样不应重复释放
+    Cleanup.flush();
+}
+
+test "request arena: 0 字节分配" {
+    const arena = RequestArena.init();
+    const a = arena.allocator();
+
+    const p = a.alloc(u8, 0) catch unreachable;
+    try testing.expectEqual(@as(usize, 0), p.len);
+
+    arena.deinit();
+    Cleanup.flush();
+}
+
+test "request arena: 跳过 defer 由 RSHUTDOWN 兜底（bailout 路径）" {
+    const arena = RequestArena.init();
+    _ = arena.allocator().alloc(u8, 256) catch unreachable;
+    try testing.expect(arena.bytesAllocated() >= 256);
+
+    // 模拟 bailout：不调 deinit，直接 flush —— rsDeinit 应 deinit + destroy
+    Cleanup.flush();
+}

@@ -585,7 +585,70 @@ pub const ModuleMeta = struct {
     observer: ?ObserverConfig = null,
 };
 
+/// comptime 校验：拦截**语义错误**（Zend/PHP 层面本就不合法的写法），
+/// 在编译期暴露，避免留到运行时才崩。
+///
+/// 边界：只校验 Zend 确实不允许的写法，**不引入任何 Zend 没有的数量上限**
+/// （参数/属性/常量/INI 的个数 Zend 均不限制，故此处同样不限制）。
+fn validateOptions(comptime opts: ModuleOptions) void {
+    if (opts.name.len == 0) @compileError("module name must not be empty");
+    if (opts.version.len == 0) @compileError("module version must not be empty");
+
+    inline for (opts.ini) |e| {
+        if (e.name.len == 0) @compileError("INI entry name must not be empty");
+    }
+    inline for (opts.constants) |cst| {
+        if (cst.name.len == 0) @compileError("constant name must not be empty");
+    }
+    inline for (opts.functions) |f| validateFunction(f);
+    inline for (opts.classes) |cls| {
+        if (cls.name.len == 0) @compileError("class name must not be empty");
+        inline for (cls.class_constants) |cst| {
+            if (cst.name.len == 0) @compileError("class constant name must not be empty");
+        }
+        inline for (cls.properties) |prop| {
+            if (prop.name.len == 0) @compileError("class property name must not be empty");
+        }
+        inline for (cls.methods) |m| validateFunction(m);
+    }
+}
+
+fn validateFunction(comptime f: FunctionDesc) void {
+    if (f.name.len == 0) @compileError("function/method name must not be empty");
+    inline for (f.params, 0..) |p, i| {
+        if (p.name.len == 0) {
+            @compileError(std.fmt.comptimePrint(
+                "function '{s}' param #{d} has empty name",
+                .{ f.name, i + 1 },
+            ));
+        }
+        // 重复参数名会让 PHP 侧静默异常，编译期拦住
+        inline for (f.params[0..i]) |q| {
+            if (std.mem.eql(u8, p.name, q.name)) {
+                @compileError(std.fmt.comptimePrint(
+                    "function '{s}' has duplicate param name '{s}'",
+                    .{ f.name, p.name },
+                ));
+            }
+        }
+        // variadic 必须是最后一个参数，否则违反 PHP 语义
+        if (p.is_variadic and i != f.params.len - 1) {
+            @compileError(std.fmt.comptimePrint(
+                "function '{s}': variadic param '{s}' must be the last param",
+                .{ f.name, p.name },
+            ));
+        }
+    }
+}
+
 pub fn Module(comptime opts: ModuleOptions) type {
+    comptime validateOptions(opts);
+
+    // 各维度缓冲**不再需要此处计算**：参数由 resolveArgInfo 按该函数自身精确分配，
+    // 类常量/属性由 registerClassFull 按该类自身精确分配，INI 按实际项数分配。
+    // Zend 对参数 / 属性 / 类常量 / INI 的个数均不设上限，本项目同样不设
+    // （此前固定 8/8/64 属自造限制，已移除）。
+
     const total_class_methods = comptime blk: {
         var n: usize = 0;
         for (opts.classes) |cls| n += cls.methods.len + 1;
@@ -643,15 +706,16 @@ pub fn Module(comptime opts: ModuleOptions) type {
         /// 解析 arg_info + num_args。
         /// 按需选择：含 variadic/default_value 走 full C glue；
         /// 否则含类型标注走 typed；否则走无类型原版。
-        fn resolveArgInfo(desc: FunctionDesc, arginfo_offset: *usize) struct { ptr: ?*anyopaque, num: u32 } {
+        /// desc 为 comptime 参数：缓冲按**该函数自身**的参数个数精确分配，
+        /// 而非模块级最大值——调用者无需关心总量，也不浪费栈空间。
+        fn resolveArgInfo(comptime desc: FunctionDesc, arginfo_offset: *usize) struct { ptr: ?*anyopaque, num: u32 } {
             if (desc.arg_info) |a| return .{ .ptr = a, .num = 0 };
             if (desc.params.len == 0) return .{ .ptr = c.phpglue_get_empty_arg_info(), .num = 0 };
 
             const off = arginfo_offset.*;
             const byte_off = off * ARGINFO_ENTRY_SIZE_MAX;
 
-            var name_ptrs: [8][*c]const u8 = undefined;
-            if (desc.params.len > 8) @panic("max 8 params supported for arg_info");
+            var name_ptrs: [desc.params.len][*c]const u8 = undefined;
             for (desc.params, 0..) |p, j| name_ptrs[j] = p.name.ptr;
 
             // required_count = 非 variadic 参数个数（variadic 可传 0 个）
@@ -673,10 +737,10 @@ pub fn Module(comptime opts: ModuleOptions) type {
             var entry_count: usize = 0;
 
             if (hasFull) {
-                var types: [8]u8 = undefined;
-                var nulls: [8]u8 = undefined;
-                var varis: [8]u8 = undefined;
-                var defs: [8]?[*:0]const u8 = undefined;
+                var types: [desc.params.len]u8 = undefined;
+                var nulls: [desc.params.len]u8 = undefined;
+                var varis: [desc.params.len]u8 = undefined;
+                var defs: [desc.params.len]?[*:0]const u8 = undefined;
                 for (desc.params, 0..) |p, j| {
                     types[j] = @intFromEnum(p.param_type);
                     nulls[j] = @intFromBool(p.allow_null);
@@ -695,8 +759,8 @@ pub fn Module(comptime opts: ModuleOptions) type {
                     &entry_count,
                 );
             } else if (hasTypes) {
-                var types: [8]u8 = undefined;
-                var nulls: [8]u8 = undefined;
+                var types: [desc.params.len]u8 = undefined;
+                var nulls: [desc.params.len]u8 = undefined;
                 for (desc.params, 0..) |p, j| {
                     types[j] = @intFromEnum(p.param_type);
                     nulls[j] = @intFromBool(p.allow_null);
@@ -731,7 +795,9 @@ pub fn Module(comptime opts: ModuleOptions) type {
 
         fn initFunctionEntries() void {
             var off: usize = 0;
-            for (opts.functions, 0..) |desc, i| {
+            // inline：使每个 desc 成为 comptime 值，resolveArgInfo 得以按
+            // 该函数自身的参数个数精确分配缓冲
+            inline for (opts.functions, 0..) |desc, i| {
                 const ai = resolveArgInfo(desc, &off);
                 function_entries[i] = .{
                     .fname = desc.name.ptr,
@@ -814,12 +880,14 @@ pub fn Module(comptime opts: ModuleOptions) type {
         fn registerClassFull(comptime cls: ClassDesc, methods_ptr: ?*anyopaque) c_int {
             // — 常量打包 —
             const k = cls.class_constants.len;
-            var c_keys: [8][*c]const u8 = undefined;
-            var c_kls: [8]usize = undefined;
-            var c_vals: [8]?*anyopaque = undefined;
-            var c_vls: [8]usize = undefined;
-            var c_types: [8]u8 = undefined;
-            var ls_buf: [8]T.zend_long = undefined;
+            // cls 是 comptime 参数：按该类自身的常量个数精确分配
+            const nc = @max(1, cls.class_constants.len);
+            var c_keys: [nc][*c]const u8 = undefined;
+            var c_kls: [nc]usize = undefined;
+            var c_vals: [nc]?*anyopaque = undefined;
+            var c_vls: [nc]usize = undefined;
+            var c_types: [nc]u8 = undefined;
+            var ls_buf: [nc]T.zend_long = undefined;
             inline for (cls.class_constants, 0..) |cnst, j| {
                 c_keys[j] = cnst.name.ptr;
                 c_kls[j] = cnst.name.len;
@@ -839,15 +907,15 @@ pub fn Module(comptime opts: ModuleOptions) type {
             }
             // — 属性打包 —
             const p = cls.properties.len;
-            if (p > 8) @panic("max 8 properties");
-            var p_keys: [8][*c]const u8 = undefined;
-            var p_kls: [8]usize = undefined;
-            var p_vals: [8]?*anyopaque = undefined;
-            var p_vls: [8]usize = undefined;
-            var p_access: [8]u32 = undefined;
-            var p_types: [8]u8 = undefined;
-            var dbl_buf: [8]f64 = undefined;
-            var bl_buf: [8]u8 = undefined;
+            const np = @max(1, p); // 至少 1，避免零长数组（该类可能只有常量无属性）
+            var p_keys: [np][*c]const u8 = undefined;
+            var p_kls: [np]usize = undefined;
+            var p_vals: [np]?*anyopaque = undefined;
+            var p_vls: [np]usize = undefined;
+            var p_access: [np]u32 = undefined;
+            var p_types: [np]u8 = undefined;
+            var dbl_buf: [np]f64 = undefined;
+            var bl_buf: [np]u8 = undefined;
             inline for (cls.properties, 0..) |prop, j| {
                 p_keys[j] = prop.name.ptr;
                 p_kls[j] = prop.name.len;
@@ -925,12 +993,12 @@ pub fn Module(comptime opts: ModuleOptions) type {
         /// 注册全部 INI 项 + 设置变更通知回调
         fn registerIniEntries(module_number: c_int) void {
             if (opts.ini.len == 0) return;
-            if (opts.ini.len > 64) @panic("max 64 INI entries");
-            var names: [64][*c]const u8 = undefined;
-            var name_lens: [64]usize = undefined;
-            var defaults: [64][*c]const u8 = undefined;
-            var types: [64]u8 = undefined;
-            var modifiables: [64]u8 = undefined;
+            const ni = opts.ini.len; // opts 是 comptime，此处即实际项数
+            var names: [ni][*c]const u8 = undefined;
+            var name_lens: [ni]usize = undefined;
+            var defaults: [ni][*c]const u8 = undefined;
+            var types: [ni]u8 = undefined;
+            var modifiables: [ni]u8 = undefined;
             for (opts.ini, 0..) |entry, j| {
                 names[j] = entry.name.ptr;
                 name_lens[j] = entry.name.len;

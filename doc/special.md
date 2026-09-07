@@ -880,3 +880,165 @@ fcall observer 的 `init` 回调若始终返回非空 begin/end handlers，则**
 php-zig 的 Observer 定位是「集中式代理」——无条件汇聚所有事件，由下游 handler 自行过滤（判断函数名、类型等）。这是「静态注册」约束下的简单模型：MINIT 一次性注册，请求期不变。若需按函数粒度精细控制，可后续用 `zend_observer_add_begin_handler`（运行时按函数添加）扩展。
 
 **测试注意**：因观察所有函数，集成测试须用「相对增量」断言（`after > before`），而非绝对值。
+
+## build.zig.zon fingerprint 是内容哈希（不是随机数）
+
+### 问题
+
+改动 `build.zig.zon` 的 `paths`（如新增 `test_all.php`）后构建报错：
+
+```
+error: invalid fingerprint: 0x...;
+if this is a new or forked package, use this value: 0x...
+```
+
+早期误以为 fingerprint 是任意随机数，用加密 RNG 生成后同样被拒。
+
+### 根因
+
+fingerprint 是包的**内容标识**，由 Zig 计算，非随机数：
+
+- **前 32 位** = 包身份（phpzig 恒为 `4612f9e1`），保证包不被误判为 fork
+- **后 32 位** = 内容哈希，随 `paths` 内容变化（`c812bbfb` → `6f6c3538`）
+
+### 解决方案
+
+**直接采用 Zig 报错中给出的建议值**，不要自行生成。改动 `paths` 后按提示同步更新。
+
+## @This() 自动发现：decls 只枚举 pub 声明
+
+### 问题
+
+`moduleInit(@This(), ...)` 扫描文件声明做自动注册，但非 `pub` 的函数完全不可见。
+
+### 根因
+
+`@typeInfo(@This()).@"struct".decls` **只包含 `pub` 声明**——非 `pub` 的 `fn php_add` 不可见，`@hasDecl(file, "php_add")` 也返回 false。
+
+Zig 0.16 的 `builtin.Type.Declaration` **没有 `is_pub` 字段**（误用 `d.is_pub` 会编译报错），且 decls 已只含 pub，无需也无法二次过滤。
+
+### 解决方案
+
+命名约定**强制 `pub fn` / `pub const`**——`pub` 在此的语义即「导出给模块注册」。
+
+## comptime 反射拿不到函数参数名
+
+### 问题
+
+理想中 `moduleInit(@This())` 应全自动，但有参函数无法完全自动发现。
+
+### 根因
+
+Zig 函数签名不含参数名——`@typeInfo(fn)` 拿不到 `fn add(a, b)` 的 `a`/`b`，只能拿到类型列表。而 arg_info 需要参数名。
+
+同理，`ParamDesc` 的 `default_value`/`is_variadic` 也无法从 struct 字段推导。
+
+### 解决方案
+
+有参函数额外提供 `<name>Args` struct（字段 = 参数，字段名 = 参数名）；默认值/可变参数用 `meta.functions` 显式声明。
+
+**无参函数 + 类**可完全自动发现。
+
+## Windows 交叉编译：mingw 与 MSVC import library ABI 不匹配
+
+### 问题
+
+用 mingw 目标（`x86_64-windows-gnu`）链接官方 `php8.lib`，符号解析失败：
+
+```
+_emalloc@@8   ← MSVC import library 的符号装饰
+```
+
+### 根因
+
+官方 Windows PHP 是 **MSVC 构建**，`php8.lib` 是 MSVC 的 COFF import library，符号装饰规则与 mingw 不同。扩展必须与宿主 PHP 用同一套工具链，否则链接失败（即使勉强链接成功，CRT 也不一致）。
+
+### 解决方案
+
+Windows 目标改用 **`.msvc` ABI**（对齐 `php8.lib` 符号装饰），而非 mingw。
+
+## Zig 不内置 MSVC libc（许可证限制）
+
+### 问题
+
+Linux/macOS 主机上 `-target x86_64-windows-msvc` 链接失败，找不到 CRT 库。
+
+### 根因
+
+Zig 的 `lib/libc/` 只内置**开源**的 CRT（glibc / musl / mingw / darwin libSystem），**不内置 MSVC libc**——微软专有，许可证禁止转发行。
+
+Windows 自带的 `ucrtbase.dll` 等是**运行时 DLL**，不是链接用的 `.lib` + headers，无法用于链接。
+
+### 解决方案
+
+`-msvc` 目标仅在**本机装有 Visual Studio 或「Build Tools for Visual Studio」（含 MSVC v143 + Windows SDK）**的 Windows 上可用。
+
+故「Linux 跨平台编译官方 Windows DLL」不可行——官方 PHP 是 MSVC 构建，扩展必须 MSVC 匹配。检测方式：`std.zig.WindowsSdk.find()` 的 `msvc_lib_dir` 非空。
+
+## runtime 包 ≠ devel-pack
+
+### 问题
+
+下载的 Windows PHP 包缺 `include/`（0 个 `.h`），无法编译扩展。
+
+### 根因
+
+Windows 官方发两类包：
+
+| 包 | 内容 | 用途 |
+|---|---|---|
+| `php-8.x-Win32-vs17-x64.zip`（运行时） | 只有 `php.exe` + `php8.dll`，**无 `include/`** | 运行 PHP |
+| `php-devel-pack-*.zip`（开发包） | 含 `include/main/config.w32.h` + `lib/*.lib` | 开发扩展 |
+
+### 解决方案
+
+识别逻辑校验 `include/` + `config.w32.h` 存在，缺失则明确报错「请下载 devel-pack」，而非静默走到编译失败。
+
+## libc 一致性是硬约束
+
+### 问题
+
+`.so`/`.dll` 只是容器格式，不承诺 ABI。musl 编的扩展塞进 glibc PHP（或反之）会「能编译、能加载、随机崩溃」。
+
+### 根因
+
+`errno` TLS 布局、`pthread`、`malloc` 行为在不同 libc 下不一致。
+
+### 解决方案
+
+扩展必须与加载它的 PHP 用同一种 libc（glibc↔glibc、musl↔musl、UCRT↔UCRT）。判断依据：`php_config.h` 的 `__MUSL__` 宏。
+
+> 注：Alpine 用 musl 替代 glibc 不是缺陷——Zig 自带 musl，Alpine 反而是最友好的交叉编译目标。问题只在「扩展与 PHP libc 不一致」。
+
+## configure 回调不能捕获外层局部变量
+
+### 问题
+
+`build_php_ext.zig` 的 `configure` 回调里引用外层 `php_prefix`，报 `not accessible from inner function`。
+
+### 根因
+
+Zig 普通函数不是闭包，无法捕获外层局部变量。
+
+### 解决方案
+
+所需上下文全部放进 `ExtContext`（含 `php_prefix`），回调只依赖 `ctx`。
+
+## 匿名 struct 字面量取地址是 `*const`
+
+### 问题
+
+`configure(&.{ .b = b, ... })` 报 `expected '*T', found '*const T'`。
+
+### 根因
+
+匿名 struct 字面量是 const，取地址得 `*const T`。
+
+### 解决方案
+
+先声明变量再取地址：
+
+```zig
+var ctx = ExtContext{ .b = b, ... };
+configure(&ctx);
+```

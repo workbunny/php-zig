@@ -30,6 +30,36 @@ pub export fn get_module() *php.T.ZendModuleEntry {
 
 ## 模块注册（module.zig）
 
+### 编译期约束（语义错误在 `zig build` 阶段即报错）
+
+以下由 `validateOptions()` 在 **comptime** 拦截，写错时编译直接失败：
+
+| 约束 | 规则 |
+|---|---|
+| 模块名 / 版本号 | 非空 |
+| 函数、类、类常量、类属性、INI、参数名 | 非空 |
+| 参数名 | 不可重复 |
+| variadic 参数 | 必须是最后一个 |
+
+错误信息示例：
+
+```
+error: function 'f' has duplicate param name 'a'
+error: function 'f': variadic param 'rest' must be the last param
+error: module name must not be empty
+```
+
+### 数量不受限（与 Zend 一致）
+
+**参数个数、类属性个数、类常量个数、INI 项个数、类个数均不设上限**——Zend/PHP 对这些数量本身没有限制，故本框架同样不限制，只按你实际声明的数量精确分配。
+
+缓冲按**各自**维度精确分配（非模块级最大值）：函数的参数缓冲按该函数自身的参数个数，类的常量/属性缓冲按该类自身的个数。你无需统计总数。
+
+> 本项目曾错误地自设 8 / 8 / 64 上限（属实现细节而非 Zend 约束），现已移除。
+> 若你在旧文档中见过这些数字，以本节为准。
+
+以下约束**无法**在编译期判定（依赖 C 运行时查询），仍为运行时 panic：zval 大小、arg_info 实际布局。见 `initModule()` 中的校验。
+
 ### 入口函数
 
 | 签名 | 说明 |

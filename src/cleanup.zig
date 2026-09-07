@@ -65,6 +65,41 @@ fn cbRecord(data: ?*anyopaque) callconv(.c) void {
     test_idx += 1;
 }
 
+/// 计数回调：计数器由调用方通过 data 传入，避免复用共享全局状态
+/// （全局 test_idx 在测试并行执行时会竞争）。
+fn cbCount(data: ?*anyopaque) callconv(.c) void {
+    const c: *usize = @ptrCast(@alignCast(data.?));
+    c.* += 1;
+}
+
+test "cleanup: 空注册表 flush 不崩溃" {
+    flush(); // 清空共享状态
+    flush(); // 再次 flush：无条目，不应崩溃或越界
+}
+
+test "cleanup: flush 幂等 —— 回调不被重复执行" {
+    flush();
+    var count: usize = 0;
+    register(&cbCount, &count);
+    flush();
+    try testing.expectEqual(@as(usize, 1), count);
+
+    // 二次 flush：注册表已清空，回调不应再被执行
+    flush();
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "cleanup: 单条 register 后未 flush 不执行" {
+    flush();
+    var count: usize = 0;
+    register(&cbCount, &count);
+    // 未 flush 前回调不应触发
+    try testing.expectEqual(@as(usize, 0), count);
+
+    flush();
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
 test "cleanup: LIFO 顺序 + 自动扩容" {
     flush(); // 清空，避免与其他测试共享状态
     test_idx = 0;

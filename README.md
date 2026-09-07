@@ -167,7 +167,7 @@ php -d extension=zig-out/lib/libhello.so \
 Hello from php-zig!
 ```
 
-完整教程见 [doc/tutorial.md](doc/tutorial.md)，API 参考见 [doc/api.md](doc/api.md)。
+完整教程见 [doc/tutorial.md](doc/tutorial.md)，API 参考见 [doc/api.md](doc/api.md)，设计哲学与竞品分析见 [doc/zen.md](doc/zen.md)。
 
 ## 能力
 
@@ -242,19 +242,7 @@ phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
 
 php-zig 以 PHPX 为功能对齐目标，主体能力（OOP、数组、闭包、接口、异常、资源）均已覆盖。
 
-| 维度 | PHPX (C++) | php-zig (Zig) |
-|--|-----------|---------------|
-| 语言 | C++（RAII、模板元编程） | Zig（comptime、defer） |
-| 函数注册 | 宏自注册 + 运行时分发 | comptime 泛型 + 直接函数指针 |
-| arg_info | 自动生成 | 声明式 + comptime struct 反射（双轨） |
-| 类导出 | Class / Interface / 继承 / 属性 / 常量 / 访问修饰符 | 对齐 PHPX，另支持 extern struct 对象绑定 |
-| 数组操作 | 完整（push/pop/shift/unshift/slice/merge/sort/keys/values） | 完整 + filter/map/reduce/each |
-| 运算符 | 算术 + 比较重载 | add/sub/mul/div/mod + cmp/lt/le/gt/ge |
-| 闭包导出 | 支持 | 支持（Closure.create） |
-| 异常抛出 | Exception | Exception + 自定义异常类 + Error 家族 |
-| 内存管理 | PHP 内存池 + C++ RAII | 「PHP 用 PHP 的，Zig 用 Zig 的」+ arena/cleanup（bailout-safe） |
-| 构建 | CMake + phpize | `zig build -Dphp=/path`（注册透传，脚本 ~5 行） |
-| 交叉编译 | 依赖工具链 | Zig 原生，`-Dtarget` 一键切换 |
+与 PHPX（C++）、phpz（Zig）、vphp（V）在语言、函数注册分发、元编程、内存模型、版本兼容、构建方式上的完整对比，见 [doc/zen.md](doc/zen.md) 的「竞品分析」章节。
 
 ### 我们的特色
 

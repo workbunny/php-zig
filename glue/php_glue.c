@@ -6,6 +6,7 @@
  */
 
 #include "php_glue.h"
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
@@ -728,8 +729,12 @@ int phpglue_register_ini_entries(const char **names, size_t *name_lens,
     const char **default_values, const uint8_t *types, const uint8_t *modifiables,
     size_t count, int module_number)
 {
-    zend_ini_entry_def defs[65];
-    if (count > 64) return 0;
+    /* Zend 对 INI 项个数不设上限，故按实际数量动态分配，与 Zend 能力保持一致
+       （此前固定 65 是本项目自造的限制，已移除）。
+       zend_register_ini_entries() 内部会拷贝 name/value，故 defs 用完即可释放。 */
+    zend_ini_entry_def *defs =
+        (zend_ini_entry_def *)malloc(sizeof(zend_ini_entry_def) * (count + 1));
+    if (!defs) return 0;
     (void)types; /* 值类型不影响注册，读取时再解析 */
     for (size_t i = 0; i < count; i++) {
         defs[i].name = names[i];
@@ -745,7 +750,9 @@ int phpglue_register_ini_entries(const char **names, size_t *name_lens,
     }
     /* 数组以 name=NULL 哨兵结尾 */
     memset(&defs[count], 0, sizeof(zend_ini_entry_def));
-    return zend_register_ini_entries(defs, module_number) == SUCCESS ? 1 : 0;
+    int ret = zend_register_ini_entries(defs, module_number) == SUCCESS ? 1 : 0;
+    free(defs);
+    return ret;
 }
 
 zend_long phpglue_ini_get_long(const char *name, size_t name_len, zend_long dflt) {
@@ -785,8 +792,6 @@ void phpglue_unregister_ini_entries(int module_number) {
  * free_obj 时调用 dtor 清理额外数据。通过 handler 指针判断对象归属。
  * ================================================================ */
 
-#define PHPGLUE_MAX_OBJECT_CLASSES 64
-
 typedef struct {
     zend_object std;
     void *extra;
@@ -799,10 +804,28 @@ typedef struct {
     void (*dtor)(void *extra);
 } phpglue_object_class_info;
 
-static phpglue_object_class_info phpglue_obj_infos[PHPGLUE_MAX_OBJECT_CLASSES];
+/* Zend 对类数量不设上限，故对象类信息表按需动态扩容
+   （此前固定 64 是本项目自造的限制，超过时静默返回 NULL 导致类注册不上）。 */
+static phpglue_object_class_info *phpglue_obj_infos = NULL;
 static int phpglue_obj_info_count = 0;
+static int phpglue_obj_info_cap = 0;
 static zend_object_handlers phpglue_object_handlers;
 static bool phpglue_handlers_ready = false;
+
+/* 预留一个表项并递增计数；容量不足时倍增扩容。失败返回 NULL。
+   注意：扩容可能移动缓冲区，故调用方不得长期持有返回的指针。 */
+static phpglue_object_class_info *phpglue_reserve_obj_info(void) {
+    if (phpglue_obj_info_count >= phpglue_obj_info_cap) {
+        int new_cap = phpglue_obj_info_cap > 0 ? phpglue_obj_info_cap * 2 : 8;
+        phpglue_object_class_info *p =
+            (phpglue_object_class_info *)realloc(phpglue_obj_infos,
+                                                 sizeof(phpglue_object_class_info) * (size_t)new_cap);
+        if (!p) return NULL;
+        phpglue_obj_infos = p;
+        phpglue_obj_info_cap = new_cap;
+    }
+    return &phpglue_obj_infos[phpglue_obj_info_count++];
+}
 
 static phpglue_object_class_info *phpglue_find_obj_info(zend_class_entry *ce) {
     for (int i = 0; i < phpglue_obj_info_count; i++) {
@@ -838,8 +861,6 @@ zend_class_entry *phpglue_register_object_class(const char *name, size_t name_le
     const zend_function_entry *methods, size_t extra_size,
     void (*init)(void *extra), void (*dtor)(void *extra))
 {
-    if (phpglue_obj_info_count >= PHPGLUE_MAX_OBJECT_CLASSES) return NULL;
-
     if (!phpglue_handlers_ready) {
         memcpy(&phpglue_object_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
         phpglue_object_handlers.offset = XtOffsetOf(phpglue_object, std);
@@ -853,7 +874,8 @@ zend_class_entry *phpglue_register_object_class(const char *name, size_t name_le
     zend_class_entry *ce_ptr = zend_register_internal_class(&ce);
     if (ce_ptr == NULL) return NULL;
 
-    phpglue_object_class_info *info = &phpglue_obj_infos[phpglue_obj_info_count++];
+    phpglue_object_class_info *info = phpglue_reserve_obj_info();
+    if (!info) return NULL;
     info->ce = ce_ptr;
     info->extra_size = extra_size;
     info->init = init;

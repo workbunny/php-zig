@@ -514,6 +514,96 @@ test "Module() with interface and implements compiles" {
     _ = M;
 }
 
+// ＝＝ 数量不受限：与 Zend 一致 ＝＝
+// Zend 对参数 / 属性 / 类常量 / INI 的个数均不设上限，本项目曾自造 8/8/64 上限，
+// 现已移除。以下用例守护「超出旧上限仍应正常编译」，防止上限被重新引入。
+
+test "Module() with 12 params (beyond former 8 limit)" {
+    const params = [_]mod.ParamDesc{
+        .{ .name = "p1" },  .{ .name = "p2" },  .{ .name = "p3" },  .{ .name = "p4" },
+        .{ .name = "p5" },  .{ .name = "p6" },  .{ .name = "p7" },  .{ .name = "p8" },
+        .{ .name = "p9" },  .{ .name = "p10" }, .{ .name = "p11" }, .{ .name = "p12" },
+    };
+    const M = mod.Module(.{
+        .name = "beyondparams",
+        .version = "0.0.0",
+        .functions = &.{mod.FunctionDesc.createWithParams(
+            "twelve",
+            @ptrCast(@alignCast(&dummyHandler)),
+            &params,
+        )},
+    });
+    _ = M;
+}
+
+test "Module() with 12 class properties (beyond former 8 limit)" {
+    // 用字面量而非 createLong 工厂：工厂是运行时调用，不能传给 comptime 参数
+    const props = [_]mod.ClassPropertyDesc{
+        .{ .name = "a", .value = .{ .long = 1 } },
+        .{ .name = "b", .value = .{ .long = 2 } },
+        .{ .name = "c", .value = .{ .long = 3 } },
+        .{ .name = "d", .value = .{ .long = 4 } },
+        .{ .name = "e", .value = .{ .long = 5 } },
+        .{ .name = "f", .value = .{ .long = 6 } },
+        .{ .name = "g", .value = .{ .long = 7 } },
+        .{ .name = "h", .value = .{ .long = 8 } },
+        .{ .name = "i", .value = .{ .long = 9 } },
+        .{ .name = "j", .value = .{ .long = 10 } },
+        .{ .name = "k", .value = .{ .long = 11 } },
+        .{ .name = "l", .value = .{ .long = 12 } },
+    };
+    const M = mod.Module(.{
+        .name = "maxprops",
+        .version = "0.0.0",
+        .classes = &.{
+            mod.ClassDesc.createWithProperties(
+                "Big",
+                &.{mod.FunctionDesc.create("noop", @ptrCast(@alignCast(&dummyHandler)))},
+                &props,
+            ),
+        },
+    });
+    _ = M;
+}
+
+test "Module() with variadic as last param" {
+    const params = [_]mod.ParamDesc{
+        .{ .name = "first" },
+        .{ .name = "rest", .is_variadic = true },
+    };
+    const M = mod.Module(.{
+        .name = "variadic",
+        .version = "0.0.0",
+        .functions = &.{mod.FunctionDesc.createWithParams(
+            "vfn",
+            @ptrCast(@alignCast(&dummyHandler)),
+            &params,
+        )},
+    });
+    _ = M;
+}
+
+test "Module() with 80 INI entries (beyond former 64 limit)" {
+    // factory 函数是运行时调用，须在 comptime blk 内求值才能传给 comptime 参数
+    const entries = comptime blk: {
+        @setEvalBranchQuota(1_000_000); // 64 次 comptimePrint 超出默认 10000 分支上限
+        var e: [80]@import("ini.zig").IniEntry = undefined;
+        for (&e, 0..) |*x, i| {
+            x.* = .{
+                .name = std.fmt.comptimePrint("myext.k{d}", .{i}),
+                .default_value = "1",
+            };
+        }
+        break :blk e;
+    };
+    const M = mod.Module(.{
+        .name = "maxini",
+        .version = "0.0.0",
+        .ini = &entries,
+    });
+    _ = M;
+}
+
 // ＝＝ 辅助桩函数（仅用于类型编译验证） ＝＝
 
 fn dummyHandler(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
