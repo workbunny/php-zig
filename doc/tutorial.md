@@ -78,6 +78,37 @@ const ext = build_php_ext.addPhpExtension(b, "myext", b.path("src/main.zig"), .{
 `ExtContext` 提供：`b`（Build）、`module`（扩展模块）、`target`、`optimize`、`php_prefix`。
 注意回调是普通函数，无法捕获外层局部变量，所需上下文均由 `ExtContext` 提供。
 
+### 自建 C 胶水层（弥补手段）
+
+骨架只封装了常规 Zend API。遇到未覆盖的 C API，可在扩展内自建一层薄胶水直接调用。
+
+**这是弥补手段而非常规用法**：能用骨架 API 解决的不要绕；缺能力优先提 issue 补进核心——
+否则每个下游各补一份，知识不回流，且容易与框架的引用计数约定冲突而产出 double-free。
+
+`addPhpExtension` 已配好 PHP 头文件路径与 libc，只需在 `configure` 回调里追加 C 文件，
+Zig 侧用 `extern fn` 声明：
+
+```c
+/* src/myext_glue.c */
+#include "php.h"
+#include "zend_alloc.h"
+
+size_t myext_memory_usage(int real) {
+    return zend_memory_usage(real);
+}
+```
+
+```zig
+// build.zig 的 configure 回调
+ctx.module.addCSourceFile(.{ .file = ctx.b.path("src/myext_glue.c") });
+
+// Zig 侧
+extern fn myext_memory_usage(real: c_int) usize;
+```
+
+自建胶水须自行处理 PHP 版本差异——`phpglue_*` 统一走 C 层正是为了把 `#ifdef` 隔离在
+核心，绕过这层意味着该责任转移到下游。
+
 ### 手动构建（可选）
 
 若需完全手动控制构建流程，可参照 `example/hello/build.zig` 早期写法，但通常推荐

@@ -1,8 +1,14 @@
 /*
  * php_glue.c — C 胶水层实现
  *
- * 将 Zend Engine 的语句级宏封装为普通 C 函数，
- * 供 Zig extern fn 直接调用。
+ * 将 Zend Engine 的语句级宏封装为普通 C 函数，供 Zig extern fn 直接调用。
+ *
+ * 阅读约定：本文件多数函数是「单行宏转发」，其语义由函数名自解释，
+ * 不加注释。注释只出现在存在非显然约束处——版本差异处理、指针有效期、
+ * 时序要求、以及为避免踩坑而刻意采取的写法。
+ *
+ * 对外契约（所有权、返回值语义、前置条件）统一写在 php_glue.h，
+ * 那边是调用方唯一需要读的文档；本文件只解释「为什么这样写」。
  */
 
 #include "php_glue.h"
@@ -116,6 +122,8 @@ int phpglue_hash_index_del(zend_array *ht, zend_ulong idx) { return zend_hash_in
 
 void phpglue_hash_internal_pointer_reset(zend_array *ht) { zend_hash_internal_pointer_reset(ht); }
 int  phpglue_hash_move_forward(zend_array *ht)           { return zend_hash_move_forward(ht); }
+/* 空表时 zend_hash_get_current_data 仍可能返回末次残留的指针，
+ * 故显式判空后再取——否则调用方会读到已删除元素的位置。 */
 zval *phpglue_hash_get_current_data(zend_array *ht)      {
     if (zend_hash_num_elements(ht) == 0) return NULL;
     return zend_hash_get_current_data(ht);
@@ -136,6 +144,8 @@ int phpglue_array_pop(zval *zv, zval *retval) {
 
 /* — 数组高级操作 — */
 
+/* array_shift 复用哈希表的内部指针来定位首元素（PHP 官方实现同此做法）。
+ * 内部指针是数组自身状态，故嵌套遍历同一数组时调用本函数会打乱外层遍历。 */
 int phpglue_array_shift(zval *zv, zval *retval) {
     HashTable *ht = Z_ARRVAL_P(zv);
     if (zend_hash_num_elements(ht) == 0) return 0;
@@ -960,6 +970,7 @@ static phpglue_observer_declared_fn     g_obs_class_linked = NULL;
 static phpglue_observer_fiber_init_fn   g_obs_fiber_init = NULL;
 static phpglue_observer_fiber_switch_fn g_obs_fiber_switch = NULL;
 static phpglue_observer_fiber_destroy_fn g_obs_fiber_destroy = NULL;
+static phpglue_observer_fcall_filter_fn  g_obs_fcall_filter = NULL;
 
 /* —— fcall begin/end trampoline —— */
 
@@ -971,11 +982,40 @@ static void phpglue_observer_fcall_end_trampoline(zend_execute_data *execute_dat
     if (g_obs_fcall_end) g_obs_fcall_end(execute_data, retval);
 }
 
-/* fcall init 回调：若注册了 begin/end 则观察全部函数。
- * 定位为「集中式代理」——无条件汇聚，下游自行决定是否处理。 */
+/* fcall init：每个函数首次执行前调用一次，返回值被引擎缓存。
+ *
+ * 返回 {NULL, NULL} 时引擎写入 ZEND_OBSERVER_NONE_OBSERVED 到该函数
+ * 的 observer 槽位，此后调用完全不进入 observer —— 这是 Zend 官方的
+ * 过滤机制，把「观察哪些函数」的判定从每次调用降为每函数一次。
+ * 故未注册 filter 时保持无条件观察（向后兼容），注册后则按 filter 结果。 */
 static zend_observer_fcall_handlers phpglue_observer_fcall_init(zend_execute_data *execute_data) {
-    (void) execute_data;
     zend_observer_fcall_handlers handlers = {NULL, NULL};
+
+    if (g_obs_fcall_filter) {
+        zend_function *func = execute_data ? execute_data->func : NULL;
+        const char *name = NULL;
+        size_t name_len = 0;
+        const char *scope = NULL;
+        size_t scope_len = 0;
+
+        if (func) {
+            if (func->common.function_name) {
+                name = ZSTR_VAL(func->common.function_name);
+                name_len = ZSTR_LEN(func->common.function_name);
+            }
+            if (func->common.scope && func->common.scope->name) {
+                scope = ZSTR_VAL(func->common.scope->name);
+                scope_len = ZSTR_LEN(func->common.scope->name);
+            }
+        }
+        /* 匿名函数无 function_name，交给 filter 以空名判定，不在此处替它决定 */
+        if (!g_obs_fcall_filter(name ? name : "", name_len,
+                                scope, scope ? scope_len : 0,
+                                func && !ZEND_USER_CODE(func->type))) {
+            return handlers;
+        }
+    }
+
     if (g_obs_fcall_begin) handlers.begin = phpglue_observer_fcall_begin_trampoline;
     if (g_obs_fcall_end)   handlers.end   = phpglue_observer_fcall_end_trampoline;
     return handlers;
@@ -996,13 +1036,11 @@ static void phpglue_observer_error_trampoline(int type, zend_string *error_filen
 /* —— function_declared / class_linked trampoline —— */
 
 static void phpglue_observer_function_declared_trampoline(zend_op_array *op_array, zend_string *name) {
-    (void) op_array;
-    if (g_obs_function_declared) g_obs_function_declared(ZSTR_VAL(name), ZSTR_LEN(name));
+    if (g_obs_function_declared) g_obs_function_declared(ZSTR_VAL(name), ZSTR_LEN(name), (void *) op_array);
 }
 
 static void phpglue_observer_class_linked_trampoline(zend_class_entry *ce, zend_string *name) {
-    (void) ce;
-    if (g_obs_class_linked) g_obs_class_linked(ZSTR_VAL(name), ZSTR_LEN(name));
+    if (g_obs_class_linked) g_obs_class_linked(ZSTR_VAL(name), ZSTR_LEN(name), (void *) ce);
 }
 
 /* —— fiber init/switch/destroy trampoline：context → status —— */
@@ -1029,7 +1067,8 @@ void phpglue_observer_register(
     phpglue_observer_declared_fn class_linked,
     phpglue_observer_fiber_init_fn fiber_init,
     phpglue_observer_fiber_switch_fn fiber_switch,
-    phpglue_observer_fiber_destroy_fn fiber_destroy
+    phpglue_observer_fiber_destroy_fn fiber_destroy,
+    phpglue_observer_fcall_filter_fn fcall_filter
 ) {
     g_obs_fcall_begin = fcall_begin;
     g_obs_fcall_end = fcall_end;
@@ -1039,6 +1078,7 @@ void phpglue_observer_register(
     g_obs_fiber_init = fiber_init;
     g_obs_fiber_switch = fiber_switch;
     g_obs_fiber_destroy = fiber_destroy;
+    g_obs_fcall_filter = fcall_filter;
 
     if (fcall_begin || fcall_end) {
         zend_observer_fcall_register(phpglue_observer_fcall_init);
@@ -1073,4 +1113,67 @@ const char *phpglue_observer_func_name(zend_execute_data *execute_data, size_t *
     }
     if (len) *len = ZSTR_LEN(func->common.function_name);
     return ZSTR_VAL(func->common.function_name);
+}
+
+/* —— 被观察函数的自身信息 —— */
+
+void phpglue_observer_func_info(zend_execute_data *execute_data, phpglue_observer_func_info_t *out) {
+    out->func_name = NULL;  out->func_name_len = 0;
+    out->scope_name = NULL; out->scope_name_len = 0;
+    out->filename = NULL;   out->filename_len = 0;
+    out->lineno = 0;
+    out->internal = 0;
+    out->is_method = 0;
+    out->num_args = 0;
+
+    zend_function *func = execute_data ? execute_data->func : NULL;
+    if (!func) return;
+
+    if (func->common.function_name) {
+        out->func_name = ZSTR_VAL(func->common.function_name);
+        out->func_name_len = ZSTR_LEN(func->common.function_name);
+    }
+    if (func->common.scope) {
+        out->is_method = 1;
+        if (func->common.scope->name) {
+            out->scope_name = ZSTR_VAL(func->common.scope->name);
+            out->scope_name_len = ZSTR_LEN(func->common.scope->name);
+        }
+    }
+    /* 内部函数没有 op_array，filename/line_start 对其无意义 */
+    if (ZEND_USER_CODE(func->type)) {
+        if (func->op_array.filename) {
+            out->filename = ZSTR_VAL(func->op_array.filename);
+            out->filename_len = ZSTR_LEN(func->op_array.filename);
+        }
+        out->lineno = func->op_array.line_start;
+    } else {
+        out->internal = 1;
+    }
+    /* num_args 的存放位置跨版本变过（PHP 7 编码在 call_info 低 16 位，
+     * 8.x 改为 This.u2.num_args），必须用宏而非直接位运算 */
+    out->num_args = ZEND_CALL_NUM_ARGS(execute_data);
+}
+
+/* —— 调用点位置（取自 prev_execute_data，即「谁调用了我」）—— */
+
+void phpglue_observer_call_site(zend_execute_data *execute_data,
+    const char **file, size_t *file_len, uint32_t *lineno) {
+    *file = NULL;
+    if (file_len) *file_len = 0;
+    *lineno = 0;
+
+    zend_execute_data *prev = execute_data ? execute_data->prev_execute_data : NULL;
+    if (!prev || !prev->func) return;
+
+    /* 调用者是内部函数时无 op_array，取不到 PHP 源码位置 */
+    if (!ZEND_USER_CODE(prev->func->type)) return;
+
+    if (prev->func->op_array.filename) {
+        *file = ZSTR_VAL(prev->func->op_array.filename);
+        if (file_len) *file_len = ZSTR_LEN(prev->func->op_array.filename);
+    }
+    /* prev->opline 在调用发生时指向发起调用的指令（DO_FCALL 等），
+     * 其 lineno 即调用点行号 */
+    if (prev->opline) *lineno = prev->opline->lineno;
 }

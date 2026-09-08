@@ -21,6 +21,12 @@ $passed = 0;
 $failed = 0;
 $skipped = 0;
 
+// 供 Observer 补强测试使用：必须是 PHP 用户函数（与扩展提供的内部函数对照），
+// 且参数个数固定为 3 以便断言 num_args
+function obs_user_fn($a = null, $b = null, $c = null) {
+    return 1;
+}
+
 function test(string $name, $expected, $actual): void {
     global $passed, $failed;
     if ($expected === $actual) {
@@ -554,6 +560,46 @@ test('fiber_init 观察已触发（创建+启动）', true, $fiberInitAfter > $f
 test('fiber_switch 观察已触发（start 挂起切换）', true, $fiberSwitchAfter > $fiberSwitchBefore);
 $obsFiber->resume('done');
 test('fiber 观察回调不影响 fiber 正常执行', 'done', hello_fiber_get_return($obsFiber));
+
+// ============================================================
+// 28. v0.9.4 — Observer 补强：现场信息 + 过滤下推
+// ============================================================
+echo "\n=== 28. v0.9.4 Observer 补强 ===\n";
+
+// P0：declared / class_linked 拿回 op_array / ce 句柄（此前被主动丢弃）
+hello_obs_reset();
+eval('function obs_handle_fn() {} class ObsHandleClass {}');
+test('function_declared 拿到 op_array 句柄', true, hello_obs_declared_handle() >= 1);
+test('class_linked 拿到 ce 句柄', true, hello_obs_linked_handle() >= 1);
+
+// P1：过滤下推——只观察 hello_world，其它函数不得进入 begin 回调。
+// 这里用「非目标函数被观察到的次数必须为 0」的结构断言，而非弱断言。
+hello_obs_reset();
+hello_world();                 // 目标函数，应被观察
+strlen('abc');                 // 非目标内部函数，应被拦截
+hello_obs_seen_target();       // 非目标用户函数，应被拦截
+test('过滤：目标函数 hello_world 被观察', 1, hello_obs_seen_target());
+test('过滤：非目标函数从未进入回调（结构断言）', 0, hello_obs_seen_other());
+
+// P0：现场信息——内部函数分支（hello_world 由扩展提供，属内部函数）
+hello_obs_reset();
+hello_world();
+test('funcInfo 识别内部函数（internal=true）', true, hello_obs_info_internal());
+test('funcInfo 内部函数无定义行号（lineno=0）', 0, hello_obs_info_lineno());
+test('funcInfo 参数个数为 0（hello_world 无参）', 0, hello_obs_info_num_args());
+
+// P0：现场信息——用户函数分支（obs_user_fn 由 PHP 定义）
+hello_obs_reset();
+obs_user_fn(1, 2, 3);
+test('funcInfo 识别用户函数（internal=false）', false, hello_obs_info_internal());
+test('funcInfo 取到用户函数定义行号', true, hello_obs_info_lineno() > 0);
+test('funcInfo 参数个数为 3', 3, hello_obs_info_num_args());
+
+// P0：调用点——callSite 应定位到 PHP 源码里的调用行
+hello_obs_reset();
+hello_world();                 // ← 这一行就是调用点
+$expectedLine = __LINE__ - 1;  // 上一行即调用发生处
+test('callSite 定位到 PHP 调用点行号', $expectedLine, hello_obs_call_lineno());
 
 // ============================================================
 // 结果汇总

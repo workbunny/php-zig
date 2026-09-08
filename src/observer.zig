@@ -35,6 +35,8 @@ pub const Config = struct {
     fiber_init: ?c.ObserverFiberInitFn = null,
     fiber_switch: ?c.ObserverFiberSwitchFn = null,
     fiber_destroy: ?c.ObserverFiberDestroyFn = null,
+    /// 只观察感兴趣的函数。null 表示观察全部（与未设 filter 时行为一致）。
+    fcall_filter: ?c.ObserverFcallFilterFn = null,
 };
 
 /// 注册全部观察点（须在 MINIT 阶段调用一次）
@@ -48,6 +50,7 @@ pub fn register(cfg: Config) void {
         cfg.fiber_init,
         cfg.fiber_switch,
         cfg.fiber_destroy,
+        cfg.fcall_filter,
     );
 }
 
@@ -56,4 +59,52 @@ pub fn funcName(execute_data: *T.ZendExecuteData) ?[]const u8 {
     var len: usize = 0;
     const ptr = c.phpglue_observer_func_name(execute_data, &len) orelse return null;
     return ptr[0..len];
+}
+
+/// 被观察函数自身的信息快照（一次性取全，避免多次跨 ABI 调用取到不一致状态）
+pub const FuncInfo = struct {
+    /// 函数名；匿名函数/闭包无函数名时为 null
+    func_name: ?[]const u8,
+    /// 方法所属类名；非方法为 null
+    scope_name: ?[]const u8,
+    /// 定义所在文件；内部函数（C 实现）为 null
+    filename: ?[]const u8,
+    /// 定义行号；内部函数为 0
+    lineno: u32,
+    /// 内部函数（C 实现）为 true，用户函数（PHP 实现）为 false
+    internal: bool,
+    is_method: bool,
+    /// 本次调用传入的参数个数
+    num_args: u32,
+};
+
+/// 提取被观察函数自身信息（仅 fcall begin/end 回调内有效）。
+/// 取的是**被调函数的定义位置**；要定位「谁调用了我」用 `callSite`。
+pub fn funcInfo(execute_data: *T.ZendExecuteData) FuncInfo {
+    var raw: c.ObserverFuncInfo = undefined;
+    c.phpglue_observer_func_info(execute_data, &raw);
+    return .{
+        .func_name = slice(raw.func_name, raw.func_name_len),
+        .scope_name = slice(raw.scope_name, raw.scope_name_len),
+        .filename = slice(raw.filename, raw.filename_len),
+        .lineno = raw.lineno,
+        .internal = raw.internal != 0,
+        .is_method = raw.is_method != 0,
+        .num_args = raw.num_args,
+    };
+}
+
+/// 调用点位置——「谁调用了我」，取自 prev_execute_data。
+/// 顶层调用（无调用者）或调用者为内部函数时 file 为 null、lineno 为 0。
+pub fn callSite(execute_data: *T.ZendExecuteData) struct { file: ?[]const u8, lineno: u32 } {
+    var file: ?[*:0]const u8 = null;
+    var file_len: usize = 0;
+    var lineno: u32 = 0;
+    c.phpglue_observer_call_site(execute_data, &file, &file_len, &lineno);
+    return .{ .file = slice(file, file_len), .lineno = lineno };
+}
+
+fn slice(ptr: ?[*:0]const u8, len: usize) ?[]const u8 {
+    const p = ptr orelse return null;
+    return p[0..len];
 }

@@ -382,19 +382,97 @@ const ini = &.{ IniEntry.createLong("myext.max_len", "1024") };
 
 ## Observer 观察者（observer.zig）
 
+集中式观察代理，在 MINIT 一次性静态注册，请求期内不变。观察是**旁路**——不拦截执行。
+
+在 `ModuleOptions` / `ModuleMeta` 中设 `observer` 字段即可自动注册：
+
 ```zig
-const cfg = php.ObserverConfig{
-    .error = php.ObserverConfig.Mode.disabled, // 启用则记录错误回溯
-};
+comptime {
+    phpzig.moduleInit(@This(), .{
+        .name = "monitor",
+        .version = "1.0.0",
+        .observer = .{
+            .fcall_begin = onFcallBegin,
+            .fcall_filter = onFcallFilter,   // 只观察关心的函数
+            .@"error" = onError,             // error 是 Zig 保留字
+        },
+    });
+}
 ```
 
-| 类型/函数 | 说明 |
-|---|---|
-| `Config` | 观察点配置（`error` 字段等） |
-| `register(cfg)` | MINIT 一次性注册观察点 |
-| `funcName(execute_data)` | 取当前函数名 |
+### 观察点
 
-> 在 `ModuleOptions` / `ModuleMeta` 中设 `observer` 字段即可在 MINIT 自动注册。
+| 字段 | 签名 | 触发时机 |
+|---|---|---|
+| `fcall_begin` | `fn (*ZendExecuteData) void` | 函数调用进入 |
+| `fcall_end` | `fn (*ZendExecuteData, *Zval) void` | 函数调用返回 |
+| `fcall_filter` | `fn (name, scope, internal) c_int` | 每个函数**首次执行前**一次 |
+| `@"error"` | `fn (type, filename, lineno, message) void` | 错误/警告 |
+| `function_declared` | `fn (name, handle) void` | 函数声明（handle = `zend_op_array*`） |
+| `class_linked` | `fn (name, handle) void` | 类链接（handle = `zend_class_entry*`） |
+| `fiber_init` / `fiber_switch` / `fiber_destroy` | `fn (status...) void` | Fiber 生命周期 |
+
+各字段可独立为 `null`，`null` 表示不观察该类。
+
+### 查询函数（仅 fcall begin/end 回调内有效）
+
+| 函数 | 说明 |
+|---|---|
+| `funcName(execute_data)` | 当前函数名 |
+| `funcInfo(execute_data)` | 被调函数自身信息（一次取全） |
+| `callSite(execute_data)` | **调用点**位置（谁调用了我） |
+
+`execute_data` 及由此取出的指针只在回调执行期间有效，**不得缓存到回调之外**。
+
+### 过滤：只观察关心的函数
+
+不设 `fcall_filter` 时观察全部函数——每个 PHP 函数调用都要付一次回调开销，
+写监控/采样时通常不划算。设了 filter 后，引擎会把判定结果缓存进该函数的
+observer 槽位，未放行的函数此后完全不进入 observer。
+
+```zig
+fn onFcallFilter(
+    name: [*c]const u8, name_len: usize,
+    scope: ?[*:0]const u8, scope_len: usize,
+    internal: c_int,
+) callconv(.c) c_int {
+    const n: []const u8 = if (name != null) name[0..name_len] else "";
+    // 返回非 0 = 观察，0 = 不观察
+    return if (std.mem.eql(u8, n, "hello_world")) 1 else 0;
+}
+```
+
+`scope` 为 `null` 表示非方法；`internal` 非 0 表示内部函数（C 实现）。
+匿名函数没有函数名，会以空名传入，是否放行由 filter 自行决定。
+
+**filter 对每个函数只调用一次**，故可放心在其中做字符串比较——但别做重活。
+
+### 现场信息
+
+```zig
+fn onFcallBegin(execute_data: *phpzig.ZendExecuteData) callconv(.c) void {
+    const info = phpzig.Observer.funcInfo(execute_data);
+    // info.func_name / scope_name / filename
+    // info.lineno     定义行号（内部函数为 0）
+    // info.internal   内部函数（C 实现）为 true
+    // info.is_method
+    // info.num_args   本次调用传入的参数个数
+
+    const site = phpzig.Observer.callSite(execute_data);
+    // site.file / site.lineno —— 调用发生的位置，不是被调函数的定义位置
+}
+```
+
+`funcInfo` 取的是**被调函数的定义位置**，`callSite` 取的是**调用发生的位置**，
+两者语义不同，按需取用。内部函数没有 PHP 源码位置，故 `filename` 为 `null`、
+`lineno` 为 0。顶层调用无调用者时 `callSite` 的 `file` 为 `null`。
+
+### function_declared / class_linked 的 handle
+
+`handle` 是不透明指针（`?*anyopaque`），分别为 `zend_op_array*` 与
+`zend_class_entry*`。php-zig 刻意不解释其内容——这两个结构体的内存布局跨 PHP
+版本变化，一旦在 Zig 侧按结构解读就会引入版本耦合。需要访问内部字段时，自行
+在 C 胶水层解析。
 
 ---
 

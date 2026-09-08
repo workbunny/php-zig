@@ -728,6 +728,55 @@ var obs_fiber_destroy_count: i64 = 0;
 var obs_last_func: [128]u8 = undefined;
 var obs_last_func_len: usize = 0;
 
+// ＝＝ v0.9.4 — Observer 补强：现场信息 + 过滤下推 ＝＝
+//
+// 过滤的验证必须走「结构断言」：非目标函数的 begin 回调应**从未**被调用，
+// 而不是「跑完没报错」。用单独的 seen 计数器把目标与非目标区分开。
+
+var obs_declared_handle_nonnull: i64 = 0; // function_declared 拿到的 op_array 句柄数
+var obs_linked_handle_nonnull: i64 = 0; // class_linked 拿到的 ce 句柄数
+var obs_seen_target: i64 = 0; // 被 filter 放行的函数调用次数
+var obs_seen_other: i64 = 0; // 被 filter 拦截却仍进入回调的次数（应为 0）
+var obs_last_info_lineno: u32 = 0; // 最近一次 funcInfo 的定义行号
+var obs_last_internal: bool = false; // 最近一次 funcInfo 的 internal 标志
+var obs_last_num_args: u32 = 0; // 最近一次 funcInfo 的参数个数
+var obs_last_call_lineno: u32 = 0; // 最近一次 callSite 的调用点行号
+
+// 只观察 hello_world（内部函数）与 obs_user_fn（用户函数）。
+// filter 对每个函数只调用一次，结果被引擎缓存进该函数的 observer 槽位。
+fn obsFcallFilter(name: [*c]const u8, name_len: usize, _: ?[*:0]const u8, _: usize, _: c_int) callconv(.c) c_int {
+    const n: []const u8 = if (name != null) name[0..name_len] else "";
+    return if (std.mem.eql(u8, n, "hello_world") or std.mem.eql(u8, n, "obs_user_fn")) 1 else 0;
+}
+
+fn obsInfoBegin(execute_data: *T.ZendExecuteData) callconv(.c) void {
+    // 一个 observer 只能挂一个 begin，故本回调同时承担计数/记名（27 节）与
+    // 取现场信息（28 节）两套职责
+    obs_fcall_begin_count += 1;
+    if (phpzig.Observer.funcName(execute_data)) |name| {
+        if (name.len <= obs_last_func.len) {
+            @memcpy(obs_last_func[0..name.len], name);
+            obs_last_func_len = name.len;
+        }
+    }
+
+    const info = phpzig.Observer.funcInfo(execute_data);
+    obs_last_info_lineno = info.lineno;
+    obs_last_internal = info.internal;
+    obs_last_num_args = info.num_args;
+    obs_last_call_lineno = phpzig.Observer.callSite(execute_data).lineno;
+
+    if (info.func_name) |n| {
+        if (std.mem.eql(u8, n, "hello_world")) {
+            obs_seen_target += 1;
+        } else {
+            obs_seen_other += 1;
+        }
+    } else {
+        obs_seen_other += 1;
+    }
+}
+
 fn obsFcallBegin(execute_data: *T.ZendExecuteData) callconv(.c) void {
     obs_fcall_begin_count += 1;
     if (phpzig.Observer.funcName(execute_data)) |name| {
@@ -754,16 +803,15 @@ fn obsError(type_: c_int, filename: [*c]const u8, filename_len: usize, lineno: u
     obs_last_error_type = type_;
 }
 
-fn obsFunctionDeclared(name: [*c]const u8, name_len: usize) callconv(.c) void {
-    _ = name;
-    _ = name_len;
+fn obsFunctionDeclared(_: [*c]const u8, _: usize, handle: ?*anyopaque) callconv(.c) void {
     obs_func_declared_count += 1;
+    // op_array 句柄必须非 null，否则「补回 op_array」这项补强等于没做
+    if (handle != null) obs_declared_handle_nonnull += 1;
 }
 
-fn obsClassLinked(name: [*c]const u8, name_len: usize) callconv(.c) void {
-    _ = name;
-    _ = name_len;
+fn obsClassLinked(_: [*c]const u8, _: usize, handle: ?*anyopaque) callconv(.c) void {
     obs_class_linked_count += 1;
+    if (handle != null) obs_linked_handle_nonnull += 1;
 }
 
 fn obsFiberInit(status: c_int) callconv(.c) void {
@@ -795,6 +843,14 @@ fn helloObsReset(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void
     obs_fiber_switch_count = 0;
     obs_fiber_destroy_count = 0;
     obs_last_func_len = 0;
+    obs_declared_handle_nonnull = 0;
+    obs_linked_handle_nonnull = 0;
+    obs_seen_target = 0;
+    obs_seen_other = 0;
+    obs_last_info_lineno = 0;
+    obs_last_internal = false;
+    obs_last_num_args = 0;
+    obs_last_call_lineno = 0;
     phpzig.Return.returnBool(return_value, true);
 }
 
@@ -827,6 +883,30 @@ fn helloObsFiberDestroy(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
 }
 fn helloObsLastFunc(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
     phpzig.Return.returnString(return_value, obs_last_func[0..obs_last_func_len]);
+}
+fn helloObsDeclaredHandle(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_declared_handle_nonnull);
+}
+fn helloObsLinkedHandle(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_linked_handle_nonnull);
+}
+fn helloObsSeenTarget(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_seen_target);
+}
+fn helloObsSeenOther(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, obs_seen_other);
+}
+fn helloObsInfoLineno(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, @intCast(obs_last_info_lineno));
+}
+fn helloObsInfoInternal(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnBool(return_value, obs_last_internal);
+}
+fn helloObsInfoNumArgs(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, @intCast(obs_last_num_args));
+}
+fn helloObsCallLineno(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(return_value, @intCast(obs_last_call_lineno));
 }
 
 // ＝＝ OOP — 类属性 + 继承 + 构造器 + 访问修饰符 ＝＝
@@ -965,6 +1045,15 @@ comptime {
             phpzig.FunctionDesc.create("hello_obs_begin_count", helloObsBeginCount),
             phpzig.FunctionDesc.create("hello_obs_end_count", helloObsEndCount),
             phpzig.FunctionDesc.create("hello_obs_error_count", helloObsErrorCount),
+            // v0.9.4：Observer 补强（现场信息 + 过滤下推）
+            phpzig.FunctionDesc.create("hello_obs_declared_handle", helloObsDeclaredHandle),
+            phpzig.FunctionDesc.create("hello_obs_linked_handle", helloObsLinkedHandle),
+            phpzig.FunctionDesc.create("hello_obs_seen_target", helloObsSeenTarget),
+            phpzig.FunctionDesc.create("hello_obs_seen_other", helloObsSeenOther),
+            phpzig.FunctionDesc.create("hello_obs_info_lineno", helloObsInfoLineno),
+            phpzig.FunctionDesc.create("hello_obs_info_internal", helloObsInfoInternal),
+            phpzig.FunctionDesc.create("hello_obs_info_num_args", helloObsInfoNumArgs),
+            phpzig.FunctionDesc.create("hello_obs_call_lineno", helloObsCallLineno),
             phpzig.FunctionDesc.create("hello_obs_error_type", helloObsErrorType),
             phpzig.FunctionDesc.create("hello_obs_func_declared", helloObsFuncDeclared),
             phpzig.FunctionDesc.create("hello_obs_class_linked", helloObsClassLinked),
@@ -1038,11 +1127,12 @@ comptime {
         },
         .info_func = helloInfo,
         .observer = .{
-            .fcall_begin = obsFcallBegin,
+            .fcall_begin = obsInfoBegin,
             .fcall_end = obsFcallEnd,
             .@"error" = obsError,
             .function_declared = obsFunctionDeclared,
             .class_linked = obsClassLinked,
+            .fcall_filter = obsFcallFilter,
             .fiber_init = obsFiberInit,
             .fiber_switch = obsFiberSwitch,
             .fiber_destroy = obsFiberDestroy,

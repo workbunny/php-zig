@@ -270,10 +270,32 @@ pub extern fn phpglue_fiber_create(callable: *T.Zval, rv: *T.Zval) c_int;
 pub const ObserverFcallBeginFn = *const fn (execute_data: *T.ZendExecuteData) callconv(.c) void;
 pub const ObserverFcallEndFn = *const fn (execute_data: *T.ZendExecuteData, retval: *T.Zval) callconv(.c) void;
 pub const ObserverErrorFn = *const fn (type_: c_int, filename: [*c]const u8, filename_len: usize, lineno: u32, message: [*c]const u8, message_len: usize) callconv(.c) void;
-pub const ObserverDeclaredFn = *const fn (name: [*c]const u8, name_len: usize) callconv(.c) void;
+
+/// handle 为不透明指针：function_declared 时是 zend_op_array*，class_linked 时是
+/// zend_class_entry*。C 侧不解释其内容，Zig 侧同样只作透传——两者的内存布局
+/// 跨 PHP 版本变化，一旦在 Zig 侧按结构解读就会引入版本耦合。
+pub const ObserverDeclaredFn = *const fn (name: [*c]const u8, name_len: usize, handle: ?*anyopaque) callconv(.c) void;
+
 pub const ObserverFiberInitFn = *const fn (status: c_int) callconv(.c) void;
 pub const ObserverFiberSwitchFn = *const fn (from_status: c_int, to_status: c_int) callconv(.c) void;
 pub const ObserverFiberDestroyFn = *const fn (status: c_int) callconv(.c) void;
+
+/// 返回非零表示观察该函数，返回 0 表示不观察。
+/// scope 为 NULL 表示非方法（普通函数或内部函数）。
+pub const ObserverFcallFilterFn = *const fn (name: [*c]const u8, name_len: usize, scope: ?[*:0]const u8, scope_len: usize, internal: c_int) callconv(.c) c_int;
+
+pub const ObserverFuncInfo = extern struct {
+    func_name: ?[*:0]const u8,
+    func_name_len: usize,
+    scope_name: ?[*:0]const u8,
+    scope_name_len: usize,
+    filename: ?[*:0]const u8,
+    filename_len: usize,
+    lineno: u32,
+    internal: c_int,
+    is_method: c_int,
+    num_args: u32,
+};
 
 pub extern fn phpglue_observer_register(
     fcall_begin: ?ObserverFcallBeginFn,
@@ -284,5 +306,8 @@ pub extern fn phpglue_observer_register(
     fiber_init: ?ObserverFiberInitFn,
     fiber_switch: ?ObserverFiberSwitchFn,
     fiber_destroy: ?ObserverFiberDestroyFn,
+    fcall_filter: ?ObserverFcallFilterFn,
 ) void;
 pub extern fn phpglue_observer_func_name(execute_data: *T.ZendExecuteData, len: *usize) ?[*:0]const u8;
+pub extern fn phpglue_observer_func_info(execute_data: *T.ZendExecuteData, out: *ObserverFuncInfo) void;
+pub extern fn phpglue_observer_call_site(execute_data: *T.ZendExecuteData, file: *?[*:0]const u8, file_len: *usize, lineno: *u32) void;

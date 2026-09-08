@@ -1044,6 +1044,7 @@ pub fn Module(comptime opts: ModuleOptions) type {
                     obs.fiber_init,
                     obs.fiber_switch,
                     obs.fiber_destroy,
+                    obs.fcall_filter,
                 );
             }
             initClassMethodEntries();

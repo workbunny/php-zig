@@ -171,29 +171,40 @@ fn detectMsvc(b: *std.Build, arch: std.Target.Cpu.Arch) bool {
     return sdk.msvc_lib_dir != null;
 }
 
+/// 从 php_config.h 全文判断是否 ZTS。
+/// configure 对 ZTS 的两种产出形态不对称：
+///   ZTS: `#define ZTS 1`
+///   NTS: `/* #undef ZTS */`
+/// NTS 那行是注释但仍含 "ZTS" 子串，故必须匹配 `#define` 前缀，否则恒为 true。
+fn detectZts(content: []const u8) bool {
+    return std.mem.indexOf(u8, content, "#define ZTS 1") != null;
+}
+
 fn detectUnixSdk(b: *std.Build, php_prefix: []const u8) DetectedSdk {
     const content = readConfigFile(b, b.pathJoin(&.{ php_prefix, "include/php/main/php_config.h" }));
 
     // PHP_OS 由 configure 写入 `uname` 输出（configure.ac: PHP_OS=$(uname | xargs)）：
     // macOS 上为 "Darwin"，Linux 上为 "Linux"。据此分流平台。
     const php_os = extractDefineString(content, "PHP_OS") orelse "";
+    const zts = detectZts(content);
+
     if (std.mem.indexOf(u8, php_os, "Darwin") != null) {
         std.debug.print(
-            \\php-zig: 识别到 macOS php（Darwin libSystem）
+            \\php-zig: 识别到 macOS php（Darwin libSystem，{s}）
             \\
-        , .{});
-        return .{ .platform = .darwin, .arch = builtin.cpu.arch, .zts = false };
+        , .{if (zts) "ZTS" else "NTS"});
+        return .{ .platform = .darwin, .arch = builtin.cpu.arch, .zts = zts };
     }
 
     // __MUSL__ 被 #undef → glibc；#define __MUSL__ 1 → musl
     const libc: Libc = if (std.mem.indexOf(u8, content, "#define __MUSL__ 1") != null) .musl else .glibc;
 
     std.debug.print(
-        \\php-zig: 识别到 Linux php-dev（libc = {s}）
+        \\php-zig: 识别到 Linux php-dev（libc = {s}，{s}）
         \\
-    , .{@tagName(libc)});
+    , .{ @tagName(libc), if (zts) "ZTS" else "NTS" });
 
-    return .{ .platform = .linux, .arch = builtin.cpu.arch, .zts = false, .libc = libc };
+    return .{ .platform = .linux, .arch = builtin.cpu.arch, .zts = zts, .libc = libc };
 }
 
 /// 判断文件是否存在
@@ -301,10 +312,13 @@ pub fn addPhpExtension(
         ext_module.addCMacro("PHP_WIN32", "1");
         ext_module.addCMacro("WIN32", "1");
         ext_module.addCMacro("_MBCS", "1");
-        // ZTS 宏对齐：ZTS 版 devel-pack 需定义 ZTS
-        if (sdk.zts) {
-            ext_module.addCMacro("ZTS", "1");
-        }
+    }
+
+    // ZTS 宏对齐：ZTS 版 PHP 必须定义 ZTS，否则 PHP 头文件按 NTS 展开——
+    // 多个 Zend 结构体在 ZTS 下多出 TSRM 相关字段，布局不符会在运行期表现为
+    // 串字段而非编译错误，故此处是正确性前提而非可选项。
+    if (sdk.zts) {
+        ext_module.addCMacro("ZTS", "1");
     }
 
     // 6. 编译 C glue（随当前 PHP 头文件一起编译，保证 ABI 一致）
