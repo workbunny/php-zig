@@ -28,8 +28,9 @@ fn helloName(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
         return;
     }
     const name = arg.toStringVal();
-    // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）
-    const arena = phpzig.RequestArena.init();
+    // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）。
+    // init() 在 OOM 时抛 PHP 异常并返回 null，故用 orelse return 交给 PHP 传播
+    const arena = phpzig.RequestArena.init() orelse return;
     defer arena.deinit();
     const msg = std.fmt.allocPrint(arena.allocator(), "Hello, {s}!", .{name}) catch {
         phpzig.Return.returnNull(return_value);
@@ -216,8 +217,10 @@ fn helloPop(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c
     }
 
     var arr = phpzig.Array.fromZval(arg);
-    if (arr.pop()) |val| {
-        phpzig.Return.returnLong(return_value, val.toLong());
+    var out: T.Zval = undefined;
+    if (arr.pop(&out)) {
+        defer c.phpglue_zval_ptr_dtor(&out);
+        phpzig.Return.returnLong(return_value, phpzig.Zval.fromPtr(&out).toLong());
     } else {
         phpzig.Return.returnNull(return_value);
     }
@@ -316,7 +319,7 @@ fn helloFormat(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv
     const name = phpzig.Return.callArg(execute_data, 1);
     const age = phpzig.Return.callArg(execute_data, 2);
     // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）
-    const arena = phpzig.RequestArena.init();
+    const arena = phpzig.RequestArena.init() orelse return;
     defer arena.deinit();
     const msg = std.fmt.allocPrint(arena.allocator(), "{s} is {d} years old", .{ name.toStringVal(), age.toLong() }) catch {
         phpzig.Return.returnNull(return_value);
@@ -340,8 +343,10 @@ fn helloArrayShift(execute_data: *T.ZendExecuteData, return_value: *T.Zval) call
         return;
     }
     var arr = phpzig.Array.fromZval(arg);
-    if (arr.shift()) |val| {
-        phpzig.Return.returnLong(return_value, val.toLong());
+    var out: T.Zval = undefined;
+    if (arr.shift(&out)) {
+        defer c.phpglue_zval_ptr_dtor(&out);
+        phpzig.Return.returnLong(return_value, phpzig.Zval.fromPtr(&out).toLong());
     } else {
         phpzig.Return.returnNull(return_value);
     }
@@ -600,7 +605,7 @@ fn helloThrowDivisionByZero(_: *T.ZendExecuteData, return_value: *T.Zval) callco
 
 fn helloArenaSum(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
     // 实例化请求级 arena，自动注册 RSHUTDOWN 回收（bailout-safe）
-    const arena = phpzig.RequestArena.init();
+    const arena = phpzig.RequestArena.init() orelse return;
     defer arena.deinit(); // 正常路径提前释放（幂等）
 
     const a = arena.allocator();
@@ -909,6 +914,134 @@ fn helloObsCallLineno(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c)
     phpzig.Return.returnLong(return_value, @intCast(obs_last_call_lineno));
 }
 
+// ＝＝ 内存增长探针 —— 通用泄漏防线 ＝＝
+//
+// 泄漏在功能测试里不可见：单个用例只调一两次，泄漏几十字节淹没在请求池里。
+// 故用「循环 N 次后内存增量」来测——这是能一次性覆盖**所有**泄漏点的
+// 公共防线，比逐个函数补断言可靠。
+//
+// 每个探针都做真实工作（构造字符串、建数组、回调 PHP 函数），
+// 若对应路径有未释放的请求池分配，N 次循环后会线性放大到可观测。
+
+/// 循环 n 次构造并返回一个字符串（走 string_alloc + return_string_ptr）
+fn helloMemBuildString(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    var last: ?*T.ZendString = null;
+    var i: T.zend_long = 0;
+    while (i < n) : (i += 1) {
+        const s = c.phpglue_string_alloc(16) orelse break;
+        if (last) |l| c.phpglue_string_release(l);
+        last = s;
+    }
+    if (last) |l| {
+        c.phpglue_return_string_ptr(rv, l);
+    } else {
+        phpzig.Return.returnNull(rv);
+    }
+}
+
+/// 循环 n 次调用 PHP 函数 strlen（覆盖 PhpFunc.call1Str 的临时 zval 释放）
+fn helloMemCallPhpFunc(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    var total: T.zend_long = 0;
+    var i: T.zend_long = 0;
+    while (i < n) : (i += 1) {
+        var ret: T.Zval = undefined;
+        if (phpzig.PhpFunc.call1Str("strlen", &ret, "hello")) {
+            total += c.phpglue_zval_get_long(&ret);
+            c.phpglue_zval_ptr_dtor(&ret);
+        }
+    }
+    phpzig.Return.returnLong(rv, total);
+}
+
+/// 循环 n 次建数组 + pop（覆盖 Array.pop 的引用计数与释放路径）
+fn helloMemArrayPop(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    var total: T.zend_long = 0;
+    var i: T.zend_long = 0;
+    while (i < n) : (i += 1) {
+        var zv: T.Zval = undefined;
+        var arr = phpzig.Array.init(&zv);
+        defer c.phpglue_zval_ptr_dtor(&zv);
+
+        var j: T.zend_long = 0;
+        while (j < 4) : (j += 1) arr.appendLong(j);
+
+        var out: T.Zval = undefined;
+        if (arr.pop(&out)) {
+            total += c.phpglue_zval_get_long(&out);
+            c.phpglue_zval_ptr_dtor(&out);
+        }
+    }
+    phpzig.Return.returnLong(rv, total);
+}
+
+/// 循环 n 次关联数组写 + 读（覆盖 add_assoc_* 的键/值释放）
+// ＝＝ Zig 侧内存（RequestArena）监控与限额 ＝＝
+//
+// RequestArena 的 backing 是 c_allocator，不进 PHP 内存池、不受 memory_limit
+// 约束。进程可在 PHP 侧毫无感知的情况下逼近容器上限被 OOM killer 杀死，
+// 故必须可观测（usage/peak）且可约束（limit）。
+
+fn helloArenaUsage(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(rv, @intCast(phpzig.Arena.usage()));
+}
+fn helloArenaPeak(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(rv, @intCast(phpzig.Arena.peak()));
+}
+
+/// 循环分配 n 次 64 字节（不释放，由 RSHUTDOWN 回收），用于观察 usage 增长
+fn helloArenaFill(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    const arena = phpzig.RequestArena.init() orelse return;
+    const a = arena.allocator();
+    var total: T.zend_long = 0;
+    var i: T.zend_long = 0;
+    while (i < n) : (i += 1) {
+        const buf = a.alloc(u8, 64) catch break; // 限额开启时会在这里失败
+        buf[0] = 1;
+        total += 64;
+    }
+    phpzig.Return.returnLong(rv, total);
+}
+
+/// 设置限额（测试用）：limit 字节，0 = 不限；account_to_php 是否参与 PHP 额度
+fn helloArenaSetLimit(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const limit = phpzig.Return.callArg(ed, 1).toLong();
+    const account = phpzig.Return.callArg(ed, 2).toBool();
+    phpzig.Arena.configure(.{
+        .limit = @intCast(@max(0, limit)),
+        .account_to_php = account,
+        .check_interval = 4096, // 测试用小间隔，避免误差掩盖效果
+    });
+    phpzig.Return.returnBool(rv, true);
+}
+
+fn helloMemAssoc(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    var total: T.zend_long = 0;
+    var i: T.zend_long = 0;
+    while (i < n) : (i += 1) {
+        var zv: T.Zval = undefined;
+        var arr = phpzig.Array.init(&zv);
+        defer c.phpglue_zval_ptr_dtor(&zv);
+
+        var key_buf: [16]u8 = undefined;
+        var j: T.zend_long = 0;
+        while (j < 8) : (j += 1) {
+            const key = std.fmt.bufPrint(&key_buf, "k{d}", .{j}) catch continue;
+            arr.setAssocLong(key, j);
+        }
+        var k: T.zend_long = 0;
+        while (k < 8) : (k += 1) {
+            const key = std.fmt.bufPrint(&key_buf, "k{d}", .{k}) catch continue;
+            if (arr.find(key)) |v| total += v.toLong();
+        }
+    }
+    phpzig.Return.returnLong(rv, total);
+}
+
 // ＝＝ OOP — 类属性 + 继承 + 构造器 + 访问修饰符 ＝＝
 
 fn bankGetBalance(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -1057,6 +1190,16 @@ comptime {
             phpzig.FunctionDesc.create("hello_obs_error_type", helloObsErrorType),
             phpzig.FunctionDesc.create("hello_obs_func_declared", helloObsFuncDeclared),
             phpzig.FunctionDesc.create("hello_obs_class_linked", helloObsClassLinked),
+            // 内存增长探针（通用泄漏防线）
+            phpzig.FunctionDesc.create("hello_mem_build_string", helloMemBuildString),
+            phpzig.FunctionDesc.create("hello_mem_call_php_func", helloMemCallPhpFunc),
+            phpzig.FunctionDesc.create("hello_mem_array_pop", helloMemArrayPop),
+            phpzig.FunctionDesc.create("hello_mem_assoc", helloMemAssoc),
+            // Zig 侧内存监控与限额
+            phpzig.FunctionDesc.create("hello_arena_usage", helloArenaUsage),
+            phpzig.FunctionDesc.create("hello_arena_peak", helloArenaPeak),
+            phpzig.FunctionDesc.create("hello_arena_fill", helloArenaFill),
+            phpzig.FunctionDesc.create("hello_arena_set_limit", helloArenaSetLimit),
             phpzig.FunctionDesc.create("hello_obs_fiber_init", helloObsFiberInit),
             phpzig.FunctionDesc.create("hello_obs_fiber_switch", helloObsFiberSwitch),
             phpzig.FunctionDesc.create("hello_obs_fiber_destroy", helloObsFiberDestroy),
@@ -1188,7 +1331,7 @@ fn helloGreet(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(
         if (g.isString()) greeting = g.toStringVal();
     }
     // 临时字符串用请求级 arena（bailout-safe，避免 c_allocator 泄漏）
-    const arena = phpzig.RequestArena.init();
+    const arena = phpzig.RequestArena.init() orelse return;
     defer arena.deinit();
     const msg = std.fmt.allocPrint(arena.allocator(), "{s}, {s}!", .{ greeting, name.toStringVal() }) catch {
         phpzig.Return.returnNull(return_value);

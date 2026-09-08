@@ -602,6 +602,88 @@ $expectedLine = __LINE__ - 1;  // 上一行即调用发生处
 test('callSite 定位到 PHP 调用点行号', $expectedLine, hello_obs_call_lineno());
 
 // ============================================================
+// 29. 内存增长探针 —— 通用泄漏防线
+// ============================================================
+echo "\n=== 29. 内存增长（泄漏防线） ===\n";
+//
+// 背景：PhpFunc.call1Str 曾泄漏——构造的临时字符串 zval 从不释放。
+// 190 项功能测试全绿却没发现，因为每个用例只调一两次，泄漏几十字节
+// 淹没在请求池里；直到 benchmark 循环 30 万次才 OOM。
+//
+// 故此处用「循环 N 次后的内存增量」做断言——这是能覆盖**所有**泄漏点的
+// 公共防线。若某条 php-zig 路径漏了释放，循环会把它线性放大到可观测。
+//
+// 阈值取 64KB：覆盖临时变量的正常抖动，但远小于「每次泄漏一个字符串」
+// 应有的量级（5 万次 × 至少 32 字节 ≈ 1.6MB）。
+
+$N = 50000;
+$LEAK_BUDGET = 65536;    // 64 KB
+
+/**
+ * 测一个探针函数的内存增长。
+ * 先跑一轮预热（触发请求池首次分配、函数解析等一次性开销），
+ * 再取基线测量，避免把一次性开销误判为泄漏。
+ */
+function memProbe(string $fn, int $n, int $budget): void {
+    $fn(1);                                  // 预热
+    $before = memory_get_usage();
+    $fn($n);
+    $after = memory_get_usage();
+    $delta = $after - $before;
+
+    // 断言：增长必须低于预算。同时报告实际值以便定位。
+    $ok = $delta < $budget;
+    test("泄漏探针 {$fn}（{$n} 次）增长 " . number_format($delta) . "B < {$budget}B",
+         true, $ok);
+}
+
+memProbe('hello_mem_build_string', $N, $LEAK_BUDGET);
+memProbe('hello_mem_call_php_func', $N, $LEAK_BUDGET);
+memProbe('hello_mem_array_pop', $N, $LEAK_BUDGET);
+memProbe('hello_mem_assoc', $N, $LEAK_BUDGET);
+
+// 反向验证：确认这套探针**确实能**测出泄漏——否则它只是个永远为真的空断言。
+// 用 PHP 侧主动泄漏一个等量内存，断言增量超过预算，证明阈值设在有效区间。
+function leakControl(int $n): void {
+    static $sink = [];
+    for ($i = 0; $i < $n; $i++) {
+        $sink[] = str_repeat('x', 32);       // 主动持有，制造真实泄漏
+    }
+}
+$sinkBefore = memory_get_usage();
+leakControl($N);
+$sinkDelta = memory_get_usage() - $sinkBefore;
+test("反向验证：探针能测出真实泄漏（控制组增长 " . number_format($sinkDelta) . "B ≥ 预算）",
+     true, $sinkDelta >= $LEAK_BUDGET);
+
+// ============================================================
+// 30. Zig 侧内存（RequestArena）监控与限额
+// ============================================================
+echo "\n=== 30. Zig 侧内存监控与限额 ===\n";
+//
+// RequestArena 的 backing 是 c_allocator，不进 PHP 内存池、不受 memory_limit
+// 约束。若无监控，进程可在 PHP 侧毫无感知的情况下逼近容器上限被 OOM 杀死。
+
+// 可观测：全局计数应反映真实占用（跨实例累加）
+$arenaBefore = hello_arena_usage();
+hello_arena_fill(1000);          // 1000 × 64 字节 = 64KB，由 RSHUTDOWN 回收
+$arenaDuring = hello_arena_usage();
+test('arena usage 反映分配量', true, $arenaDuring - $arenaBefore >= 64000);
+test('arena peak 已记录', true, hello_arena_peak() >= $arenaDuring);
+
+// 可约束：限额开启后，超限分配应被拒绝（reject → 分配失败，不崩溃）
+// 注意：这里不设 PHP 侧额度核算（第二参 false），只测显式上限
+hello_arena_set_limit(65536, false);
+$got = hello_arena_fill(100000);   // 远超限额，应在中途停止
+test('限额生效：超限后分配被拒绝（未崩溃）', true, $got < 100000 * 64);
+test('限额生效：实际分配未超额度上限', true, $got <= 65536 + 65536);
+
+// 关闭限额后应恢复自由分配
+hello_arena_set_limit(0, false);
+$got2 = hello_arena_fill(2000);
+test('关闭限额后恢复分配', 128000, $got2);
+
+// ============================================================
 // 结果汇总
 // ============================================================
 $total = $passed + $failed;

@@ -14,9 +14,12 @@ pub fn call(name: []const u8, retval: *T.Zval, args: []const T.Zval) bool {
     return c.phpglue_call_func(name.ptr, name.len, retval, @intCast(args.len), args.ptr) != 0;
 }
 
+/// 用单个字符串参数调用。注意：构造的临时 zval 持有 PHP 请求池分配的
+/// 字符串，必须在本函数内释放——调用方拿不到它，无法代为回收。
 pub fn call1Str(name: []const u8, retval: *T.Zval, arg: []const u8) bool {
     var zv: T.Zval = undefined;
     c.phpglue_zval_set_stringl(&zv, arg.ptr, arg.len);
+    defer c.phpglue_zval_ptr_dtor(&zv);
     return call(name, retval, &.{zv});
 }
 
@@ -34,11 +37,14 @@ pub fn call2Long(name: []const u8, retval: *T.Zval, a: T.zend_long, b: T.zend_lo
     return call(name, retval, &.{ zv1, zv2 });
 }
 
+/// 用两个字符串参数调用。两个临时 zval 各持有一个请求池字符串，均须释放。
 pub fn call2Str(name: []const u8, retval: *T.Zval, a: []const u8, b: []const u8) bool {
     var zv1: T.Zval = undefined;
     var zv2: T.Zval = undefined;
     c.phpglue_zval_set_stringl(&zv1, a.ptr, a.len);
     c.phpglue_zval_set_stringl(&zv2, b.ptr, b.len);
+    defer c.phpglue_zval_ptr_dtor(&zv1);
+    defer c.phpglue_zval_ptr_dtor(&zv2);
     return call(name, retval, &.{ zv1, zv2 });
 }
 

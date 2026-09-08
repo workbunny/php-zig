@@ -75,6 +75,8 @@ uint8_t phpglue_zval_type(zval *zv);
  * 需要独立于 zval 存活的数据必须自行复制。
  * ================================================================ */
 
+/** 读 long 值。实现为 Z_LVAL_P（直接读字段），不做类型转换。
+ *  已是 Z_LVAL_P 语义，无需再提供 unchecked 变体。 */
 zend_long   phpglue_zval_get_long(zval *zv);
 double      phpglue_zval_get_double(zval *zv);
 const char *phpglue_zval_get_string_val(zval *zv);
@@ -148,14 +150,19 @@ void phpglue_add_index_bool(zval *zv, zend_ulong idx, bool v);
 void phpglue_add_index_null(zval *zv, zend_ulong idx);
 void phpglue_add_index_zval(zval *zv, zend_ulong idx, zval *val);
 
-/* — 按字符串键设值（关联数组） — */
+/* — 按字符串键设值（关联数组） —
+ *
+ * key 必须带长度：Zig 侧的 []const u8 不保证 NUL 结尾（std.fmt.bufPrint 的
+ * 返回值即如此），一旦内部走 strlen 就会越过切片末尾读到残留字节，
+ * 症状为键名错乱而非稳定报错。
+ */
 
-void phpglue_add_assoc_long(zval *zv, const char *key, zend_long v);
-void phpglue_add_assoc_double(zval *zv, const char *key, double v);
-void phpglue_add_assoc_stringl(zval *zv, const char *key, const char *s, size_t len);
-void phpglue_add_assoc_bool(zval *zv, const char *key, bool v);
-void phpglue_add_assoc_null(zval *zv, const char *key);
-void phpglue_add_assoc_zval(zval *zv, const char *key, zval *val);
+void phpglue_add_assoc_long(zval *zv, const char *key, size_t key_len, zend_long v);
+void phpglue_add_assoc_double(zval *zv, const char *key, size_t key_len, double v);
+void phpglue_add_assoc_stringl(zval *zv, const char *key, size_t key_len, const char *s, size_t len);
+void phpglue_add_assoc_bool(zval *zv, const char *key, size_t key_len, bool v);
+void phpglue_add_assoc_null(zval *zv, const char *key, size_t key_len);
+void phpglue_add_assoc_zval(zval *zv, const char *key, size_t key_len, zval *val);
 
 /* ================================================================
  * HashTable 操作 — 底层哈希表查询与遍历
@@ -322,6 +329,55 @@ void phpglue_throw_exception(const char *message, size_t message_len);
  *  成功返回 1，类不存在返回 0。message 按 message_len 复制（支持非 NUL 结尾）。 */
 int phpglue_throw_exception_class(const char *class_name, size_t class_len,
     const char *message, size_t message_len, zend_long code);
+
+/* ================================================================
+ * 字符串分配 / 异常状态
+ * ================================================================ */
+
+/** 用 PHP 请求池分配一个长度为 len 的 zend_string，返回其句柄。
+ *  返回 NULL 表示分配失败。
+ *
+ *  用途：构造要交还给 PHP 的字符串。与 phpglue_return_string（内部
+ *  zend_string_init，会**再分配并拷贝一次**）不同，本函数配合
+ *  phpglue_return_string_ptr 可以做到零拷贝移交。
+ *
+ *  所有权：调用方必须在 phpglue_return_string_ptr（移交）与
+ *  phpglue_string_release（放弃）中**恰好选择一个**，否则泄漏。 */
+zend_string *phpglue_string_alloc(size_t len);
+
+/** 取 zend_string 的可写数据区，长度即分配时的 len（另有结尾 NUL）。
+ *  返回的指针不独立持有所有权，随 zend_string 一起移交或释放。 */
+char *phpglue_string_buffer(zend_string *s);
+
+/** 把 phpglue_string_alloc 得到的字符串**零拷贝**挂到 rv（ZVAL_STR），
+ *  所有权移交给 PHP。调用后不得再访问该 zend_string。 */
+void phpglue_return_string_ptr(zval *rv, zend_string *s);
+
+/** 放弃一个未移交的 zend_string（zend_string_release）。用于分配后走错误分支的场景。 */
+void phpglue_string_release(zend_string *s);
+
+/** 当前是否存在未处理的异常（EG(exception) 非空返回 1） */
+int phpglue_exception_exists(void);
+
+/* ================================================================
+ * PHP 内存池额度查询
+ *
+ * 供 Zig 侧计算「Zig 分配还能用多少」：RequestArena 的 backing 是
+ * c_allocator（malloc），不进 PHP 内存池、不受 memory_limit 约束。若不限额，
+ * 进程可在 PHP 侧完全无感知的情况下逼近容器上限并被 OOM killer 杀死。
+ * 故需要在此查询 PHP 池的额度，让 Zig 侧参与统一核算。
+ * ================================================================ */
+
+/** PHP 池当前用量（字节）。real=0 为已用，real=1 为向 OS 申请的真实量 */
+size_t    phpglue_memory_usage(int real);
+
+/** memory_limit（字节）。返回 0 表示未设置/不限（PHP 用 0 与 -1 两种表达，
+ *  这里统一归并为 0 = 不限，避免 Zig 侧处理负数） */
+size_t    phpglue_memory_limit(void);
+
+/** 清除当前异常（zend_clear_exception）。已有异常未清理就继续调用 Zend API
+ *  可能触发二次抛出或状态错乱。 */
+void phpglue_clear_exception(void);
 
 /* ================================================================
  * 类注册

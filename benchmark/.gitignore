@@ -1,0 +1,12 @@
+# 基准测量产物（每次运行重新生成，不入库）
+*.tsv
+
+# Zig 构建产物
+php_zig/zig-out/
+php_zig/.zig-cache/
+zig-out/
+.zig-cache/
+
+# 原生 C 扩展产物
+c_ext/*.so
+*.so

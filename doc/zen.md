@@ -137,7 +137,8 @@ swoole 出品的成熟框架，架构四层：`PHP 扩展层 → 门面层(func/
 
 - **bailout-safe cleanup**：PHP 的 bailout（OOM/超时/fatal）用 `longjmp` 跳过 Zig `defer`。但 zval/emalloc 由请求级内存池兜底，真正泄漏的只有 Zig 侧系统资源（allocator 内存/文件/socket），故与 allocator 一起做。
 - **Fiber 控制操作走 PHP 原生方法**：`zend_fiber_suspend/resume/start` 内含 `return` 宏（会提前中断 glue 函数），故控制操作改用 `PhpFunc.callMethod` 调 PHP 原生 `Fiber::*`，既避开陷阱又天然获得运行时校验。只读查询仍由 glue 直读结构体（零开销）。
-- **Observer 集中式代理**：无条件汇聚所有事件（含内部函数），由下游自行过滤。这是「MINIT 静态注册」约束下的简单模型。
+- **Observer 集中式代理**：MINIT 静态注册，用一个 init handler 代理所有事件（Zend 只允许注册一个）。注册了 filter 时按 filter 结果决定是否观察某函数，引擎缓存判定结果，未放行函数零开销；未注册 filter 则观察全部，由下游自行过滤。
+- **Zig 侧内存须显式约束**：`RequestArena` 的 backing 是 `c_allocator`，不进 PHP 内存池、不受 `memory_limit` 约束——这既是特性（大块临时内存不触发 memory_limit）也是风险（PHP 侧无感知地逼近容器上限被 OOM 杀死）。故框架提供进程级计数与 INI 限额，并默认参与 `memory_limit` 额度核算。
 
 ---
 

@@ -78,7 +78,7 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
     - Closure     : 从 Zig 函数创建 PHP Closure
     - Serialize   : PHP 序列化（serialize/unserialize）
     - Ini         : PHP INI 配置（声明式注册 + 读取 + 变更通知）
-    - Arena       : 请求级内存池（bailout-safe，自动 RSHUTDOWN 回收）
+    - Arena       : 请求级内存池（bailout-safe，自动 RSHUTDOWN 回收 + 进程级计数 + INI 限额）
     - Cleanup     : 清理注册表（bailout-safe，RSHUTDOWN 统一回收）
     - Fiber       : PHP Fiber 协程（只读查询 + create/start/suspend_/resume_/throw）
     - Observer    : 集中式观察代理（fcall/error/declared/class_linked/fiber 五类观察点静态注册）
@@ -190,6 +190,7 @@ Hello from php-zig!
 | 对象属性 | ✅ | `readProperty` / `writeProperty` + `instanceOf` + `toObject()` |
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
 | 请求级内存池 | ✅ | `RequestArena` + `Cleanup.register`（bailout-safe，RSHUTDOWN 回收） |
+| Zig 侧内存治理 | ✅ | `Arena.usage/peak` 进程级原子计数 + INI 限额（默认参与 `memory_limit` 额度）；容器感知与告警由下游实现 |
 | 闭包导出 | ✅ | `Closure.create` 从 Zig 函数创建 PHP Closure |
 | Fiber 协程 | ✅ | 只读查询（isFiber/getStatus/getCurrent/getReturn）+ 控制操作（create/start/suspend_/resume_/throw，走 PHP 原生方法复用校验） |
 | Observer 观察代理 | ✅ | 五类观察点静态注册（fcall begin/end、error、function_declared、class_linked、fiber init/switch/destroy）+ `funcName` |
@@ -274,10 +275,38 @@ phpzig.ClassDesc.createObject("Counter", &.{ /* methods */ }, Counter, counterIn
 明确「PHP 用 PHP 的、Zig 用 Zig 的」边界：PHP 数据结构由 PHP 请求池兜底，Zig 自己分配的内存用 `RequestArena`（请求级内存池）或 `Cleanup.register` 兜底。两者在 bailout（`longjmp` 跳过 `defer`）后都保证回收：
 
 ```zig
-const arena = phpzig.RequestArena.init();
+const arena = phpzig.RequestArena.init() orelse return;  // OOM 抛异常，不 panic
 defer arena.deinit();          // 正常路径，bailout 时 RSHUTDOWN 兜底
 const a = arena.allocator();
 ```
+
+Zig 侧内存**不受 `memory_limit` 约束**——`RequestArena` 的 backing 是 `c_allocator`，
+不进 PHP 请求池。这既是特性（大块临时内存不触发 `memory_limit`），也是风险：
+进程可在 PHP 侧完全无感知的情况下逼近容器上限被 OOM killer 杀死。故框架提供
+可观测与可约束两层：
+
+```zig
+phpzig.Arena.usage();   // 当前 Zig 侧占用（跨全部 arena 实例的进程级计数）
+phpzig.Arena.peak();    // 进程内峰值
+```
+
+```ini
+phpzig.arena_limit = 0              ; 字节，0 = 不以此项限制
+phpzig.arena_account_to_php = 1     ; 参与 memory_limit 额度核算（默认开）
+phpzig.arena_check_interval = 65536 ; 降频阈值，默认 64K
+```
+
+额度取 `arena_limit` 与 `memory_limit` 剩余的较小者；超限按 **reject** 语义返回
+`error.OutOfMemory`，由业务代码自行决定降级还是抛异常。
+
+两处使用前提与边界：
+
+- **真实 PHP 探针由 `moduleInit` 在 MINIT 挂载**（`Arena.bindPhpProbes()`）。
+  绕过 `moduleInit` 直接使用 `RequestArena` 会退化为内建空实现——不施加 PHP
+  侧额度，但不崩溃。这是安全方向的降级。
+- **框架只提供能力，不做容器感知与告警**。读 cgroup limit、按水位告警等策略
+  由下游基于 `usage()` / `peak()` 自行实现——php-zig 是骨架，不该替业务决定
+  在特定部署环境下的内存策略。
 
 **4. 极简注册入口——`moduleInit(@This())`**
 

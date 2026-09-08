@@ -1,0 +1,18 @@
+.{
+    .name = .bench_zig,
+    // 注意：fingerprint 是 paths 内容的哈希，此处为占位值。
+    // 首次 `zig build` 若报 invalid fingerprint，按提示值更新本字段。
+    .fingerprint = 0x5dddb3f470db5ebf,
+    .version = "1.0.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .phpzig = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

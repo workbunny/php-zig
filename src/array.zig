@@ -52,6 +52,8 @@ pub const Array = struct {
         return null;
     }
 
+
+
     pub fn exists(self: *const Array, key: []const u8) bool {
         return c.phpglue_hash_str_exists(self.hashTable(), key.ptr, key.len) != 0;
     }
@@ -92,25 +94,30 @@ pub const Array = struct {
 
     // ＝＝ 按字符串键设值（关联数组） ＝＝
 
-    pub fn setAssocLong(self: *Array, key: []const u8, v: T.zend_long) void   { c.phpglue_add_assoc_long(self.zv.ptr, key.ptr, v); }
-    pub fn setAssocString(self: *Array, key: []const u8, s: []const u8) void   { c.phpglue_add_assoc_stringl(self.zv.ptr, key.ptr, s.ptr, s.len); }
-    pub fn setAssocBool(self: *Array, key: []const u8, v: bool) void           { c.phpglue_add_assoc_bool(self.zv.ptr, key.ptr, v); }
+    pub fn setAssocLong(self: *Array, key: []const u8, v: T.zend_long) void   { c.phpglue_add_assoc_long(self.zv.ptr, key.ptr, key.len, v); }
+    pub fn setAssocString(self: *Array, key: []const u8, s: []const u8) void   { c.phpglue_add_assoc_stringl(self.zv.ptr, key.ptr, key.len, s.ptr, s.len); }
+    pub fn setAssocBool(self: *Array, key: []const u8, v: bool) void           { c.phpglue_add_assoc_bool(self.zv.ptr, key.ptr, key.len, v); }
 
     // ＝＝ 高级操作 ＝＝
 
-    pub fn pop(self: *Array) ?Zval {
-        var retval: T.Zval = undefined;
-        if (c.phpglue_array_pop(self.zv.ptr, &retval) == 0) return null;
-        return Zval.fromPtr(&retval);
+    /// 移除并返回末尾元素，结果写入 out（输出参数形态）。空数组返回 false。
+    ///
+    /// 用输出参数而非返回 `?Zval`：Zval 只是 `*T.Zval` 的包装，若把内部
+    /// 栈上临时 zval 的地址返回出去，函数一返回该地址即失效——踩坑 #9
+    /// （Array.init 返回栈指针）的同类问题，读数值时因栈帧未被立即覆盖
+    /// 而「看起来能用」，属偶发失败型缺陷。
+    ///
+    /// out 带走引用计数，用后须 `out.deinit()`（或移交他人）。
+    pub fn pop(self: *Array, out: *T.Zval) bool {
+        return c.phpglue_array_pop(self.zv.ptr, out) != 0;
     }
 
     // ＝＝ 队列 / 栈操作 ＝＝
 
-    /// 移除并返回第一个元素（等价 PHP array_shift），空数组返回 null
-    pub fn shift(self: *Array) ?Zval {
-        var retval: T.Zval = undefined;
-        if (c.phpglue_array_shift(self.zv.ptr, &retval) == 0) return null;
-        return Zval.fromPtr(&retval);
+    /// 移除并返回第一个元素（等价 PHP array_shift），结果写入 out，
+    /// 空数组返回 false。out 用后须 `deinit()`。同 `pop`，勿返回栈地址。
+    pub fn shift(self: *Array, out: *T.Zval) bool {
+        return c.phpglue_array_shift(self.zv.ptr, out) != 0;
     }
 
     /// 头部插入元素（等价 PHP array_unshift，数字键重索引）

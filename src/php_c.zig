@@ -80,12 +80,13 @@ pub extern fn phpglue_add_index_zval(zv: *T.Zval, idx: T.zend_ulong, val: *T.Zva
 
 // —— 按字符串键设值（关联数组） ——
 
-pub extern fn phpglue_add_assoc_long(zv: *T.Zval, key: [*c]const u8, v: T.zend_long)                         void;
-pub extern fn phpglue_add_assoc_double(zv: *T.Zval, key: [*c]const u8, v: f64)                               void;
-pub extern fn phpglue_add_assoc_stringl(zv: *T.Zval, key: [*c]const u8, s: [*c]const u8, len: usize)         void;
-pub extern fn phpglue_add_assoc_bool(zv: *T.Zval, key: [*c]const u8, v: bool)                                void;
-pub extern fn phpglue_add_assoc_null(zv: *T.Zval, key: [*c]const u8)                                         void;
-pub extern fn phpglue_add_assoc_zval(zv: *T.Zval, key: [*c]const u8, val: *T.Zval)                           void;
+// key 带长度：Zig 侧 []const u8 不保证 NUL 结尾，strlen 会越界
+pub extern fn phpglue_add_assoc_long(zv: *T.Zval, key: [*c]const u8, key_len: usize, v: T.zend_long)         void;
+pub extern fn phpglue_add_assoc_double(zv: *T.Zval, key: [*c]const u8, key_len: usize, v: f64)               void;
+pub extern fn phpglue_add_assoc_stringl(zv: *T.Zval, key: [*c]const u8, key_len: usize, s: [*c]const u8, len: usize) void;
+pub extern fn phpglue_add_assoc_bool(zv: *T.Zval, key: [*c]const u8, key_len: usize, v: bool)                void;
+pub extern fn phpglue_add_assoc_null(zv: *T.Zval, key: [*c]const u8, key_len: usize)                         void;
+pub extern fn phpglue_add_assoc_zval(zv: *T.Zval, key: [*c]const u8, key_len: usize, val: *T.Zval)           void;
 
 // ＝＝＝＝ HashTable 底层操作 ＝＝＝＝
 
@@ -156,6 +157,19 @@ pub extern fn phpglue_fill_arg_info(dst: ?*anyopaque, required_count: u32, names
 pub extern fn phpglue_fill_arg_info_typed(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, name_count: usize, out_entry_count: *usize) void;
 /// 完整版 — 在 typed 基础上增加 variadic 与 default_values（均可传 null 表示无）
 pub extern fn phpglue_fill_arg_info_full(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, variadic: [*c]const u8, default_values: [*c]const ?[*:0]const u8, name_count: usize, out_entry_count: *usize) void;
+
+// ＝＝＝＝ 字符串分配 / 异常状态 ＝＝＝＝
+
+pub extern fn phpglue_string_alloc(len: usize) ?*T.ZendString;
+pub extern fn phpglue_string_buffer(s: *T.ZendString) [*]u8;
+pub extern fn phpglue_return_string_ptr(rv: *T.Zval, s: *T.ZendString) void;
+pub extern fn phpglue_string_release(s: *T.ZendString) void;
+pub extern fn phpglue_exception_exists() c_int;
+pub extern fn phpglue_clear_exception() void;
+/// PHP 池当前用量。real=0 已用，real=1 向 OS 申请的真实量
+pub extern fn phpglue_memory_usage(real: c_int) usize;
+/// memory_limit，0 = 不限
+pub extern fn phpglue_memory_limit() usize;
 
 // ＝＝＝＝ 类注册 ＝＝＝＝
 

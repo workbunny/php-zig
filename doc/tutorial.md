@@ -774,8 +774,9 @@ const ptr: ?*anyopaque = MyRes.fetch(&arg_zval);
 bailout（`longjmp`）会跳过 Zig `defer`，但 RSHUTDOWN 仍执行，故用两层机制兜底：
 
 ```zig
-// RequestArena：请求级内存池，自动注册 RSHUTDOWN 回收
-const arena = phpzig.RequestArena.init();
+// RequestArena：请求级内存池，自动注册 RSHUTDOWN 回收。
+// OOM 时抛 PHP 异常并返回 null（不 panic），故用 orelse return 传播
+const arena = phpzig.RequestArena.init() orelse return;
 defer arena.deinit();                 // 正常路径（幂等），bailout 时 RSHUTDOWN 兜底
 const a = arena.allocator();
 var list: std.ArrayList(i64) = .empty; // Zig 0.16：unmanaged，方法传 allocator
@@ -816,7 +817,7 @@ const msg = std.fmt.allocPrint(std.heap.c_allocator, "Hi {s}", .{name}) catch ..
 phpzig.Return.returnString(return_value, msg);   // returnString 内部复制到 PHP 池，msg 泄漏
 
 // ✅ 正确：用请求级 arena（bailout-safe）
-const arena = phpzig.RequestArena.init();
+const arena = phpzig.RequestArena.init() orelse return;
 defer arena.deinit();
 const msg = std.fmt.allocPrint(arena.allocator(), "Hi {s}", .{name}) catch ...;
 phpzig.Return.returnString(return_value, msg);

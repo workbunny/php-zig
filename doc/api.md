@@ -481,10 +481,66 @@ fn onFcallBegin(execute_data: *phpzig.ZendExecuteData) callconv(.c) void {
 ### RequestArena（请求级内存池）
 
 ```zig
-var arena = php.RequestArena.init();
-defer arena.deinit();
-const a = arena.allocator(); // 供 ArrayList/HashMap 等使用
+// OOM 时抛 PHP 异常并返回 null，故用 orelse return 让 PHP 传播
+const arena = phpzig.RequestArena.init() orelse return;
+defer arena.deinit();          // 幂等，bailout 时 RSHUTDOWN 兜底
+const a = arena.allocator();   // 供 ArrayList/HashMap 等使用
 ```
+
+`init()` 在 OOM 时**不 panic**——生产环境 panic 等于进程崩溃。改为设置 PHP
+异常并返回 null，由调用方决定是传播（`orelse return`）还是降级后继续。
+
+### Zig 侧内存：监控与限额
+
+`RequestArena` 的 backing 是 `c_allocator`，**不进 PHP 内存池、不受
+`memory_limit` 约束**。若无约束，进程可在 PHP 侧毫无感知的情况下逼近容器
+上限并被 OOM killer 杀死——PHP 看到的用量远低于 `memory_limit`，一切"正常"。
+
+```zig
+// 可观测
+phpzig.Arena.usage();   // 当前 Zig 侧活跃占用（跨全部 arena 实例）
+phpzig.Arena.peak();    // 进程内峰值（RSHUTDOWN 后仍保留）
+
+// 可约束
+phpzig.Arena.configure(.{
+    .limit = 64 * 1024 * 1024,  // 显式上限，0 = 不以此项限制
+    .account_to_php = true,     // 参与 memory_limit 额度核算
+    .check_interval = 64 * 1024,// 累积多少字节后重新核算 PHP 池用量
+});
+```
+
+INI 项（在 MINIT 后自动读取，未注册则用默认值）：
+
+```ini
+phpzig.arena_limit = 0              ; 字节，0 = 不以此项限制
+phpzig.arena_account_to_php = 1     ; 1 = 参与 memory_limit 额度（默认开）
+phpzig.arena_check_interval = 65536 ; 降频阈值，默认 64K
+```
+
+**限额语义是 reject**：超限时 `alloc` 返回 `error.OutOfMemory`，由业务代码
+自行决定降级还是抛异常——框架不替下游决策。
+
+```zig
+const buf = a.alloc(u8, size) catch |err| {
+    phpzig.Throw.throwException("arena exhausted");
+    return;
+};
+```
+
+额度取 `arena_limit` 与 `memory_limit` 剩余中的较小者。`check_interval`
+用于降频：每次 alloc 都读 `zend_memory_usage()` 代价过高，故累积到阈值才
+重新核算，误差最多多占一个 check_interval。
+
+`bytesAllocated()` 是实例级的，且含 `ArenaAllocator` 内部节点开销——
+反映的是**真实内存占用**而非仅用户请求量。要看总量用 `Arena.usage()`。
+
+**使用前提**：真实的 PHP 探针（额度查询、OOM 抛异常）由 `Module` 在 MINIT 调用
+`Arena.bindPhpProbes()` 挂载。绕过 `moduleInit` 直接使用 `RequestArena` 时，
+这些探针是内建空实现——不施加 PHP 侧额度，但也不崩溃（安全方向的降级）。
+
+**边界**：框架只提供计数与限额能力，**不做容器感知与水位告警**。读 cgroup
+limit、按水位发告警等策略由下游基于 `usage()` / `peak()` 自行实现——php-zig
+是骨架，不该替业务决定特定部署环境下的内存策略。
 
 | 方法 | 说明 |
 |---|---|

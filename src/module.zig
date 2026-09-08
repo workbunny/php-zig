@@ -9,6 +9,7 @@
 const c = @import("php_c.zig");
 const T = @import("php_types.zig");
 const Cleanup = @import("cleanup.zig");
+const Arena = @import("arena.zig");
 const builtin = @import("builtin");
 const std = @import("std");
 const IniEntry = @import("ini.zig").IniEntry;
@@ -1034,6 +1035,10 @@ pub fn Module(comptime opts: ModuleOptions) type {
                 }
             }
             registerIniEntries(module_number);
+            // 挂载 PHP 侧实现的探针（内存额度查询、OOM 抛异常）。
+            // 必须在 INI 注册之后：configureFromIni 要读 INI 值。
+            Arena.bindPhpProbes();
+            Arena.configureFromIni();
             if (opts.observer) |obs| {
                 c.phpglue_observer_register(
                     obs.fcall_begin,

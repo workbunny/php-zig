@@ -41,6 +41,8 @@ pub const Serialize = @import("serialize.zig");
 pub const Ini = @import("ini.zig");
 pub const Cleanup = @import("cleanup.zig");
 pub const RequestArena = @import("arena.zig").RequestArena;
+pub const Arena = @import("arena.zig");
+pub const ArenaConfig = @import("arena.zig").Config;
 pub const Fiber = @import("fiber.zig");
 pub const Observer = @import("observer.zig");
 
