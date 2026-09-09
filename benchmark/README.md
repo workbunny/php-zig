@@ -94,30 +94,36 @@ php                                                   smoke.php pure_php
 
 ## 性能结论
 
-PHP 8.4.19 (NTS) / Linux / 20 万次迭代 × 3 轮取中位数，`zig / C` 开销比：
+PHP 8.4.19 (NTS) / Linux / 30 万次迭代 × 5 轮取中位数（zig 侧经 7 轮复核），
+`zig / C` 开销比：
 
 | 用例 | 比值 | 用例 | 比值 |
 |---|---:|---|---:|
-| empty | 0.96x | str_len | 0.87x |
-| add | 1.11x | math(1000) | 0.85x |
-| concat | 1.14x | call_php(10) | 1.01x |
-| array_build(100) | 1.12x | object(100) | 0.71x |
-| **array_read(100)** | **1.49x** | throw(10) | 1.08x |
-| assoc(100) | 0.67x | method(100) | 1.11x |
-| mixed(100) | 0.86x | serialize(100) | 1.09x |
-| nested(100) | 1.19x | closure(100) | 1.00x |
-| strkey(1000) | 0.71x | fiber(100) | 1.03x |
-| | | arena(1000) | 0.71x |
+| empty | 0.96x | str_len | 1.06x |
+| add | 1.10x | math(1000) | 0.97x |
+| concat | 1.15x | call_php(10) | 1.09x |
+| array_build(100) | 1.17x | object(100) | 0.74x |
+| **array_read(100)** | **1.41x** | throw(10) | 1.06x |
+| assoc(100) | 0.70x | method(100) | 1.19x |
+| mixed(100) | 0.89x | serialize(100) | 1.08x |
+| nested(100) | 1.18x | closure(100) | 0.94x |
+| strkey(1000) | 0.75x | fiber(100) | 0.99x |
+| | | arena(1000) | 0.69x |
 
-1. **调用分发与纯计算已达原生水准**：`empty` 0.96x、`math` 0.85x、
-   `closure` 1.00x、`call_php` 1.01x、`fiber` 1.03x。
-2. **复合类型场景多数优于 C**：`mixed` 0.86x、`strkey` 0.71x、`object` 0.71x、
-   `assoc` 0.67x。这些差距来自两侧实现策略不同（键生成、属性访问路径），
-   不代表 php-zig 更快，但说明**无系统性劣势**。
-3. **`array_read` 1.49x 是唯一明显短板**，且**只影响纯数字紧密循环**——
-   换成混合类型的 `mixed` 反而 0.86x。
+1. **调用分发与纯计算已达原生水准**：`empty` 0.96x、`math` 0.97x、
+   `closure` 0.94x、`fiber` 0.99x、`arena` 0.69x。
+2. **复合类型场景多数优于 C**：`strkey` 0.75x、`object` 0.74x、`assoc` 0.70x。
+   这些差距来自两侧实现策略不同（键生成、属性访问路径），不代表 php-zig
+   更快，但说明**无系统性劣势**。
+3. **`array_read` 1.41x 是唯一明显短板**，且**只影响纯数字紧密循环**——
+   换成混合类型的 `mixed` 反而 0.89x。
 
-### `array_read` 的 1.49x
+> 注：单用例跨轮波动可达 ±0.1x（容器调度抖动），结论看整体分布而非单值。
+> 最近的 v0.10.2 改动（取值弱转换、flags 传递）经实测**零性能影响**——
+> 弱转换对 IS_LONG 快路径是 inline 直读，benchmark 参数均为 mixed 不触发
+> HAS_TYPE_HINTS 运行时检查。
+
+### `array_read` 的 1.41x
 
 根因是跨 ABI 调用次数：
 
@@ -130,7 +136,7 @@ php-zig:  zval_get_array → hash_index_find → zval_get_long   （3 次 extern
 
 | 解法 | 代价 |
 |---|---|
-| 接受 1.49x（**推荐**） | 无。跨语言框架在紧密循环付 1.4x~1.5x 是正常量级 |
+| 接受 1.41x（**推荐**） | 无。跨语言框架在紧密循环付 1.4x~1.5x 是正常量级 |
 | 加复合 API（一次调用完成查+取） | 违反「不为 benchmark 做特异化优化」铁律 |
 | Zig 侧直接操作 `zend_array` 布局 | 违反「版本差异隔离在 C 层」的架构原则 |
 

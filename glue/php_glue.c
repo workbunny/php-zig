@@ -42,10 +42,32 @@ uint8_t phpglue_zts_mode(void)            { return USING_ZTS; }
  * ================================================================ */
 
 uint8_t     phpglue_zval_type(zval *zv)              { return Z_TYPE_P(zv); }
-zend_long   phpglue_zval_get_long(zval *zv)          { return Z_LVAL_P(zv); }
-double      phpglue_zval_get_double(zval *zv)        { return Z_DVAL_P(zv); }
-const char *phpglue_zval_get_string_val(zval *zv)    { return Z_STRVAL_P(zv); }
-size_t      phpglue_zval_get_string_len(zval *zv)    { return Z_STRLEN_P(zv); }
+/* 取值走官方弱转换（zval_get_long/double），而非 Z_LVAL_P 直读：
+ *
+ * 背景：内部函数的 arginfo 类型校验只在 ZEND_DEBUG 构建下进行（zend_execute.c
+ * 的 zend_internal_call_should_throw 包在 #if ZEND_DEBUG 里），Release 构建下
+ * PHP 信任 handler 的 zend_parse_parameters 做转换，对 php-zig 来说就是——
+ * 没有任何引擎层校验。若此处直读 Z_LVAL_P，string/array 等类型会被当成
+ * zend_long 解读（读到 union 里的指针低位），返回看似合理却错误的数字。
+ *
+ * zval_get_long 是官方弱转换：IS_LONG 直接返回（快路径无开销），其他类型
+ * 按 PHP 语义转换，永不返回垃圾指针。这也正是「拿到什么按什么处理」——
+ * 转不了的类型会得到 PHP 定义的结果而非 UB。 */
+zend_long   phpglue_zval_get_long(zval *zv)          { return zval_get_long(zv); }
+double      phpglue_zval_get_double(zval *zv)        { return zval_get_double(zv); }
+/* 非字符串一律返回 NULL / 0：Z_STRVAL_P 不做类型检查，对非字符串读到的是
+ * 同一联合体里的其它字段（如 zend_array* 指针）被当成 char* 解引用——
+ * 实测传 null 时读到 0x2，触发 misaligned address panic。Release 构建无该
+ * 检查，会静默返回垃圾数据，比崩溃更难排查。
+ * 类型不符在此统一返回空值，是 zval 取值路径的公共防线。 */
+const char *phpglue_zval_get_string_val(zval *zv)    {
+    if (Z_TYPE_P(zv) != IS_STRING) return NULL;
+    return Z_STRVAL_P(zv);
+}
+size_t      phpglue_zval_get_string_len(zval *zv)    {
+    if (Z_TYPE_P(zv) != IS_STRING) return 0;
+    return Z_STRLEN_P(zv);
+}
 zend_array *phpglue_zval_get_array(zval *zv)         { return Z_ARRVAL_P(zv); }
 
 /* ================================================================
@@ -364,6 +386,72 @@ void phpglue_fill_arg_info(void *dst, uint32_t required_count, const char **name
     *out_entry_count = name_count;
 }
 
+/* MAY_BE_* 位值由 Zig 侧硬编码（见 src/php_types.zig 的 PhpType），
+ * 此处断言其在本版本 PHP 头文件中未变——若断言失败，说明 PHP 调整了
+ * 类型位布局，Zig 侧的常量必须同步修改，否则类型约束会静默失效
+ * （表现为「该报错的没报错」，比崩溃更难发现）。 */
+_Static_assert(MAY_BE_NULL     == 0x2u,   "php-zig: MAY_BE_NULL 位值与假设不符");
+_Static_assert(MAY_BE_FALSE    == 0x4u,   "php-zig: MAY_BE_FALSE 位值与假设不符");
+_Static_assert(MAY_BE_TRUE     == 0x8u,   "php-zig: MAY_BE_TRUE 位值与假设不符");
+_Static_assert(MAY_BE_LONG     == 0x10u,  "php-zig: MAY_BE_LONG 位值与假设不符");
+_Static_assert(MAY_BE_DOUBLE   == 0x20u,  "php-zig: MAY_BE_DOUBLE 位值与假设不符");
+_Static_assert(MAY_BE_STRING   == 0x40u,  "php-zig: MAY_BE_STRING 位值与假设不符");
+_Static_assert(MAY_BE_ARRAY    == 0x80u,  "php-zig: MAY_BE_ARRAY 位值与假设不符");
+_Static_assert(MAY_BE_OBJECT   == 0x100u, "php-zig: MAY_BE_OBJECT 位值与假设不符");
+_Static_assert(MAY_BE_RESOURCE == 0x200u, "php-zig: MAY_BE_RESOURCE 位值与假设不符");
+_Static_assert(MAY_BE_CALLABLE == 0x1000u, "php-zig: MAY_BE_CALLABLE 位值与假设不符");
+_Static_assert(_ZEND_TYPE_ITERABLE_BIT == 0x200000u, "php-zig: ITERABLE 位值与假设不符");
+
+/* — 掩码版本：直接接受 MAY_BE_* 位组合，支持 `int|string` 这类联合类型 — */
+
+static void fill_masked_param_entry(zend_internal_arg_info *entry, const char *name,
+    uint32_t type_mask, uint8_t variadic_flag, const char *default_value)
+{
+    memcpy(entry, &__phpglue_arg_param_template[0], sizeof(zend_internal_arg_info));
+    entry->name = name;
+
+    const uint32_t extra_flags = (uint32_t)_ZEND_ARG_INFO_FLAGS(0, variadic_flag, 0);
+
+    if (type_mask == 0) {
+        /* 无约束（mixed）：仅可变参数需写入 variadic 位 */
+        if (variadic_flag) {
+            entry->type = (zend_type)ZEND_TYPE_INIT_NONE(extra_flags);
+        }
+    } else {
+        /* ZEND_TYPE_INIT_MASK 直接吃位组合，天然支持 OR 出的联合类型；
+         * 且 MAY_BE_NULL 位与 _ZEND_TYPE_NULLABLE_BIT 同值，故 `?int`
+         * 与 `int|null` 在此无需区分。 */
+        entry->type = (zend_type)ZEND_TYPE_INIT_MASK(type_mask | extra_flags);
+    }
+
+    if (default_value != NULL) {
+        entry->default_value = default_value;
+    }
+}
+
+void phpglue_fill_arg_info_masked(void *dst, uint32_t required_count,
+    const char **names, const uint32_t *type_masks,
+    const uint8_t *variadic, const char **default_values,
+    size_t name_count, size_t *out_entry_count)
+{
+    zend_internal_arg_info *entries = (zend_internal_arg_info *)dst;
+
+    memcpy(&entries[0], &__phpglue_arg_header_template[0], sizeof(zend_internal_arg_info));
+    entries[0].name = (const char *)(uintptr_t)(required_count);
+
+    for (size_t i = 0; i < name_count; i++) {
+        fill_masked_param_entry(&entries[i + 1], names[i],
+            type_masks ? type_masks[i] : 0,
+            variadic ? variadic[i] : 0,
+            default_values ? default_values[i] : NULL);
+    }
+
+    memcpy(&entries[name_count + 1], &__phpglue_arg_param_template[0], sizeof(zend_internal_arg_info));
+    entries[name_count + 1].name = NULL;
+
+    *out_entry_count = name_count;
+}
+
 /* — 类型化版本：逐参数设置 PHP 类型标注 — */
 
 static void fill_typed_param_entry(zend_internal_arg_info *entry, const char *name,
@@ -523,6 +611,8 @@ size_t phpglue_memory_limit(void) {
     if (limit <= 0) return 0;
     return (size_t) limit;
 }
+
+uint32_t phpglue_acc_has_type_hints(void) { return ZEND_ACC_HAS_TYPE_HINTS; }
 
 /* ================================================================
  * 类注册

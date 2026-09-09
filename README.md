@@ -20,11 +20,18 @@ pub fn php_hello(_: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void
     phpzig.Return.returnString(rv, "Hello from Zig!");
 }
 
-// 有参函数——参数名由伴生 struct 反射（Zig fn 无参数名，故需 Args struct）
+// 有参函数——参数名由伴生 struct 反射（Zig fn 无参数名，故需 Args struct）。
+// toLong() 是官方弱转换（"1"→1、null→0，与 PHP 语义一致），不做类型洁癖；
+// 但裸 + 会溢出（PHP_INT_MAX+1 在 Debug 下 panic），须用 @addWithOverflow。
 pub fn php_add(ed: *phpzig.ZendExecuteData, rv: *phpzig.Zval) callconv(.c) void {
     const a = phpzig.Return.callArg(ed, 1).toLong();
     const b = phpzig.Return.callArg(ed, 2).toLong();
-    phpzig.Return.returnLong(rv, a + b);
+    const sum, const overflowed = @addWithOverflow(a, b);
+    if (overflowed != 0) {
+        phpzig.Return.returnDouble(rv, @as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b)));
+    } else {
+        phpzig.Return.returnLong(rv, sum);
+    }
 }
 pub const addArgs = struct { a: i64, b: i64 };
 

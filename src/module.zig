@@ -76,10 +76,83 @@ pub const ParamType = enum(u8) {
     object = 6,
 };
 
+// ＝＝＝＝ PHP 类型位掩码（PhpType）＝＝＝＝
+//
+// 直接对应 Zend 的 MAY_BE_*，用位组合表达联合类型（`int|string`），
+// 这是 enum(u8) 的 ParamType 做不到的——它只能表达单一类型。
+//
+// 位值由 glue/php_glue.c 顶部的 _Static_assert 守护：PHP 若调整 MAY_BE_*
+// 布局，编译期即失败，不会产生「类型约束静默失效」这种比崩溃更难查的问题。
+
+pub const PhpType = packed struct(u32) {
+    mask: u32,
+
+    /// 无约束（mixed / 不检查）
+    pub const any = PhpType{ .mask = 0 };
+
+    // — 基础类型 —
+    pub const null_ = PhpType{ .mask = 1 << 1 }; // IS_NULL
+    pub const false_ = PhpType{ .mask = 1 << 2 }; // IS_FALSE
+    pub const true_ = PhpType{ .mask = 1 << 3 }; // IS_TRUE
+    pub const long = PhpType{ .mask = 1 << 4 };
+    pub const double = PhpType{ .mask = 1 << 5 };
+    pub const string = PhpType{ .mask = 1 << 6 };
+    pub const array = PhpType{ .mask = 1 << 7 };
+    pub const object = PhpType{ .mask = 1 << 8 };
+    pub const resource = PhpType{ .mask = 1 << 9 };
+
+    // — 便捷组合（纯语法糖，不含额外语义）—
+    /// bool：false|true。注意 PHP 的 bool 是两个独立类型的联合
+    pub const bool_ = false_.unionWith(true_);
+    /// 数值：int|float
+    pub const number = long.unionWith(double);
+    /// 全部基础类型
+    pub const any_typed = PhpType{ .mask = 0x3FF };
+
+    // — 伪类型：位值不落在基础类型区间，由 Zend 特殊处理 —
+    pub const callable = PhpType{ .mask = 1 << 12 };
+    pub const iterable = PhpType{ .mask = 1 << 21 };
+
+    /// 组合出联合类型：`PhpType.string.unionWith(PhpType.long)` → `string|int`
+    /// 链式即可表达多项：`a.unionWith(b).unionWith(c)`
+    ///
+    /// 方法名不能用 `or`——它是 Zig 保留字。
+    pub fn unionWith(self: PhpType, other: PhpType) PhpType {
+        return .{ .mask = self.mask | other.mask };
+    }
+
+    /// 允许 null。PHP 的 `?int` 与 `int|null` 完全等价——
+    /// MAY_BE_NULL 位与 _ZEND_TYPE_NULLABLE_BIT 同值，故此处无需区分。
+    pub fn nullable(self: PhpType) PhpType {
+        return self.unionWith(null_);
+    }
+};
+
+/// Zig 类型 → PHP 类型位掩码（供 arg_info 生成与联合类型补齐共用）
+pub fn zigTypeToPhpMask(comptime Z: type) PhpType {
+    const info = @typeInfo(Z);
+    if (info == .optional) {
+        return zigTypeToPhpMask(info.optional.child).nullable();
+    }
+    return switch (Z) {
+        i64, u64, i32, u32, i16, u16, i8, u8, isize, usize => PhpType.long,
+        f64, f32 => PhpType.double,
+        bool => PhpType.bool_,
+        []const u8, [:0]const u8, []u8 => PhpType.string,
+        // mixed：不生成类型约束，值原样进 handler（unsafe 路径，保留）
+        *T.Zval, ?*T.Zval => PhpType.any,
+        *const T.Zval => PhpType.any,
+        else => @compileError("Unsupported comptime arg type: " ++ @typeName(Z)),
+    };
+}
+
 pub const ParamDesc = struct {
     name: [:0]const u8,
     param_type: ParamType = .mixed,
     allow_null: bool = false,
+    /// PHP 类型位掩码（MAY_BE_*）。非零时优先于 param_type，用于表达
+    /// `int|string` 这类联合类型——param_type 只能表达单一类型。
+    type_mask: u32 = 0,
     /// 是否为可变参数（...$args），仅对最后一个参数有意义
     is_variadic: bool = false,
     /// 默认值源码字符串（如 "NULL"、"0"、"[]"），null 表示无默认值
@@ -92,6 +165,10 @@ pub const ParamDesc = struct {
     /// 声明式构造 + 类型标注
     pub fn createTyped(name: [:0]const u8, pt: ParamType) ParamDesc {
         return .{ .name = name, .param_type = pt };
+    }
+    /// 声明式构造 + 位掩码类型（支持联合类型）
+    pub fn createMasked(name: [:0]const u8, mask: PhpType) ParamDesc {
+        return .{ .name = name, .type_mask = mask.mask };
     }
     /// 声明式构造 + 类型标注 + nullable
     pub fn createNullable(name: [:0]const u8, pt: ParamType) ParamDesc {
@@ -166,6 +243,56 @@ pub const FunctionDesc = struct {
         return .{ .name = name, .handler = handler, .params = params, .flags = Marker.static_marker };
     }
 
+    /// 反射 + 显式补齐。`overrides` 是匿名 struct，字段名对应 Args 的字段。
+    ///
+    /// 用于 Zig 类型无法表达的场合：
+    /// ```zig
+    /// const Args = struct { key: *T.Zval };
+    /// createFromWith("f", f, Args, .{
+    ///     .key = PhpType.long.unionWith(PhpType.string),   // int|string
+    /// })
+    /// ```
+    ///
+    /// 编译期校验，均为「显式报错」而非静默失效：
+    ///  1. overrides 的字段必须在 Args 中存在（防拼写错误）
+    ///  2. overrides 中出现的字段在 Args 中必须是 `*T.Zval`（mixed）类型
+    ///     —— 与反射结果冲突说明意图不清，静默选一个会埋雷
+    ///
+    /// `handler` 不声明 comptime：它常由 `@ptrCast(&fn)` 得到，
+    /// 标 comptime 会导致「unable to resolve comptime value」。
+    pub fn createFromWith(
+        comptime name: [:0]const u8,
+        handler: T.FunctionHandler,
+        comptime Args: type,
+        comptime overrides: anytype,
+    ) FunctionDesc {
+        const info = @typeInfo(Args);
+        if (info != .@"struct") @compileError("createFromWith expects a struct, got " ++ @typeName(Args));
+        const fields = info.@"struct".fields;
+
+        // 校验：overrides 的字段必须存在，且对应字段是 mixed（*T.Zval）。
+        // 反射已能推出类型的字段不允许再覆盖——声明与反射冲突说明意图不清，
+        // 静默选一个会埋雷，故显式编译错误。
+        inline for (@typeInfo(@TypeOf(overrides)).@"struct".fields) |of| {
+            var found = false;
+            inline for (fields) |af| {
+                if (std.mem.eql(u8, af.name, of.name)) {
+                    found = true;
+                    if (zigTypeToPhpMask(af.type).mask != 0) {
+                        @compileError("createFromWith: field '" ++ af.name ++
+                            "' already has a reflected type; overrides are only for mixed (*T.Zval) fields");
+                    }
+                }
+            }
+            if (!found) {
+                @compileError("createFromWith: override field '" ++ of.name ++
+                    "' does not exist in " ++ @typeName(Args));
+            }
+        }
+
+        return .{ .name = name, .handler = handler, .params = comptime paramsFromStructWithOverrides(Args, overrides) };
+    }
+
     /// comptime struct 反射 — 从 struct 字段名和类型自动推导 arg_info。
     ///
     /// ```zig
@@ -175,12 +302,10 @@ pub const FunctionDesc = struct {
     ///
     /// 字段顺序 = 参数顺序，字段名 = 参数名，字段类型 → PHP 类型标注。
     /// ?T 类型自动映射为 allow_null。
+    ///
+    /// 需要联合类型时用 `createFromWith` 补齐。
     pub fn createFrom(comptime name: [:0]const u8, handler: T.FunctionHandler, comptime Args: type) FunctionDesc {
-        return .{
-            .name = name,
-            .handler = handler,
-            .params = comptime paramsFromStruct(Args),
-        };
+        return createFromWith(name, handler, Args, .{});
     }
 
     /// createFrom 的静态方法版本
@@ -215,6 +340,24 @@ const Marker = struct {
     const private_marker: u32 = 0xDEADBEF1;
 };
 
+/// ParamDesc → MAY_BE_* 掩码。
+/// type_mask 非零时优先（联合类型）；否则由 ParamType 枚举折算，
+/// 有 allow_null 时补上 MAY_BE_NULL 位。
+fn paramMask(p: ParamDesc) u32 {
+    if (p.type_mask != 0) return p.type_mask;
+    var m: u32 = switch (p.param_type) {
+        .long => PhpType.long.mask,
+        .double => PhpType.double.mask,
+        .string => PhpType.string.mask,
+        .bool => PhpType.bool_.mask,
+        .array => PhpType.array.mask,
+        .object => PhpType.object.mask,
+        .mixed => 0,
+    };
+    if (p.allow_null) m |= PhpType.null_.mask;
+    return m;
+}
+
 /// comptime：从 struct 类型反射出 []const ParamDesc
 fn paramsFromStruct(comptime Args: type) []const ParamDesc {
     const info = @typeInfo(Args);
@@ -228,6 +371,38 @@ fn paramsFromStruct(comptime Args: type) []const ParamDesc {
                 .name = field.name,
                 .param_type = ti.pt,
                 .allow_null = ti.an,
+                .type_mask = zigTypeToPhpMask(field.type).mask,
+            };
+        }
+        break :blk arr;
+    };
+    return &params;
+}
+
+/// comptime：反射 + overrides 补齐。overrides 中出现的字段用其位掩码，
+/// 其余字段走反射。所有校验已在 createFromWith 中完成。
+fn paramsFromStructWithOverrides(comptime Args: type, comptime overrides: anytype) []const ParamDesc {
+    const info = @typeInfo(Args);
+    if (info != .@"struct") @compileError("createFromWith expects a struct, got " ++ @typeName(Args));
+    const fields = info.@"struct".fields;
+    const ov_fields = @typeInfo(@TypeOf(overrides)).@"struct".fields;
+
+    const params: [fields.len]ParamDesc = blk: {
+        var arr: [fields.len]ParamDesc = undefined;
+        inline for (fields, 0..) |field, i| {
+            var mask = zigTypeToPhpMask(field.type).mask;
+            // overrides 优先：找到同名字段就用其掩码（仅 mixed 字段会走到这里）
+            inline for (ov_fields) |of| {
+                if (comptime std.mem.eql(u8, field.name, of.name)) {
+                    mask = @field(overrides, of.name).mask;
+                }
+            }
+            const ti = zigTypeToPhpType(field.type);
+            arr[i] = ParamDesc{
+                .name = field.name,
+                .param_type = ti.pt,
+                .allow_null = ti.an,
+                .type_mask = mask,
             };
         }
         break :blk arr;
@@ -687,21 +862,43 @@ pub fn Module(comptime opts: ModuleOptions) type {
 
         /// 将方法 flags 哨兵转换为运行时 ACC 标志。
         /// __construct → ACC_PUBLIC|ACC_CTOR，__destruct → ACC_PUBLIC|ACC_DTOR
+        /// 参数是否带类型约束（单一类型标注或联合类型掩码）
+        fn hasTypedParams(desc: FunctionDesc) bool {
+            for (desc.params) |p| {
+                if (p.type_mask != 0) return true;
+                if (p.param_type != .mixed) return true;
+            }
+            return false;
+        }
+
         fn resolveFlags(desc: FunctionDesc) u32 {
-            if (desc.flags == Marker.static_marker) {
-                return c.phpglue_acc_public() | c.phpglue_acc_static();
+            const base = blk: {
+                if (desc.flags == Marker.static_marker) {
+                    break :blk c.phpglue_acc_public() | c.phpglue_acc_static();
+                }
+                if (desc.flags == Marker.protected_marker) {
+                    break :blk c.phpglue_acc_protected();
+                }
+                if (desc.flags == Marker.private_marker) {
+                    break :blk c.phpglue_acc_private();
+                }
+                if (desc.flags == Marker.publicz_marker) {
+                    break :blk c.phpglue_acc_public();
+                }
+                if (desc.flags != 0) break :blk desc.flags;
+                break :blk c.phpglue_acc_public();
+            };
+
+            // 参数带类型约束时必须置 HAS_TYPE_HINTS：PHP 只在 fn_flags 含该位
+            // 时才对内部函数参数做校验与转换（zend_execute.c 中
+            // zend_verify_internal_arg_types 的调用条件）。缺了它，arg_info
+            // 的类型信息虽能被 Reflection 读到，运行时却完全不生效——
+            // 表现为「声明了 int 却照样收到 string/array」，而这正是
+            // hello_format(null,null) 野指针崩溃的成因。
+            if (hasTypedParams(desc)) {
+                return base | c.phpglue_acc_has_type_hints();
             }
-            if (desc.flags == Marker.protected_marker) {
-                return c.phpglue_acc_protected();
-            }
-            if (desc.flags == Marker.private_marker) {
-                return c.phpglue_acc_private();
-            }
-            if (desc.flags == Marker.publicz_marker) {
-                return c.phpglue_acc_public();
-            }
-            if (desc.flags != 0) return desc.flags;
-            return c.phpglue_acc_public();
+            return base;
         }
 
         /// 解析 arg_info + num_args。
@@ -730,48 +927,34 @@ pub fn Module(comptime opts: ModuleOptions) type {
                 if (p.is_variadic or p.default_value != null) break true;
             } else false;
 
-            // 检测是否包含类型标注
+            // 检测是否包含类型标注（单一类型或位掩码）
             const hasTypes = for (desc.params) |p| {
                 if (p.param_type != .mixed or p.allow_null) break true;
+            } else false;
+            const hasMask = for (desc.params) |p| {
+                if (p.type_mask != 0) break true;
             } else false;
 
             var entry_count: usize = 0;
 
-            if (hasFull) {
-                var types: [desc.params.len]u8 = undefined;
-                var nulls: [desc.params.len]u8 = undefined;
+            if (hasFull or hasTypes or hasMask) {
+                // 统一走掩码版本：它能表达 typed 的单一类型、支持联合类型，
+                // 且同样处理 variadic 与默认值。type_mask 为 0 时即 mixed。
+                var masks: [desc.params.len]u32 = undefined;
                 var varis: [desc.params.len]u8 = undefined;
                 var defs: [desc.params.len]?[*:0]const u8 = undefined;
                 for (desc.params, 0..) |p, j| {
-                    types[j] = @intFromEnum(p.param_type);
-                    nulls[j] = @intFromBool(p.allow_null);
+                    masks[j] = paramMask(p);
                     varis[j] = @intFromBool(p.is_variadic);
                     defs[j] = if (p.default_value) |dv| dv.ptr else null;
                 }
-                c.phpglue_fill_arg_info_full(
+                c.phpglue_fill_arg_info_masked(
                     @ptrCast(&param_entries_buf[byte_off]),
                     @intCast(required),
                     &name_ptrs,
-                    &types,
-                    &nulls,
+                    &masks,
                     &varis,
                     &defs,
-                    desc.params.len,
-                    &entry_count,
-                );
-            } else if (hasTypes) {
-                var types: [desc.params.len]u8 = undefined;
-                var nulls: [desc.params.len]u8 = undefined;
-                for (desc.params, 0..) |p, j| {
-                    types[j] = @intFromEnum(p.param_type);
-                    nulls[j] = @intFromBool(p.allow_null);
-                }
-                c.phpglue_fill_arg_info_typed(
-                    @ptrCast(&param_entries_buf[byte_off]),
-                    @intCast(required),
-                    &name_ptrs,
-                    &types,
-                    &nulls,
                     desc.params.len,
                     &entry_count,
                 );
@@ -800,11 +983,15 @@ pub fn Module(comptime opts: ModuleOptions) type {
             // 该函数自身的参数个数精确分配缓冲
             inline for (opts.functions, 0..) |desc, i| {
                 const ai = resolveArgInfo(desc, &off);
+                // flags 此前留空（默认 0），导致 resolveFlags 算出的
+                // ZEND_ACC_HAS_TYPE_HINTS 从未传给 PHP——arg_info 的类型信息
+                // 因此只在 Reflection 里可见，运行时不做校验与转换。
                 function_entries[i] = .{
                     .fname = desc.name.ptr,
                     .handler = desc.handler,
                     .arg_info = ai.ptr,
                     .num_args = ai.num,
+                    .flags = resolveFlags(desc),
                 };
             }
             function_entries[opts.functions.len] = .{};
@@ -1126,8 +1313,36 @@ fn discoverFunctions(comptime file: type) []const FunctionDesc {
             const handler: T.FunctionHandler = @ptrCast(@alignCast(&@field(file, d.name)));
 
             const args_name = std.fmt.comptimePrint("{s}Args", .{php_name});
+            const types_name = std.fmt.comptimePrint("{s}ArgTypes", .{php_name});
+
+            // 静默退化成无类型约束是危险的：曾经 hello_format 声明了 FormatArgs
+            // 但命名不匹配，约束没生效，null 直接进 handler 导致野指针崩溃。
+            // 故声明了任何 *Args / *Types 形式却对不上名字时，一律编译错误。
+            // 显式出口：`{name}Untyped` 表示「故意不做类型约束」。
+            // 无参函数用它；有参但想保留 unsafe 灵活性的也可显式声明。
+            const untyped_name = std.fmt.comptimePrint("{s}Untyped", .{php_name});
+            if (!@hasDecl(file, args_name) and !@hasDecl(file, untyped_name)) {
+                @compileError(std.fmt.comptimePrint(
+                    \\php-zig: function `php_{0s}` has no parameter type declaration.
+                    \\
+                    \\  Add ONE of the following:
+                    \\    pub const {0s}Args = struct {{ ... }};   // 反射生成类型约束
+                    \\    pub const {0s}ArgTypes = .{{ ... }};      // 联合类型补齐（需配合 Args）
+                    \\    pub const {0s}Untyped = true;             // 故意不加约束（无参函数用）
+                    \\
+                    \\  This is an error rather than a silent fallback because a
+                    \\  misnamed declaration (e.g. `FormatArgs` instead of
+                    \\  `hello_formatArgs`) previously caused the type constraint
+                    \\  to be dropped silently — which let null reach the handler
+                    \\  and crash via a wild pointer dereference.
+                , .{php_name}));
+            }
+
             arr[idx] = if (@hasDecl(file, args_name))
-                FunctionDesc.createFrom(php_name, handler, @field(file, args_name))
+                if (@hasDecl(file, types_name))
+                    FunctionDesc.createFromWith(php_name, handler, @field(file, args_name), @field(file, types_name))
+                else
+                    FunctionDesc.createFrom(php_name, handler, @field(file, args_name))
             else
                 FunctionDesc{ .name = php_name, .handler = handler };
             idx += 1;

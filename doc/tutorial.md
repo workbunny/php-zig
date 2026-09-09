@@ -138,11 +138,18 @@ fn greet(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) v
 
 fn add(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     if (phpzig.Return.callNumArgs(ed) < 2) { phpzig.Return.returnNull(rv); return; }
-    const a = phpzig.Return.callArg(ed, 1);
-    const b = phpzig.Return.callArg(ed, 2);
-    phpzig.Return.returnLong(rv,
-        (if (a.isLong()) a.toLong() else 0) +
-        (if (b.isLong()) b.toLong() else 0));
+    // toLong() 是官方弱转换（"1"→1、null→0），与 PHP 语义一致；
+    // 不要用 `if (isLong()) ... else 0`——那会绕过转换，add("1","2") 返回 0
+    const a = phpzig.Return.callArg(ed, 1).toLong();
+    const b = phpzig.Return.callArg(ed, 2).toLong();
+    // 裸 + 会溢出（PHP_INT_MAX+1 在 Debug 下 panic，Release 下静默 wrap），
+    // 须用 @addWithOverflow 并按 PHP 语义溢出转 float
+    const sum, const overflowed = @addWithOverflow(a, b);
+    if (overflowed != 0) {
+        phpzig.Return.returnDouble(rv, @as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b)));
+    } else {
+        phpzig.Return.returnLong(rv, sum);
+    }
 }
 ```
 
@@ -194,7 +201,25 @@ phpzig.FunctionDesc.createFrom("query", query, OptArgs),
 | `f64`, `f32` | `float` |
 | `bool` | `bool` |
 | `[]const u8`, `[:0]const u8` | `string` |
-| `*T.Zval` | `mixed` |
+| `*T.Zval` | `mixed`（无类型约束） |
+| `?T`（任一上述类型） | `?php_type`（nullable） |
+
+**Zig 表达不了的联合类型**（`int|string`、`callable` 等）用
+`createFromWith` + `PhpType` 补齐，字段须声明为 `*T.Zval`（mixed）：
+
+```zig
+const KeyArgs = struct { key: *T.Zval };   // mixed 字段才能被 ArgTypes 覆盖
+const KeyArgTypes = .{
+    .key = phpzig.PhpType.long.unionWith(phpzig.PhpType.string), // int|string
+};
+
+// 手动注册
+phpzig.FunctionDesc.createFromWith("find", find, KeyArgs, KeyArgTypes),
+// 或自动发现（见「模块入口」一节：<name>ArgTypes 约定）
+```
+
+`PhpType` 常用组合：`string.unionWith(long)`（int|string）、`nullable()`（?int）、
+`bool_`（false|true，PHP 的 bool 是两个独立类型的联合）、`callable`/`iterable`。
 
 **静态方法**用 `createStaticFrom`，其余完全相同。
 
@@ -250,22 +275,13 @@ phpzig.Return.returnZval(rv, &other_zval);
 ```zig
 const arg = phpzig.Return.callArg(execute_data, 1);
 
+// 类型判断——先用 is* 确认，再按对应方式取
 if (arg.isString()) {
     const s: []const u8 = arg.toStringVal();
 }
-
-if (arg.isLong()) {
-    const v: c_long = arg.toLong();
-}
-
-if (arg.isDouble()) {
-    const v: f64 = arg.toDouble();
-}
-
-if (arg.isBool()) {
-    const v: bool = arg.toBool();
-}
-
+if (arg.isLong()) { ... }
+if (arg.isDouble()) { ... }
+if (arg.isBool()) { ... }
 if (arg.isNull()) { ... }
 if (arg.isArray()) { ... }
 if (arg.isObject()) { ... }
@@ -278,6 +294,24 @@ if (arg.isScalar()) { ... }     // int/float/string/bool
 if (arg.isEmpty()) { ... }      // 等价 PHP empty()
 if (arg.isNumeric()) { ... }    // int/float/数值字符串
 ```
+
+**取值是官方弱转换（PHP 语义），不是类型洁癖**：
+
+```zig
+// toLong() = zval_get_long：IS_LONG 直读（快路径零开销），其他按 PHP 转换
+const v: c_long = arg.toLong();      // "1"→1、1.9→1、null→0、[]→0
+const d: f64    = arg.toDouble();    // zval_get_double
+const b: bool   = arg.toBool();      // zval_is_true
+
+// 字符串：非字符串返回空串（底层防野指针），要区分用 asString()
+const s: []const u8  = arg.toStringVal();  // 非字符串 → ""
+const opt: ?[]const u8 = arg.asString();   // 非字符串 → null
+```
+
+**为什么不能直读字段**：内部函数的 arginfo 类型校验只在 ZEND_DEBUG 构建生效
+（详见 special.md），Release 下 handler 可能收到任意类型。若直读 `Z_LVAL_P`
+/`Z_STRVAL_P`，会把 string/array 的指针当数值/字符串解读——不崩溃时返回
+「看似合理却错误的数字」。弱转换保证**永不返回垃圾指针**。
 
 ### zval 设值
 
@@ -556,8 +590,12 @@ if (arr.exists("key")) { ... }
 arr.del("key");
 arr.delIndex(0);
 
-// 弹出
-if (arr.pop()) |val| { ... }
+// 弹出——out-param 形态（返回 ?Zval 会把栈地址暴露出去，见下）
+var out: T.Zval = undefined;
+if (arr.pop(&out)) {
+    defer c.phpglue_zval_ptr_dtor(&out);   // out 带走引用计数，用后须释放
+    // 使用 out
+}
 
 // 迭代
 var iter = arr.iterator();
@@ -573,8 +611,11 @@ const n: u32 = arr.count();
 ### 数组高级操作
 
 ```zig
-// shift — 移除并返回首元素（空数组返回 null）
-if (arr.shift()) |val| { ... }
+// shift — 移除并返回首元素（out-param，同 pop；空数组返回 false）
+var out: T.Zval = undefined;
+if (arr.shift(&out)) {
+    defer c.phpglue_zval_ptr_dtor(&out);
+}
 
 // unshift — 头部插入（数字键重索引）
 arr.unshift(some_zval);
@@ -782,13 +823,45 @@ const a = arena.allocator();
 var list: std.ArrayList(i64) = .empty; // Zig 0.16：unmanaged，方法传 allocator
 defer list.deinit(a);
 list.append(a, 10) catch unreachable;
-const used = arena.bytesAllocated();   // 累计字节（预留统计接口）
+const used = arena.bytesAllocated();   // 本实例累计字节（含 arena 内部节点开销）
 
 // Cleanup：绕过 arena 自行管理资源时，注册任意回收逻辑
 phpzig.Cleanup.register(myCleanupFn, data);
 ```
 
 `defer` 负责正常路径，`Cleanup.register`/arena 负责 bailout 兜底，两者叠加。
+
+### Zig 侧内存治理 ★ v0.10.1
+
+`RequestArena` 的 backing 是 `c_allocator`（malloc），**不进 PHP 内存池、
+不受 `memory_limit` 约束**——进程可在 PHP 侧完全无感知的情况下逼近容器上限
+被 OOM killer 杀死。故框架提供可观测 + 可约束两层：
+
+```zig
+// 可观测：进程级计数（跨全部 arena 实例）
+phpzig.Arena.usage();   // 当前 Zig 侧活跃占用
+phpzig.Arena.peak();    // 进程内峰值（RSHUTDOWN 后仍保留）
+```
+
+```ini
+; INI 配置（MINIT 自动读取）
+phpzig.arena_limit = 0              ; 字节，0 = 不以此项限制
+phpzig.arena_account_to_php = 1     ; 参与 memory_limit 额度（默认开）
+phpzig.arena_check_interval = 65536 ; 降频阈值，默认 64K（每轮核算的误差上界）
+```
+
+额度取 `arena_limit` 与 `memory_limit` 剩余的较小者。**限额语义是 reject**：
+超限时 `alloc` 返回 `error.OutOfMemory`，由业务代码自行决定降级还是抛异常。
+
+```zig
+const buf = a.alloc(u8, 4096) catch |err| {
+    // 超限（或真 OOM）：降级或抛异常，框架不替下游决策
+    return;
+};
+```
+
+> 容器感知（读 cgroup limit）与水位告警不在框架职责内，由下游基于
+> `usage()`/`peak()` 自行实现——php-zig 是骨架。
 
 ### 内存归属心智模型
 
@@ -946,9 +1019,50 @@ comptime {
 
 **注意**：
 - `error` 是 Zig 保留字，字段名须 `@"error"` 转义，访问时 `obs.@"error"`。
-- fcall observer 观察**所有函数**（含内部函数），下游自行过滤；测试用相对增量断言。
 - fiber 观察回调拿到的是 status（非 Fiber 对象），需要对象细节时配合 `Fiber.getCurrent()`。
 - 观察是旁路动作，不拦截执行；返回值改写/reject 不在 observer 能力内（用 `Throw`）。
+
+### Observer 现场信息与过滤 ★ v0.10.1
+
+**过滤下推**：观察全部函数会付全量回调开销。设 `fcall_filter` 后，引擎把判定
+结果缓存进该函数槽位，未放行的函数此后**完全不进入 observer**（零开销）：
+
+```zig
+fn onFcallFilter(name: [*c]const u8, name_len: usize,
+    scope: ?[*:0]const u8, scope_len: usize,
+    internal: c_int) callconv(.c) c_int {
+    const n: []const u8 = if (name != null) name[0..name_len] else "";
+    // 只观察 hello_world：返回 0 表示不观察该函数
+    return if (std.mem.eql(u8, n, "hello_world")) 1 else 0;
+}
+
+.observer = .{
+    .fcall_filter = onFcallFilter,
+    // ...
+}
+```
+
+filter 对每个函数**只调用一次**（结果被缓存），可放心在其中做字符串比较。
+
+**现场信息**（仅 fcall begin/end 回调内有效，指针不得缓存到回调外）：
+
+```zig
+fn onBegin(execute_data: *T.ZendExecuteData) callconv(.c) void {
+    const info = phpzig.Observer.funcInfo(execute_data);
+    // info.func_name / scope_name（类名）/ filename（定义文件）
+    // info.lineno（定义行，内部函数 0）/ internal / is_method / num_args
+
+    const site = phpzig.Observer.callSite(execute_data);
+    // site.file / site.lineno —— 调用发生的位置（谁调用了我），
+    // 与 funcInfo 的「被调函数定义位置」语义不同
+}
+
+fn onDeclared(_: [*c]const u8, _: usize, handle: ?*anyopaque) callconv(.c) void {
+    // handle 不透明指针：function_declared 是 zend_op_array*，
+    // class_linked 是 zend_class_entry*。框架刻意不解释其内容——
+    // 布局跨 PHP 版本变化，需要时在 C 胶水层解析。
+}
+```
 
 ### 接口与实现
 
@@ -1026,28 +1140,36 @@ fn warn(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
 在 `comptime` 块中调用 `phpzig.moduleInit(@This(), meta)`——扫描当前文件，
 按命名约定自动发现函数与类，并导出 `get_module` 符号。
 
-命名约定（声明须为 `pub`）：
+命名约定（声明须为 `pub`，有参函数**必须**配套 Args，否则编译错误）：
 
 | 声明 | 含义 |
 |------|------|
 | `pub fn php_<name>` | 模块函数 `<name>` |
 | `pub fn php_<name>` + `pub const <name>Args` | 有参函数（Args 字段 = 参数名/类型） |
+| `pub fn php_<name>` + `pub const <name>ArgTypes` | 联合类型补齐（配合 `<name>Args` 用，见「参数元信息」节） |
+| `pub fn php_<name>` + `pub const <name>Untyped = true` | **故意**不做类型约束（无参函数用） |
 | `pub const Class_<name>` | 类 `<name>`（内部用 public_/static_ 等前缀） |
 
 ```zig
 const phpzig = @import("phpzig");
 const T = phpzig.php_types;
 
-// 无参函数——自动发现
+// 无参函数——自动发现，须显式声明不做类型约束
+pub const helloUntyped = true;
 pub fn php_hello(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     phpzig.Return.returnString(rv, "Hello");
 }
 
-// 有参函数——参数由伴生 struct 反射
+// 有参函数——参数由伴生 struct 反射（toLong 弱转换，溢出转 float）
 pub fn php_add(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const a = phpzig.Return.callArg(ed, 1).toLong();
     const b = phpzig.Return.callArg(ed, 2).toLong();
-    phpzig.Return.returnLong(rv, a + b);
+    const sum, const overflowed = @addWithOverflow(a, b);
+    if (overflowed != 0) {
+        phpzig.Return.returnDouble(rv, @as(f64, @floatFromInt(a)) + @as(f64, @floatFromInt(b)));
+    } else {
+        phpzig.Return.returnLong(rv, sum);
+    }
 }
 pub const addArgs = struct { a: i64, b: i64 };   // php_add 的参数
 
@@ -1063,9 +1185,9 @@ comptime {
 }
 ```
 
-**为何不能 100% 只写 `@This()`**：Zig 函数签名没有参数名（`@typeInfo(fn)` 拿不到
-`fn add(a,b)` 的 a/b），所以有参函数必须用 `<name>Args` struct 提供参数名；
-默认值/可变参数也无法从字段推导，需 `meta.functions` 显式。
+**为何强制 Args 声明而非静默退化**：历史上 `FormatArgs` 命名不匹配导致约束
+静默失效，null 直达 handler 触发野指针崩溃——「以为有约束实际没有」比没有
+约束更危险，故缺失 Args 时直接编译错误。
 
 `moduleInit(@This(), meta)` 的底层仍是 `Module()`（供需要持有 Module type 引用的高级用法）：
 
@@ -1081,16 +1203,18 @@ comptime { @export(&M.get_module, .{ .name = "get_module" }); }
 ```bash
 cd php-zig
 zig build test
-# 57/57 通过
+# 74/74 通过
 ```
 
-集成测试扩展（`example/tests/`）编译后运行 PHP 集成测试：
+集成测试扩展（`example/tests/`）编译后运行**三件套**（功能正确 / 崩溃隔离 /
+类型语料矩阵——PHP 弱类型的越界行为只靠功能断言测不出，故有后两者）：
 
 ```bash
 cd example/tests
 zig build -Dphp=/usr/local
-php -d extension=zig-out/lib/libext-tests.so test_all.php
-# 179/179 通过
+php -d extension=zig-out/lib/libext-tests.so test_all.php     # 功能 200/200
+php -d extension=zig-out/lib/libext-tests.so test_crash.php   # 崩溃隔离 59/59（fork + 信号检测）
+php -d extension=zig-out/lib/libext-tests.so test_corpus.php  # 语料矩阵 312/312（任意类型 × API 不崩溃）
 ```
 
 最小示例（`example/hello/`）构建与运行：

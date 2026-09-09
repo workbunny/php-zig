@@ -13,6 +13,8 @@ const c = phpzig.php_c;
 // ＝＝ 既有函数 ＝＝
 
 // 命名约定自动发现：php_ 前缀 → 模块函数（无需在注册块显式列出）
+/// 无参函数：显式声明不做类型约束
+pub const hello_worldUntyped = true;
 pub fn php_hello_world(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
     phpzig.Return.returnString(return_value, "Hello from Zig!");
 }
@@ -39,6 +41,8 @@ fn helloName(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
     phpzig.Return.returnString(return_value, msg);
 }
 
+/// 无参函数：显式声明不做类型约束
+pub const versionUntyped = true;
 pub fn php_version(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
     phpzig.Return.returnString(return_value, "php-zig v0.9.0");
 }
@@ -50,9 +54,25 @@ pub fn php_add(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    phpzig.Return.returnLong(return_value, (if (a.isLong()) a.toLong() else @as(c_long, 0)) + (if (b.isLong()) b.toLong() else @as(c_long, 0)));
+    // toLong() 是官方弱转换（zval_get_long）："1"→1、null→0、[]→0，
+    // 永不返回垃圾值。此前用 `isLong() else 0` 会绕过转换——string 被当 0，
+    // add("1","2") 返回 0 而非 3，与 PHP 语义不符。
+    const x = a.toLong();
+    const y = b.toLong();
+
+    // 整数溢出：Debug 构建有检查会 panic，Release 构建**静默 wrap 成负数**——
+    // 返回看似合理却错误的结果比崩溃更难发现。按 PHP 语义溢出转 float。
+    const sum, const overflowed = @addWithOverflow(x, y);
+    if (overflowed != 0) {
+        phpzig.Return.returnDouble(return_value, @as(f64, @floatFromInt(x)) + @as(f64, @floatFromInt(y)));
+    } else {
+        phpzig.Return.returnLong(return_value, sum);
+    }
 }
-pub const addArgs = struct { a: *T.Zval, b: *T.Zval }; // php_add 的参数（*T.Zval = mixed）
+// 用 i64 而非 *T.Zval：此前 mixed 不生成约束，PHP 不做转换，
+// 于是 add("1","2") 里 isLong() 为 false 而返回 0（应为 3）。
+// 声明 int 后 PHP 负责转换，入参到 handler 时已是合法 int。
+pub const addArgs = struct { a: i64, b: i64 };
 
 fn helloDivide(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
     if (phpzig.Return.callNumArgs(execute_data) < 2) {
@@ -306,7 +326,16 @@ fn helloSum(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    phpzig.Return.returnLong(return_value, a.toLong() + b.toLong());
+    const x = a.toLong();
+    const y = b.toLong();
+    // 溢出保护：裸 + 在 Debug 下对 PHP_INT_MAX+1 会 panic（ABRT，语料库测试
+    // 实测命中），Release 下静默 wrap。按 PHP 语义溢出转 float。
+    const sum, const overflowed = @addWithOverflow(x, y);
+    if (overflowed != 0) {
+        phpzig.Return.returnDouble(return_value, @as(f64, @floatFromInt(x)) + @as(f64, @floatFromInt(y)));
+    } else {
+        phpzig.Return.returnLong(return_value, sum);
+    }
 }
 
 const SumArgs = struct { a: i64, b: i64 };
@@ -1018,6 +1047,62 @@ fn helloArenaSetLimit(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     phpzig.Return.returnBool(rv, true);
 }
 
+// ＝＝ 类型系统验证（v0.10.1）＝＝
+//
+// 这些函数只为验证 arg_info 类型约束是否真的生成并生效，不承载业务逻辑。
+// 崩溃根因正是「声明了 Args 但命名不匹配 → 约束静默失效 → null 进 handler →
+// 野指针解引用」，故必须有可观测的对照。
+
+/// key 为 int|string 联合类型（Zig 类型系统无法表达的场合）
+/// key 为 int|string 联合类型（Zig 类型系统无法表达的场合）
+fn helloUnionKey(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const key = phpzig.Return.callArg(ed, 1);
+    if (key.isLong()) {
+        phpzig.Return.returnString(rv, "int");
+    } else if (key.isString()) {
+        phpzig.Return.returnString(rv, "string");
+    } else {
+        phpzig.Return.returnString(rv, "other");
+    }
+}
+const helloUnionKeyArgs = struct { key: *T.Zval };
+const helloUnionKeyArgTypes = .{
+    .key = phpzig.PhpType.long.unionWith(phpzig.PhpType.string),
+};
+
+/// 反射生成：name 为 string（不可 null）、count 为 int
+fn helloTypedArgs(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const name = phpzig.Return.callArg(ed, 1);
+    const count = phpzig.Return.callArg(ed, 2);
+    const msg = std.fmt.allocPrint(
+        std.heap.c_allocator,
+        "{s}:{d}",
+        .{ name.toStringVal(), count.toLong() },
+    ) catch {
+        phpzig.Return.returnNull(rv);
+        return;
+    };
+    defer std.heap.c_allocator.free(msg);
+    phpzig.Return.returnString(rv, msg);
+}
+const helloTypedArgsArgs = struct {
+    name: []const u8,
+    count: i64,
+};
+
+/// callable 伪类型
+fn helloCallableArg(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const cb = phpzig.Return.callArg(ed, 1);
+    var ret: T.Zval = undefined;
+    if (phpzig.PhpFunc.callZval(cb.ptr, &ret, &.{})) {
+        phpzig.Return.returnZval(rv, &ret);
+    } else {
+        phpzig.Return.returnNull(rv);
+    }
+}
+const helloCallableArgArgs = struct { cb: *T.Zval };
+const helloCallableArgArgTypes = .{ .cb = phpzig.PhpType.callable };
+
 fn helloMemAssoc(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const n = phpzig.Return.callArg(ed, 1).toLong();
     var total: T.zend_long = 0;
@@ -1200,6 +1285,10 @@ comptime {
             phpzig.FunctionDesc.create("hello_arena_peak", helloArenaPeak),
             phpzig.FunctionDesc.create("hello_arena_fill", helloArenaFill),
             phpzig.FunctionDesc.create("hello_arena_set_limit", helloArenaSetLimit),
+            // 类型系统验证
+            phpzig.FunctionDesc.create("hello_union_key", helloUnionKey),
+            phpzig.FunctionDesc.create("hello_typed_args", helloTypedArgs),
+            phpzig.FunctionDesc.create("hello_callable_arg", helloCallableArg),
             phpzig.FunctionDesc.create("hello_obs_fiber_init", helloObsFiberInit),
             phpzig.FunctionDesc.create("hello_obs_fiber_switch", helloObsFiberSwitch),
             phpzig.FunctionDesc.create("hello_obs_fiber_destroy", helloObsFiberDestroy),
@@ -1290,7 +1379,14 @@ fn calcAdd(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c)
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    phpzig.Return.returnLong(return_value, (if (a.isLong()) a.toLong() else @as(c_long, 0)) + (if (b.isLong()) b.toLong() else @as(c_long, 0)));
+    const x = a.toLong(); // 弱转换（PHP 语义），同 php_add
+    const y = b.toLong();
+    const sum, const overflowed = @addWithOverflow(x, y);
+    if (overflowed != 0) {
+        phpzig.Return.returnDouble(return_value, @as(f64, @floatFromInt(x)) + @as(f64, @floatFromInt(y)));
+    } else {
+        phpzig.Return.returnLong(return_value, sum);
+    }
 }
 
 fn calcMultiply(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -1300,7 +1396,7 @@ fn calcMultiply(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callcon
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    phpzig.Return.returnLong(return_value, (if (a.isLong()) a.toLong() else @as(c_long, 0)) * (if (b.isLong()) b.toLong() else @as(c_long, 0)));
+    phpzig.Return.returnLong(return_value, a.toLong() * b.toLong()); // 弱转换
 }
 
 fn calcSubtract(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {

@@ -76,9 +76,11 @@ uint8_t phpglue_zval_type(zval *zv);
  * ================================================================ */
 
 /** 读 long 值。实现为 Z_LVAL_P（直接读字段），不做类型转换。
- *  已是 Z_LVAL_P 语义，无需再提供 unchecked 变体。 */
+ *  非 long 时读到的是同一联合体的其它字段，值无意义但**不会**解引用野指针。 */
 zend_long   phpglue_zval_get_long(zval *zv);
 double      phpglue_zval_get_double(zval *zv);
+/** 读字符串数据区。非字符串返回 NULL（配 phpglue_zval_get_string_len 的 0）
+ *  —— 这是 Z_STRVAL_P 的安全替代，后者对非字符串会解引用野指针 */
 const char *phpglue_zval_get_string_val(zval *zv);
 size_t      phpglue_zval_get_string_len(zval *zv);
 zend_array *phpglue_zval_get_array(zval *zv);
@@ -296,6 +298,16 @@ void phpglue_fill_arg_info_typed(void *dst, uint32_t required_count,
     const char **names, const uint8_t *types, const uint8_t *allow_null,
     size_t name_count, size_t *out_entry_count);
 
+/** 按 MAY_BE_* 位掩码填充参数 arg_info，支持 `int|string` 这类联合类型。
+ *
+ *  type_masks[i] 为 0 表示无约束（mixed）。位值与 Zig 侧 PhpType 常量一一
+ *  对应，由 php_glue.c 顶部的静态断言守护。
+ *  nullable 无需单独传：MAY_BE_NULL 位与 _ZEND_TYPE_NULLABLE_BIT 同值。 */
+void phpglue_fill_arg_info_masked(void *dst, uint32_t required_count,
+    const char **names, const uint32_t *type_masks,
+    const uint8_t *variadic, const char **default_values,
+    size_t name_count, size_t *out_entry_count);
+
 /* 完整版 — 在 typed 基础上增加可变参数与默认值。
  * variadic[i]：非零表示该参数为可变参数（...$args），仅对最后一个参数有意义
  * default_values[i]：默认值源码字符串（如 "NULL"、"0"、"[]"），可传 NULL 表示无默认值  */
@@ -401,6 +413,11 @@ int phpglue_register_class_full(const char *name, size_t name_len, const zend_fu
     const void **const_vals, size_t *const_val_lens, uint8_t *const_types,
     int prop_count, const char **prop_keys, size_t *prop_key_lens,
     const void **prop_vals, size_t *prop_val_lens, uint32_t *prop_accesses, uint8_t *prop_types);
+
+/** ZEND_ACC_HAS_TYPE_HINTS 标志位。PHP 仅在 fn_flags 含该位时才对内部函数
+ *  参数做类型校验与转换（zend_execute.c: zend_verify_internal_arg_types）。
+ *  缺少它时 arg_info 的类型信息虽能被 Reflection 读到，运行时却不生效。 */
+uint32_t phpglue_acc_has_type_hints(void);
 
 /** 注册接口（等价 zend_register_internal_interface），成功返回 1 */
 int phpglue_register_interface(const char *name, size_t name_len, const zend_function_entry *methods);

@@ -1042,3 +1042,134 @@ Zig 普通函数不是闭包，无法捕获外层局部变量。
 var ctx = ExtContext{ .b = b, ... };
 configure(&ctx);
 ```
+
+## 内部函数 arginfo 类型校验只在 ZEND_DEBUG 构建生效
+
+### 问题
+
+arg_info 里写明了 `int`/`string` 类型，Reflection 也正确显示（`add(int $a, int $b)`），但运行时 PHP **不做校验也不转换**——`add("1","2")` 返回 0（handler 收到原始 string），`add(null,2)` 返回 2。
+
+### 根因（源码依据）
+
+`zend_execute.c` 的 `zend_internal_call_should_throw` **整个包在 `#if ZEND_DEBUG` 里**：
+
+```c
+#if ZEND_DEBUG
+static zend_always_inline bool zend_internal_call_should_throw(...)
+    ...
+#endif
+```
+
+注释明确：「In release builds, we trust that arginfo matches what is enforced by `zend_parse_parameters`」。即 Release 构建下，PHP 把内部函数的类型校验责任**完全委托给 handler 的 `zend_parse_parameters`**——php-zig 没有等价物，handler 拿到的是原始未转换 zval。
+
+### 结论
+
+1. arginfo 类型标注的价值：Reflection / IDE / 文档 + ZEND_DEBUG 构建的运行时检查。
+2. **Release 下运行时不强制**——取值必须走官方弱转换（见下节），不能依赖 arginfo 兜底。
+
+## 取值必须走官方弱转换（zval_get_long），不能 Z_LVAL_P 直读
+
+### 问题
+
+`hello_sum("5","3")` 返回 `218321324866848` 这类指针值——把 `zend_string*` 当成 `zend_long` 读了。Debug 下 `hello_format(null,null)` 直接触发 misaligned address 崩溃（读到 0x2）。
+
+### 根因
+
+上一节已说明：Release 构建下内部函数参数不经过引擎层校验/转换，handler 收到的 zval 可能是**任意类型**。此时 `Z_LVAL_P`/`Z_STRVAL_P` 直读会把 union 里其它字段（指针）当数值/字符串解读——不触发对齐检查时返回「看似合理却错误的数字」。
+
+### 解决方案
+
+`phpglue_zval_get_long/double` 改用官方弱转换 `zval_get_long()`/`zval_get_double()`：IS_LONG/IS_DOUBLE 快路径直读零开销，其他类型按 PHP 语义转换（`"1"`→1、`null`→0、`[]`→0），**永不返回垃圾指针**。
+
+这符合「拿到什么按什么处理」原则——与 PHP 内置函数（handler 用 `zend_parse_parameters`）行为一致。
+
+## 模块级函数的 flags 从未传递（ZEND_ACC_HAS_TYPE_HINTS 失效）
+
+### 问题
+
+给参数加了类型约束后仍不生效，排查发现 `zend_function_entry.flags` 恒为 0——`resolveFlags()` 算出的 static/protected/`ZEND_ACC_HAS_TYPE_HINTS` 从未传给 PHP。
+
+### 根因
+
+`initFunctionEntries` 构造 `zend_function_entry` 时**漏了 `.flags` 字段**（默认 0）。类方法走另一条路径（`zend_register_internal_class` 系列），所以不受影响；模块级函数全部中招。
+
+### 解决方案
+
+```zig
+function_entries[i] = .{
+    .fname = desc.name.ptr,
+    .handler = desc.handler,
+    .arg_info = ai.ptr,
+    .num_args = ai.num,
+    .flags = resolveFlags(desc),   // 此前缺失
+};
+```
+
+注意：即便补上 `ZEND_ACC_HAS_TYPE_HINTS`，运行时校验仍受「只在 ZEND_DEBUG」限制——该标志的意义更多是让 Reflection 正确展示类型信息。
+
+## PhpType 位掩码 + ZEND_TYPE_INIT_MASK：表达联合类型
+
+### 问题
+
+PHP 8.0+ 支持 `int|string` 联合类型。arg_info 的 `type` 字段在 Zend 里是 `zend_type`，其 `type_mask` 字段是 **MAY_BE_* 位组合**——单类型用 `ZEND_TYPE_INIT_CODE`（`1 << type`），联合直接 OR 掩码即可。但 php-zig 原来只用 enum(u8) 的 `ParamType` 表达单类型。
+
+### 解决方案
+
+1. Zig 侧新增 `PhpType`（`packed struct(u32)`），字段是 `MAY_BE_*` 位值，`unionWith()` 链式组合：
+
+```zig
+PhpType.string.unionWith(PhpType.long)              // string|int
+PhpType.string.unionWith(PhpType.long).nullable()   // string|int|null
+```
+
+2. 方法名不能用 `or`——**它是 Zig 保留字**，报 `expected function, found keyword`。
+3. glue 新增 `phpglue_fill_arg_info_masked`，内部 `ZEND_TYPE_INIT_MASK(mask | extra_flags)`。
+4. 位值由 glue 顶部 11 条 `_Static_assert` 守护——PHP 调整 MAY_BE_* 布局即编译失败，不会「类型约束静默失效」。
+
+### 关键认知
+
+`MAY_BE_NULL` 位与 `_ZEND_TYPE_NULLABLE_BIT` **同值**（`0x2`）——PHP 里 `?int` 与 `int|null` 完全等价，`nullable()` 就是 `unionWith(null_)`。
+
+## 联合类型不拦截隐式转换：`strict_types` 与内部函数
+
+### 问题
+
+以为声明 `int $a` 后传 `"123"` 会抛 TypeError——实测不会。
+
+### 实测结论（php-src + 运行时双确认）
+
+1. `declare(strict_types=1)` 对内部函数**生效**，由**调用方文件**决定。
+2. 但可隐式转换的（`"123"`→int、`1.9`→int、`true`→int）**永不报错**，静默转换。
+3. 只有无法转换的（array→string、null→非 nullable）才抛 TypeError。
+
+### 含义
+
+类型标注挡住「类别错误」（防 UB），挡不住「转换后的值域问题」。测试断言须分三类：TypeError / 转换后的值 / 不崩溃。
+
+## `<name>Args` 命名不匹配必须编译错误（防约束静默失效）
+
+### 问题
+
+`hello_format` 声明的是 `FormatArgs`，而自动注册找 `hello_formatArgs`——找不到就静默退化成无类型约束。结果 `hello_format(null,null)` 把 null 直接送进 handler，`Z_STRVAL_P` 解引用野指针崩溃。
+
+### 根因
+
+`moduleInit(@This())` 自动发现逻辑：找得到 `{name}Args` 就带约束注册，找不到就 `FunctionDesc{ .name, .handler }`（无约束）——**静默退化**是缺陷（「以为有约束实际没有」比没有约束更危险）。
+
+### 解决方案
+
+找不到 `{name}Args` 时**编译错误**，提示三种写法：
+
+```
+pub const {name}Args = struct { ... };   // 反射生成类型约束
+pub const {name}ArgTypes = .{ ... };      // 联合类型补齐（配合 Args）
+pub const {name}Untyped = true;           // 故意不加约束（无参函数用）
+```
+
+`{name}ArgTypes` 是新增约定：联合类型等 Zig 表达不了的，用同名 `{name}ArgTypes` 声明。
+
+### comptime 校验（createFromWith）
+
+`overrides`（ArgTypes）的校验都是**显式编译错误**而非静默：
+- 字段必须在 `Args` 中存在（防拼写错误）
+- 只能覆盖 `*T.Zval`（mixed）字段——反射已推出类型的字段不允许覆盖，冲突说明意图不清

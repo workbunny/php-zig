@@ -102,7 +102,8 @@ pub const FunctionDesc = struct {
 | `createStatic(name, handler)` | 静态方法 |
 | `createWithParams(name, handler, params)` | 带参数描述 |
 | `createStaticWithParams(...)` | 静态 + 参数 |
-| `createFrom(name, handler, Args)` | **comptime 反射**：struct 字段 → 参数（类型/可空自动推导） |
+| `createFrom(name, handler, Args)` | **comptime 反射**：struct 字段 → 参数（类型/可空自动推导）。Zig 表达不了的（联合类型）用 `createFromWith` |
+| `createFromWith(name, handler, Args, ArgTypes)` | 反射 + 显式补齐（联合类型 / callable 等） |
 | `createStaticFrom(...)` | 反射 + 静态 |
 | `createProtected(name, handler)` / `createProtectedWithParams(...)` | protected 方法 |
 | `createPrivate(name, handler)` / `createPrivateWithParams(...)` | private 方法 |
@@ -111,7 +112,34 @@ pub const FunctionDesc = struct {
 // createFrom 示例：字段顺序 = 参数顺序，字段名 = 参数名
 const AddArgs = struct { a: i64, b: i64, name: []const u8 };
 FunctionDesc.createFrom("my_add", my_add, AddArgs);
+
+// createFromWith 示例：联合类型（i64 无法表达 int|string）
+const KeyArgs = struct { key: *T.Zval };        // mixed 字段
+FunctionDesc.createFromWith("f", f, KeyArgs, .{
+    .key = phpzig.PhpType.long.unionWith(phpzig.PhpType.string),
+});
 ```
+
+> **编译期校验**（`createFromWith`）：ArgTypes 的字段必须存在于 Args 中，且只能
+> 覆盖 mixed（`*T.Zval`）字段——反射已推出类型的字段被覆盖会编译错误。
+> 名字冲突用 `unionWith` 组合，方法名不是 `or`（Zig 保留字）。
+
+#### 自动发现命名约定（`moduleInit(@This(), ...)`）
+
+`moduleInit` 接收 `@This()` 时自动发现 `pub fn php_*` 函数并注册为 PHP 同名函数
+（去 `php_` 前缀）。有参函数须配套声明，三种写法：
+
+```zig
+pub const hello_echoArgs = struct { name: []const u8, times: i64 }; // ① 反射
+pub const hello_keyArgTypes = .{ .key = phpzig.PhpType.long.unionWith(...) }; // ② 联合类型补齐
+pub const hello_worldUntyped = true;  // ③ 故意不加约束（无参函数用）
+```
+
+规则：
+- `pub fn php_hello_echo` 找 `hello_echoArgs`（反射类型）；有 `hello_echoArgTypes`
+  则叠加联合类型
+- **缺 Args 且无 Untyped → 编译错误**（不是静默退化）。历史上 `FormatArgs` 命名
+  不匹配导致约束静默失效，null 直达 handler 触发野指针崩溃——故强制显式声明。
 
 ### ParamDesc / ParamType
 
@@ -120,6 +148,9 @@ pub const ParamDesc = struct {
     name: [:0]const u8,
     param_type: ParamType = .mixed,
     allow_null: bool = false,
+    /// MAY_BE_* 位掩码（联合类型）。非零时优先于 param_type——
+    /// 单类型用 param_type，`int|string` 用 type_mask（经 PhpType）
+    type_mask: u32 = 0,
     is_variadic: bool = false,
     default_value: ?[:0]const u8 = null, // PHP 源码字符串，如 "0"、"[]"、"NULL"
 };
@@ -136,6 +167,21 @@ pub const ParamDesc = struct {
 | `createTypedWithDefault(name, pt, dv)` | 类型 + 默认值 |
 
 `ParamType` 枚举：`mixed / long / double / string / array / object / bool / callable / iterable`。
+
+#### PhpType（联合类型位掩码）
+
+单类型不够时（`int|string`、`?int`、`callable`）用 `PhpType`：
+
+```zig
+phpzig.PhpType.long                          // int
+phpzig.PhpType.string.unionWith(PhpType.long)   // int|string（方法名非 or，Zig 保留字）
+phpzig.PhpType.string.nullable()             // ?string（= string|null，PHP 中二者等价）
+phpzig.PhpType.callable                      // callable（伪类型，不参与 unionWith）
+phpzig.PhpType.iterable                      // iterable
+```
+
+位值对应 Zend `MAY_BE_*`，由 glue 顶部 `_Static_assert` 守护（PHP 改布局即编译失败）。
+`nullable()` 与 `unionWith(null_)` 等价——PHP 中 `MAY_BE_NULL` 与 nullable 位同值。
 
 ### ClassDesc
 
@@ -187,14 +233,21 @@ public_magic_tostring → __toString（魔术方法）
 `isArray()` / `isObject()` / `isResource()` / `isCallable()` / `isIterable()` /
 `isScalar()` / `isEmpty()` / `isNumeric()`
 
-### 取值（强转）
+### 取值（弱转换，PHP 语义）
 
-| 方法 | 返回 |
-|---|---|
-| `toLong()` | `T.zend_long` |
-| `toDouble()` | `f64` |
-| `toBool()` | `bool` |
-| `toStringVal()` | `[]const u8` |
+> **语义修正**：这些是官方弱转换（`zval_get_long` 等），不是强转直读。
+> 背景：内部函数 arginfo 类型校验只在 ZEND_DEBUG 构建生效（见 special.md），
+> Release 下 handler 收到原始未转换 zval。直读 `Z_LVAL_P` 会把 string/array
+> 的指针当 long 解读（返回看似合理的垃圾值）；弱转换按 PHP 语义转换，
+> **永不返回垃圾指针**。判断原始类型用 `isLong()` 等。
+
+| 方法 | 返回 | 语义 |
+|---|---|---|
+| `toLong()` | `T.zend_long` | `zval_get_long`：`"1"`→1、`null`→0、`[]`→0、`1.9`→1 |
+| `toDouble()` | `f64` | `zval_get_double` |
+| `toBool()` | `bool` | `zval_is_true` |
+| `toStringVal()` | `[]const u8` | 非字符串返回**空串**（底层防野指针） |
+| `asString()` | `?[]const u8` | 非字符串返回 null（区分「空串」与「类型不符」） |
 
 ### 赋值
 

@@ -45,8 +45,18 @@ pub const Zval = struct {
 
     pub fn toLong(self: Zval) T.zend_long    { return c.phpglue_zval_get_long(self.ptr); }
     pub fn toDouble(self: Zval) f64           { return c.phpglue_zval_get_double(self.ptr); }
+    /// 读字符串值。非字符串返回空切片——zval 是联合体，直接按字符串解读
+    /// 会把同一位置的指针字段当成 char* 解引用（实测传 null 会崩），
+    /// 故由 glue 层统一拦截，此处只需处理空指针。
+    ///
+    /// 需要区分「空串」与「类型不符」时用 `asString()`。
     pub fn toStringVal(self: Zval) []const u8 {
-        const val = c.phpglue_zval_get_string_val(self.ptr);
+        return self.asString() orelse "";
+    }
+
+    /// 字符串取值，类型不符返回 null（区分于空串）
+    pub fn asString(self: Zval) ?[]const u8 {
+        const val = c.phpglue_zval_get_string_val(self.ptr) orelse return null;
         const len = c.phpglue_zval_get_string_len(self.ptr);
         return val[0..len];
     }

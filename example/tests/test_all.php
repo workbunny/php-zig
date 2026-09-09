@@ -1,20 +1,29 @@
 <?php
 /**
- * php-zig 集成测试套件
- * 覆盖全部公开 API：
- *   - 模块级函数
- *   - 返回值类型（9种）
- *   - zval 类型判断 + 取值 + 设值 + 语义判断
- *   - 参数 arg_info（反射验证，含 comptime struct 反射类型标注）
- *   - 异常抛出、错误报告
- *   - 模块常量（5种类型）
- *   - PHP Facade 调用、闭包
- *   - 类注册（静态方法 + comptime struct 反射）、接口、继承
- *   - 数组操作（增删查 + 高级操作）
- *   - HashTable 遍历（迭代器）
- *   - 对象属性读写、instanceof
- *   - 生命周期钩子（MINIT）
- *   - phpinfo 输出
+ * php-zig 集成测试套件 —— 功能正确性（正常路径）
+ *
+ * 测试体系三件套：
+ *   test_all.php     本文件：功能正确性（正常路径返回值/行为断言）
+ *   test_crash.php   崩溃隔离（fork）：危险边界不崩溃（SEGV/ABRT 检测）
+ *   test_corpus.php  类型语料库矩阵：任意类型 × 核心 API 不崩溃
+ *
+ * 断言「功能正确」看本文件；「不崩溃」看另两个。类型越界类断言不可放在
+ * 本文件——弱类型 PHP 的可隐式转换值（"123"→int）不报错，只有类别错误
+ * （array→string）才 TypeError（见 special.md「联合类型不拦截隐式转换」）。
+ *
+ * 分组索引（按能力域）：
+ *   §1-2    模块级函数 + 返回值类型
+ *   §3       zval 类型判断/取值
+ *   §4       arg_info 反射（含 comptime struct 反射）
+ *   §5      异常/错误报告        §6  模块常量
+ *   §7      PHP Facade 调用      §8  类注册
+ *   §9-10  数组操作/遍历         §11 对象属性
+ *   §12-13 生命周期/phpinfo      §15-16 Zval 运算符/边界
+ *   §17-20 comptime 反射/OOP/数组高级/语义判断
+ *   §21-24 默认值/可变参数/序列化/INI
+ *   §25-26 arena/cleanup + Fiber
+ *   §27-28 Observer（过滤/现场信息）
+ *   §29    内存增长探针（泄漏防线）  §30 RequestArena 监控与限额
  */
 
 $passed = 0;
@@ -262,7 +271,10 @@ test('hello_reduce() → sum 1+2+3+4 = 10', 10, hello_reduce());
 
 echo "\n=== 16. 边界情况 ===\n";
 
-test('add 带小数 → 浮点 isLong=false, 0+0=0', 0, add(3.7, 4.2));
+// 弱转换语义：3.7→3、4.2→4（PHP 截断），相加得 7。
+// 旧断言 `0+0=0` 锁定的是「isLong() else 0」——string/float 一律当 0，
+// 与 PHP 语义不符，已在 v0.10.1 改为官方弱转换（zval_get_long）。
+test('add 带小数 → 弱转换截断 3+4=7', 7, add(3.7, 4.2));
 test('hello_pop 空数组 → null', null, hello_pop([]));
 test('hello_strlen 非字符串 → null', null, @hello_strlen(123));
 test('hello_concat 参数不足 → null', null, @hello_concat('a'));

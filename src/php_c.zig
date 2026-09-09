@@ -17,6 +17,7 @@ pub extern fn phpglue_arginfo_entry_size() usize;
 pub extern fn phpglue_acc_public()      u32;
 pub extern fn phpglue_acc_protected()   u32;
 pub extern fn phpglue_acc_private()     u32;
+pub extern fn phpglue_acc_has_type_hints() u32;
 pub extern fn phpglue_acc_static()      u32;
 pub extern fn phpglue_acc_abstract()    u32;
 pub extern fn phpglue_acc_final()       u32;
@@ -157,6 +158,10 @@ pub extern fn phpglue_fill_arg_info(dst: ?*anyopaque, required_count: u32, names
 pub extern fn phpglue_fill_arg_info_typed(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, name_count: usize, out_entry_count: *usize) void;
 /// 完整版 — 在 typed 基础上增加 variadic 与 default_values（均可传 null 表示无）
 pub extern fn phpglue_fill_arg_info_full(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, types: [*c]const u8, allow_null: [*c]const u8, variadic: [*c]const u8, default_values: [*c]const ?[*:0]const u8, name_count: usize, out_entry_count: *usize) void;
+/// 掩码版 — type_masks 为 MAY_BE_* 位组合，支持 `int|string` 联合类型。
+/// 取代 typed/full 两版：mask=0 即 mixed，且同样处理 variadic 与默认值。
+pub extern fn phpglue_fill_arg_info_masked(dst: ?*anyopaque, required_count: u32, names: [*c]const [*c]const u8, type_masks: [*c]const u32, variadic: [*c]const u8, default_values: [*c]const ?[*:0]const u8, name_count: usize, out_entry_count: *usize) void;
+
 
 // ＝＝＝＝ 字符串分配 / 异常状态 ＝＝＝＝
 

@@ -10,6 +10,8 @@ const c = phpzig.php_c;
 
 // — empty：纯调用分发开销 —
 
+/// 无参函数：显式声明不做类型约束（自动发现的编译期校验要求）
+pub const bench_emptyUntyped = true;
 pub fn php_bench_empty(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     phpzig.Return.returnNull(rv);
 }
