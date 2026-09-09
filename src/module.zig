@@ -1058,7 +1058,8 @@ pub fn Module(comptime opts: ModuleOptions) type {
             return if (needs_mshutdown_wrapper) &phpzigMshutdown else null;
         }
         fn rinitPtr() ?T.ModuleLifecycleFn {
-            return if (opts.rinit) |_| &phpzigRinit else null;
+            // 始终注册：限额要按请求载入，见 phpzigRinit
+            return &phpzigRinit;
         }
         fn rshutdownPtr() ?T.ModuleLifecycleFn {
             // 始终注册：Cleanup 注册表需要在 RSHUTDOWN 统一回收（bailout-safe）
@@ -1222,10 +1223,10 @@ pub fn Module(comptime opts: ModuleOptions) type {
                 }
             }
             registerIniEntries(module_number);
-            // 挂载 PHP 侧实现的探针（内存额度查询、OOM 抛异常）。
-            // 必须在 INI 注册之后：configureFromIni 要读 INI 值。
+            // 挂载 PHP 侧实现的探针（内存额度查询、OOM 抛异常）：函数指针在
+            // MINIT 后不再改动，各请求线程读到同一份，故保持进程级全局。
+            // 限额本身不在这里读——见 phpzigRinit。
             Arena.bindPhpProbes();
-            Arena.configureFromIni();
             if (opts.observer) |obs| {
                 c.phpglue_observer_register(
                     obs.fcall_begin,
@@ -1269,6 +1270,9 @@ pub fn Module(comptime opts: ModuleOptions) type {
             return 0;
         }
         fn phpzigRinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
+            // 限额按请求载入：INI 值可被 perdir 机制按请求改变，且 ZTS 下 PG
+            // 每请求线程一份——放在 MINIT 读，其它请求线程会一直用默认额度。
+            Arena.configureFromIni();
             if (opts.rinit) |hook| return hook(type_, module_number);
             return 0;
         }

@@ -1036,6 +1036,18 @@ fn helloArenaFill(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
 }
 
 /// 设置限额（测试用）：limit 字节，0 = 不限；account_to_php 是否参与 PHP 额度
+/// 当前请求线程的有效额度（显式配置 vs INI 载入的仲裁结果）
+fn helloArenaEffectiveLimit(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(rv, @intCast(phpzig.Arena.effectiveLimit()));
+}
+
+/// 触发一次 INI 载入（RINIT 走的就是这个），用于验证它不会覆盖显式配置
+fn helloArenaIniReload(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Arena.configureFromIni();
+    phpzig.Return.returnBool(rv, true);
+}
+
+/// 设置限额（测试用）：limit 字节，0 = 不限；account_to_php 是否参与 PHP 额度
 fn helloArenaSetLimit(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const limit = phpzig.Return.callArg(ed, 1).toLong();
     const account = phpzig.Return.callArg(ed, 2).toBool();
@@ -1045,6 +1057,83 @@ fn helloArenaSetLimit(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
         .check_interval = 4096, // 测试用小间隔，避免误差掩盖效果
     });
     phpzig.Return.returnBool(rv, true);
+}
+
+// ＝＝ 真实 bailout（longjmp）兜底探针 ＝＝
+//
+// bailout 是 PHP 的 longjmp：直接跳出整个调用栈，Zig 的 defer 会被跳过，
+// 请求级资源只能靠 RSHUTDOWN 的 Cleanup 回收。单测里手动调 flush() 模拟不出
+// 这条路径（longjmp 不走 Zig 的返回路径），必须真实触发一次才算验证过。
+//
+// fork 之后内存不共享，观察点只能写进 marker 文件：
+//   held-usage=N          RSHUTDOWN 时 arena 仍持有的字节数
+//                         （回调后注册 → LIFO 先跑，此时子分配还没释放）
+//   reached-after-call=1  触发点之后的代码执行到（bailout 时不应出现）
+//   mshutdown-usage=N     MSHUTDOWN 时全局计数（应为 0）
+
+// 进程级而非 threadlocal：写入方是请求线程（探针），读取方还有 MSHUTDOWN
+// （跑在 MINIT 所在线程）。跨线程共享是这里的正确语义——只服务于本次 fork
+// 出的单一请求，不存在并发写。
+var bailout_path: [512]u8 = undefined;
+var bailout_path_len: usize = 0;
+
+fn appendMarker(key: []const u8, value: usize) void {
+    if (bailout_path_len == 0) return; // 未设置 marker 路径（如父进程）直接跳过
+    var line: [96]u8 = undefined;
+    const s = std.fmt.bufPrint(&line, "{s}={d}\n", .{ key, value }) catch return;
+    const path: [*:0]const u8 = @ptrCast(&bailout_path);
+    const f = fopen(path, "a") orelse return;
+    _ = fwrite(@ptrCast(s.ptr), 1, s.len, f);
+    _ = fclose(f);
+}
+
+/// RSHUTDOWN 观察点：在 arena 释放**前**执行（后注册 → LIFO 先跑），
+/// 故记录的是「被跳过的 defer 本该释放的那些字节」。
+fn bailoutHeldMarker(_: ?*anyopaque) callconv(.c) void {
+    appendMarker("held-usage", phpzig.Arena.usage());
+}
+
+/// hello_bailout_probe($marker_path, $mode, ...$cb)
+///   mode 0 = 正常返回（对照组）：defer 生效，走常规释放路径
+///   mode 1 = Zig 侧报 E_ERROR：php_error_docref → zend_bailout → longjmp
+///   mode 2 = 回调内 trigger_error(E_USER_ERROR)：longjmp **穿过**本 Zig 帧
+fn helloBailoutProbe(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const path = phpzig.Return.callArg(ed, 1);
+    const mode = phpzig.Return.callArg(ed, 2).toLong();
+    if (!path.isString()) {
+        phpzig.Return.returnNull(rv);
+        return;
+    }
+    const p = path.toStringVal();
+    if (p.len >= bailout_path.len) {
+        phpzig.Return.returnNull(rv);
+        return;
+    }
+    @memcpy(bailout_path[0..p.len], p);
+    bailout_path[p.len] = 0; // C 字符串需要 NUL 结尾
+    bailout_path_len = p.len;
+
+    const arena = phpzig.RequestArena.init() orelse return;
+    defer arena.deinit(); // bailout 时这行被 longjmp 跳过 —— 正是要验证的风险点
+    phpzig.Cleanup.register(&bailoutHeldMarker, null);
+
+    _ = arena.allocator().alloc(u8, 64 * 1024) catch {
+        phpzig.Return.returnNull(rv);
+        return;
+    };
+
+    if (mode == 1) {
+        // Zig 侧致命错误：php_error_docref(E_ERROR) → zend_bailout → longjmp
+        phpzig.Error.docref(null, .fatal, "php-zig bailout probe");
+    } else if (mode == 2 and phpzig.Return.callNumArgs(ed) >= 3) {
+        // 由 PHP 回调触发 fatal：longjmp 直接穿过本帧，defer 同样被跳过
+        var ret: T.Zval = undefined;
+        _ = phpzig.PhpFunc.callZval(phpzig.Return.callArg(ed, 3).ptr, &ret, &.{});
+    }
+
+    // bailout 场景下永远到不了这里 —— 这是「defer 确实被跳过」的结构性证据
+    appendMarker("reached-after-call", 1);
+    phpzig.Return.returnNull(rv);
 }
 
 // ＝＝ 类型系统验证（v0.10.1）＝＝
@@ -1188,6 +1277,15 @@ fn myMinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
     return 0;
 }
 
+/// MSHUTDOWN：此时请求已结束、Cleanup 已 flush，全局计数应为 0。
+/// 未设置 marker 路径时（父进程跑完整个测试脚本也会走到这里）自动跳过。
+fn myMshutdown(type_: c_int, module_number: c_int) callconv(.c) c_int {
+    _ = type_;
+    _ = module_number;
+    appendMarker("mshutdown-usage", phpzig.Arena.usage());
+    return 0;
+}
+
 // ＝＝ 模块注册 ＝＝
 
 comptime {
@@ -1285,6 +1383,14 @@ comptime {
             phpzig.FunctionDesc.create("hello_arena_peak", helloArenaPeak),
             phpzig.FunctionDesc.create("hello_arena_fill", helloArenaFill),
             phpzig.FunctionDesc.create("hello_arena_set_limit", helloArenaSetLimit),
+            phpzig.FunctionDesc.create("hello_arena_effective_limit", helloArenaEffectiveLimit),
+            phpzig.FunctionDesc.create("hello_arena_ini_reload", helloArenaIniReload),
+            // 真实 bailout（longjmp）兜底验证
+            phpzig.FunctionDesc.createWithParams("hello_bailout_probe", helloBailoutProbe, &.{
+                phpzig.ParamDesc.create("marker"),
+                phpzig.ParamDesc.create("mode"),
+                phpzig.ParamDesc.createVariadic("cb"), // 可选：仅 mode 2 需要
+            }),
             // 类型系统验证
             phpzig.FunctionDesc.create("hello_union_key", helloUnionKey),
             phpzig.FunctionDesc.create("hello_typed_args", helloTypedArgs),
@@ -1295,6 +1401,7 @@ comptime {
             phpzig.FunctionDesc.create("hello_obs_last_func", helloObsLastFunc),
         },
         .minit = myMinit,
+        .mshutdown = myMshutdown,
         .ini = &.{
             phpzig.IniEntry.createLong("hello.max_items", "100"),
             phpzig.IniEntry.createString("hello.greeting", "Hi"),
@@ -1578,3 +1685,9 @@ fn counterSet(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(
 }
 
 extern fn php_printf(fmt: [*c]const u8, ...) void;
+
+// bailout 探针用 C stdio 写 marker 文件：清理回调运行在 RSHUTDOWN，
+// 环境已不适合走 Zig 的高层 IO（且需跨 fork 与父进程通信）
+extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern fn fwrite(ptr: *const anyopaque, size: usize, nmemb: usize, stream: *anyopaque) usize;
+extern fn fclose(stream: *anyopaque) i32;

@@ -20,10 +20,21 @@ PHP 开发头文件（`php-config` + `php.h`）、可运行的 `php` CLI、Zig 0
 
 ```bash
 cd benchmark
-bash run.sh                    # 默认 30 万次迭代 × 5 轮，同时出性能与内存报告
-bash run.sh 1000000 5          # 指定迭代数与轮数
+bash run.sh                    # 文档复现参数：性能 30 万次 × 5 轮，内存 200 次重复
+bash run.sh 300000 5 200       # 显式指定（性能迭代 × 轮数 × 内存重复数）
 PHP_SDK=/usr/local bash run.sh # 指定 PHP SDK（同 -Dphp）
+ZIG=/path/to/zig bash run.sh   # 指定 zig（容器内常不在 PATH）
+SKIP_BUILD=1 bash run.sh       # 跳过编译，只测量（交叉编译产物已在位时）
 ```
+
+不带参即文档复现参数，本节所有结论都以此为准。
+
+两个迭代数**语义不同、量级差三个数量级，不可互换**：
+
+| 参数 | 作用 | 默认 |
+|------|------|------|
+| `iters` | `bench.php`：每次调用处理一条数据，重复次数 | 300000 |
+| `mem_iters` | `memory.php`：用例重复次数，**单次调用固定处理 10 万级数据** | 200 |
 
 产物写入 `results.tsv`（性能）与 `memory.tsv`（内存），均已 gitignore。
 
@@ -79,14 +90,15 @@ php                                                   smoke.php pure_php
 - 进程内 `hrtime(true)`，**多轮取中位数**（默认 5 轮）。单轮受调度抖动影响可达数倍。
 - 测量前预热 1 万次（触发函数解析、autoload 等一次性开销）。
 - **直接调用而非闭包包装**：闭包引入固定开销，且差距越大稀释越严重。
-- `run.sh` 在支持时自动 `taskset -c 0` 固定 CPU。
+- **不绑核**：负载不为空的机器上 `taskset -c 0` 会把进程按在被争抢的核上
+  （实测 real 达 user 的 3 倍、同用例慢 3 倍），抖动交给多轮取中位数吸收。
 - php-zig 必须 `-Doptimize=ReleaseFast`：Debug 比 C 的 `-O2` 慢 1.3~5 倍。
 - CLI 默认 JIT 关闭，扩展函数不受 JIT 影响（JIT 无法跨扩展边界优化）。
 
 内存基准另有三条：
 
-- 数据量放大到 **10 万级**：小数据量单次分配仅数 KB，会淹没在数百 KB 基线里，
-  各方案测出同一值、对比失效。
+- 数据量放大到 **10 万级**（`memory.php` 内 `$SIZE`，与 `mem_iters` 无关）：
+  小数据量单次分配仅数 KB，会淹没在数百 KB 基线里，各方案测出同一值、对比失效。
 - RSS 取**循环内多次采样的最大增量**：ZendMM 会把空 chunk 还给 OS，
   只看「末值 − 初值」会得到负数。
 - 测 **baseline**（扩展加载后的固定开销）：数据结构层面三方案操作同一套

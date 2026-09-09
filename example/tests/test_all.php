@@ -690,6 +690,13 @@ $got = hello_arena_fill(100000);   // 远超限额，应在中途停止
 test('限额生效：超限后分配被拒绝（未崩溃）', true, $got < 100000 * 64);
 test('限额生效：实际分配未超额度上限', true, $got <= 65536 + 65536);
 
+// 显式 configure 后，RINIT 的 INI 载入不得覆盖它。
+// INI 项未注册 → configureFromIni 算出 limit=0；若允许覆盖，下游在 MINIT
+// 设的限额会在首个请求到来时静默失效——这类失效在功能测试里看不到。
+hello_arena_set_limit(32768, false);
+hello_arena_ini_reload();
+test('显式 configure 不被 INI 载入覆盖', 32768, hello_arena_effective_limit());
+
 // 关闭限额后应恢复自由分配
 hello_arena_set_limit(0, false);
 $got2 = hello_arena_fill(2000);

@@ -4,6 +4,14 @@
 //! PHP 的 bailout（longjmp）会跳过 Zig 的 defer，但 RSHUTDOWN 在 bailout 后
 //! 仍会执行，故此处兜底回收被跳过的资源。
 //!
+//! 注册表是**线程局部**的：ZTS 下每个请求线程各跑一次 RINIT/RSHUTDOWN，
+//! 共享一张表会让请求 A 的条目被请求 B 的 RSHUTDOWN 执行掉。NTS 下只有
+//! 一个请求线程，threadlocal 与普通全局等价——两种构建下行为一致。
+//!
+//! 由此推出一条与 ZTS/NTS 无关的使用约束：Zig 侧自开线程里注册的资源没有
+//! 对应的 RSHUTDOWN，要么自行回收，要么把数据交回请求线程处理（跨线程访问
+//! 请求上下文本身就是错的，得走 IPC 或显式传参）。
+//!
 //! 注册表自身用 c_allocator 动态扩容（初始 16，翻倍增长），RSHUTDOWN 时
 //! 释放，不引入额外泄漏——其生命周期 = 请求生命周期，由 flush() 兜底。
 //! 扩容/释放计入 memtrack：这样 Arena.usage() 才能回答「框架 c_allocator
@@ -20,8 +28,8 @@ const Entry = struct {
     data: ?*anyopaque,
 };
 
-var entries: []Entry = &.{};
-var len: usize = 0;
+threadlocal var entries: []Entry = &.{};
+threadlocal var len: usize = 0;
 
 /// 注册清理：请求结束（RSHUTDOWN）时按 LIFO 顺序调用 fn(data)。
 /// bailout 后 RSHUTDOWN 仍执行，故可兜住被 longjmp 跳过的 defer。
@@ -124,4 +132,26 @@ test "cleanup: LIFO 顺序 + 自动扩容" {
     for (0..100) |i| {
         try testing.expectEqual(@as(u8, @intCast(99 - i)), test_order[i]);
     }
+}
+
+test "cleanup: 注册表线程隔离（ZTS 下每请求线程各一份）" {
+    flush();
+    var main_count: usize = 0;
+    register(&cbCount, &main_count);
+
+    var child_count: usize = 0;
+    const t = try std.Thread.spawn(.{}, struct {
+        fn f(c: *usize) void {
+            register(&cbCount, c);
+            flush();
+        }
+    }.f, .{&child_count});
+    t.join();
+
+    // 子线程的 flush 只能执行子线程注册的回调；共享注册表时这里会变成 1
+    try testing.expectEqual(@as(usize, 1), child_count);
+    try testing.expectEqual(@as(usize, 0), main_count);
+
+    flush();
+    try testing.expectEqual(@as(usize, 1), main_count);
 }

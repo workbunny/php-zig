@@ -387,7 +387,12 @@ public_magic_tostring → __toString（魔术方法）
 | `warning(msg)` | 触发 `E_WARNING` |
 | `notice(msg)` | 触发 `E_NOTICE` |
 
-`ErrorType` 枚举：`E_ERROR / E_WARNING / E_NOTICE / E_DEPRECATED` 等（对齐 PHP 常量）。
+`ErrorType` 枚举：`fatal`(E_ERROR) / `warning`(E_WARNING) / `notice`(E_NOTICE) / `deprecated` / `user_warning` / `user_notice` / `user_deprecated`（对齐 PHP 常量）。
+
+> ⚠️ `.fatal`（E_ERROR）会触发 **bailout（longjmp）**：调用后不会返回，
+> Zig 侧 `defer` 被跳过。仅用于「扩展进入不可恢复状态」；
+> 想让 PHP 侧可捕获请用 `Throw`（抛异常）。请求级资源由
+> `Cleanup` / `RequestArena` 在 RSHUTDOWN 兜底回收（已验证，见 `example/tests/test_bailout.php`）。
 
 ---
 
@@ -562,7 +567,10 @@ phpzig.Arena.configure(.{
 });
 ```
 
-INI 项（在 MINIT 后自动读取，未注册则用默认值）：
+INI 项（由 `Module` 在 **RINIT** 自动读取，未注册则用默认值）：
+
+INI 走 RINIT 而非 MINIT：值可被 perdir 机制按请求改变，且 ZTS 下 `PG` 每请求
+线程一份——只在 MINIT 读，其它请求线程会一直用默认额度。
 
 ```ini
 phpzig.arena_limit = 0              ; 字节，0 = 不以此项限制
@@ -590,6 +598,16 @@ const buf = a.alloc(u8, size) catch |err| {
 **使用前提**：真实的 PHP 探针（额度查询、OOM 抛异常）由 `Module` 在 MINIT 调用
 `Arena.bindPhpProbes()` 挂载。绕过 `moduleInit` 直接使用 `RequestArena` 时，
 这些探针是内建空实现——不施加 PHP 侧额度，但也不崩溃（安全方向的降级）。
+
+**配置仲裁**：调用 `configure()` 后即锁定，框架在 RINIT 载入的 INI 值不再覆盖它——
+否则下游在 MINIT 设的限额会在首个请求到来时被重置为 INI 默认值。
+`configureFromIni()` 在已锁定时直接返回。
+
+**线程归属**：`effective_limit`（含 `memory_limit` 剩余）是请求线程局部的，
+`usage()`/`peak()`/限额配置是进程级的。`effectiveLimit()` 读当前线程的核算结果。
+ZTS 与 NTS 行为一致：NTS 只有主线程，线程局部与普通全局等价。
+`configure()` 改的是进程级配置，请求内调用会对其余请求线程生效——限额应在
+启动期定好。
 
 **边界**：框架只提供计数与限额能力，**不做容器感知与水位告警**。读 cgroup
 limit、按水位发告警等策略由下游基于 `usage()` / `peak()` 自行实现——php-zig

@@ -174,7 +174,11 @@ php -d extension=zig-out/lib/libhello.so \
 Hello from php-zig!
 ```
 
-完整教程见 [doc/tutorial.md](doc/tutorial.md)，API 参考见 [doc/api.md](doc/api.md)，设计哲学与竞品分析见 [doc/zen.md](doc/zen.md)。
+- 完整教程见 [doc/tutorial.md](doc/tutorial.md)
+- API 参考见 [doc/api.md](doc/api.md)
+- 设计哲学与竞品分析见 [doc/zen.md](doc/zen.md)
+- 责任边界见 [doc/boundary.md](doc/boundary.md)
+- 兼容性承诺见[doc/compat.md](doc/compat.md)
 
 ## 能力
 
@@ -204,7 +208,7 @@ Hello from php-zig!
 | INI 配置 | ✅ | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知 |
 | 序列化 | ✅ | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize() |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 59 项 + PHP 集成测试 179 项 |
+| 测试 | ✅ | Zig 单元测试 78 项 + PHP 集成测试：功能 200 / 崩溃隔离 59 / 类型语料 312 / bailout 兜底 14 |
 
 ### 两种注册哲学，并存
 
@@ -245,6 +249,13 @@ phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
 框架不硬编码任何 PHP 版本号。`ZEND_MODULE_API_NO`、`ZEND_ACC_*` 标志位、`sizeof(zend_internal_arg_info)`、`USING_ZTS` 等全部由 C glue 在编译期从 PHP 头文件获取。用哪个版本的 PHP 头文件编译，就产出一个与该版本兼容的 `.so`。
 
 注意事项见 [special.md](doc/special.md)。
+
+## 责任边界
+
+php-zig 是**骨架**：它保证「类型闭合、失败显式、内存可观测、崩溃可定位、请求级资源兜底（含真实 bailout）、ZTS/NTS 行为一致」，
+**不**负责「下游自己的裸分配、Zig 侧自开线程的生命周期、跨请求/跨进程存活的指针、部署环境策略」。
+
+完整清单与下游自查步骤见 [doc/boundary.md](doc/boundary.md)。
 
 ## 与 PHPX 的异同
 

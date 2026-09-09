@@ -9,6 +9,10 @@
  *   php memory.php <mode> [iters]          mode 同 bench.php
  *   php memory.php --summary <file>        汇总 TSV 为 markdown
  *
+ * iters 是**用例重复次数**（默认 200），不是数据量：单次调用固定处理下面
+ * $SIZE（10 万级）的数据。与 bench.php 的 iters 语义不同——那边每轮只处理
+ * 一条数据，故量级差三个数量级，两者不可互换。
+ *
  * 测三个维度（均为**相对基线增量**，绝对值含进程基线无意义）：
  *
  *   1. peak  用例执行期间的峰值增量 = reset 后的 peak - 执行前 usage

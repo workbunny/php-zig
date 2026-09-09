@@ -17,9 +17,6 @@ const Cleanup = @import("cleanup.zig");
 const track = @import("memtrack.zig");
 const c = @import("php_c.zig");
 
-/// 距上次额度检查以来新分配的字节数，用于降频（见 checkQuota）
-var g_since_check = std.atomic.Value(usize).init(0);
-
 // ＝＝＝＝ 限额配置 ＝＝＝＝
 
 pub const Config = struct {
@@ -29,20 +26,49 @@ pub const Config = struct {
     account_to_php: bool = true,
     /// 降频检查阈值：距上次检查新分配超过该字节数才重新核算 PHP 池用量
     check_interval: usize = 64 * 1024,
-    /// 当前核算出的有效额度。0 = 不限
+    /// 派生值，configure 传入时被忽略；读取请用 `effectiveLimit()`
     effective_limit: usize = 0,
 };
 
-var g_config: Config = .{};
+// 配置三件套是**进程级**：「框架的 c_allocator 一共能用多少」是进程视角的
+// 约束，按请求线程各存一份会让 N 个线程吃掉 N 倍额度。副作用是请求内改配置
+// 对整个进程生效——限额应在启动期（INI/MINIT）定好。
+var g_limit = std.atomic.Value(usize).init(0);
+var g_account_to_php = std.atomic.Value(bool).init(true);
+var g_check_interval = std.atomic.Value(usize).init(64 * 1024);
 
-/// 配置由下游模块在 MINIT 设置（或从 INI 读取后填入）。
+// 派生状态是**线程局部**：effective_limit 里的 PHP 池剩余取自 PG/EG，ZTS 下
+// 每请求线程各一份；since_check 只是降频计数，跟着本线程走才有意义。
+// NTS 下只有主线程，threadlocal 与全局等价——两种构建行为一致。
+threadlocal var g_effective_limit: usize = 0;
+threadlocal var g_since_check: usize = 0;
+
+// 显式配置过就锁住：configure() 表达的是明确意图，而 INI 由框架在 RINIT
+// 载入。若后者能覆盖前者，下游在 MINIT 里设的限额会在首个请求到来时被
+// 静默重置为 INI 默认值——这是最难排查的一类失效。
+var g_pinned = std.atomic.Value(bool).init(false);
+
+/// 配置由下游模块设置（MINIT 或请求内均可）。一旦调用，后续
+/// `configureFromIni()` 不再覆盖。
 /// 未显式配置时：不限制，但计数照常工作——可观测不应依赖是否开启限额。
 pub fn configure(cfg: Config) void {
-    g_config = cfg;
+    g_limit.store(cfg.limit, .release);
+    g_account_to_php.store(cfg.account_to_php, .release);
+    g_check_interval.store(cfg.check_interval, .release);
+    g_pinned.store(true, .release);
     recomputeLimit();
 }
 
-/// 从 INI 读取配置并生效。MINIT 之后调用（INI 项须已注册）。
+/// 当前请求线程的有效额度（字节）。0 = 不限。
+pub fn effectiveLimit() usize {
+    return g_effective_limit;
+}
+
+/// 从 INI 读取配置并生效。由 Module 在 **RINIT** 调用（INI 项须已注册）。
+///
+/// 放在 RINIT 而非 MINIT：INI 值可被 perdir 机制（.htaccess / php_admin_value）
+/// 按请求改变，且 ZTS 下 PG 是每请求线程的——只在 MINIT 读，其它请求线程
+/// 会一直用默认额度。
 ///
 /// 读取的项：
 ///   phpzig.arena_limit           字节，0 = 不以此项限制（支持 64M 简写由 PHP 解析）
@@ -50,7 +76,9 @@ pub fn configure(cfg: Config) void {
 ///   phpzig.arena_check_interval  距上次核算累积多少字节后重新核算（默认 64K）
 ///
 /// 未注册这些 INI 项时按默认值处理，故本函数可安全调用。
+/// 已显式 `configure()` 过时跳过，避免覆盖下游的明确设置。
 pub fn configureFromIni() void {
+    if (g_pinned.load(.acquire)) return;
     const Ini = @import("ini.zig");
     configure(.{
         .limit = @intCast(@max(0, Ini.getLong("phpzig.arena_limit", 0))),
@@ -116,9 +144,9 @@ pub fn bindPhpProbes() void {
 /// 重新核算有效额度：取显式上限与 PHP 池剩余中的较小者。
 /// account_to_php 关闭时只用显式上限。
 fn recomputeLimit() void {
-    var eff = g_config.limit;
+    var eff = g_limit.load(.acquire);
 
-    if (g_config.account_to_php) {
+    if (g_account_to_php.load(.acquire)) {
         const php_limit = php_probes.memory_limit();
         if (php_limit > 0) {
             const used = php_probes.memory_usage(0);
@@ -127,8 +155,8 @@ fn recomputeLimit() void {
         }
     }
 
-    g_config.effective_limit = eff;
-    g_since_check.store(0, .release);
+    g_effective_limit = eff;
+    g_since_check = 0;
 }
 
 /// 判断本次分配是否应被拒绝。
@@ -137,16 +165,16 @@ fn recomputeLimit() void {
 /// 统计），故累积到 check_interval 才重新核算一次。误差有界——最多多占
 /// check_interval 字节，相对 OOM 阈值可忽略。
 fn shouldReject(len: usize) bool {
-    if (g_config.effective_limit == 0 and g_config.limit == 0 and !g_config.account_to_php) {
+    if (g_limit.load(.acquire) == 0 and !g_account_to_php.load(.acquire)) {
         return false; // 完全未开启限制，不检查
     }
 
-    const since = g_since_check.fetchAdd(len, .monotonic) + len;
-    if (since >= g_config.check_interval) {
+    g_since_check += len;
+    if (g_since_check >= g_check_interval.load(.acquire)) {
         recomputeLimit();
     }
 
-    const eff = g_config.effective_limit;
+    const eff = g_effective_limit;
     if (eff == 0) return false; // 不限
 
     return track.usage() + len > eff;
@@ -294,8 +322,7 @@ const testing = std.testing;
 /// recomputeLimit 就会调用 phpglue_memory_limit 等 extern 符号而崩溃。
 fn resetGlobals() void {
     track.resetForTests();
-    g_since_check.store(0, .release);
-    g_config = .{ .account_to_php = false };
+    configure(.{ .account_to_php = false });
     Cleanup.flush(); // 清空可能残留的注册表（其内存也计入 usage）
 }
 
@@ -367,8 +394,7 @@ test "arena: peak 记录峰值且不回落" {
 
 test "arena: 限额生效 —— 超限返回 OutOfMemory（reject）" {
     resetGlobals();
-    g_config = .{ .limit = 64 * 1024, .account_to_php = false };
-    recomputeLimit();
+    configure(.{ .limit = 64 * 1024, .account_to_php = false });
 
     const arena = RequestArena.init().?;
     const a = arena.allocator();
@@ -392,10 +418,13 @@ test "arena: 限额生效 —— 超限返回 OutOfMemory（reject）" {
     Cleanup.flush();
 }
 
+// 「显式 configure 不被 INI 载入覆盖」的回归在集成测试侧
+// （example/tests/test_all.php）：configureFromIni 会调到 phpglue_ini_*，
+// 而单测不链接 PHP 运行时——把符号拉进测试二进制在 Windows 上直接链接失败。
+
 test "arena: 未开启限制时不检查" {
     resetGlobals();
-    g_config = .{ .limit = 0, .account_to_php = false };
-    recomputeLimit();
+    configure(.{ .limit = 0, .account_to_php = false });
 
     const arena = RequestArena.init().?;
     const a = arena.allocator();

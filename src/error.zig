@@ -7,6 +7,10 @@ const c = @import("php_c.zig");
 
 /// PHP 错误类型（与 E_* 常量对应，值由 Zend 头文件保证稳定）
 pub const ErrorType = enum(c_int) {
+    /// E_ERROR —— **致命**：触发 bailout（longjmp），调用后不会返回，
+    /// Zig 侧的 `defer` 会被跳过。仅用于「扩展进入不可恢复状态」的场合：
+    /// 想让 PHP 侧可捕获，请用 `Throw`（抛异常）而不是它。
+    fatal = 1,
     warning = 2,   // E_WARNING
     notice = 8,    // E_NOTICE
     deprecated = 8192, // E_DEPRECATED
