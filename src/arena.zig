@@ -5,7 +5,8 @@
 //! PHP 侧完全无感知的情况下逼近容器上限而被 OOM killer 杀死。
 //!
 //! 故本模块提供两层保障：
-//!   - 可观测：进程级全局计数（usage / peak），跨全部 arena 实例
+//!   - 可观测：进程级全局计数（usage / peak），跨全部 c_allocator 分配
+//!     （含本模块子分配 + 实例自身 + cleanup 注册表，见 memtrack.zig）
 //!   - 可约束：INI 配置额度，超限按 reject 语义返回 error.OutOfMemory
 //!
 //! init() 时自动注册 RSHUTDOWN 回收（bailout-safe），正常路径可
@@ -13,20 +14,8 @@
 
 const std = @import("std");
 const Cleanup = @import("cleanup.zig");
+const track = @import("memtrack.zig");
 const c = @import("php_c.zig");
-
-// ＝＝＝＝ 进程级全局计数 ＝＝＝＝
-//
-// 单个 arena 实例只知道自己分配了多少，回答不了「Zig 侧一共占了多少」——
-// 一个请求里往往有若干 arena 并存。故在此做进程级累加。
-//
-// 用原子而非普通变量：ZTS 下多个请求线程会并发进出这些路径，普通变量会
-// 产生竞争导致计数漂移，进而让限额判断失效。原子成本远低于埋雷代价。
-
-/// 当前活跃占用（全部 arena 实例合计）
-var g_live = std.atomic.Value(usize).init(0);
-/// 进程内峰值（RSHUTDOWN 后仍保留，供事后排查）
-var g_peak = std.atomic.Value(usize).init(0);
 
 /// 距上次额度检查以来新分配的字节数，用于降频（见 checkQuota）
 var g_since_check = std.atomic.Value(usize).init(0);
@@ -70,14 +59,15 @@ pub fn configureFromIni() void {
     });
 }
 
-/// 当前活跃占用（字节）
+/// 当前活跃占用（字节）——转发到 memtrack：计数已收敛为
+/// 「框架全部 c_allocator 分配」，不只是 RequestArena 子分配
 pub fn usage() usize {
-    return g_live.load(.acquire);
+    return track.usage();
 }
 
 /// 进程内峰值占用（字节）
 pub fn peak() usize {
-    return g_peak.load(.acquire);
+    return track.peak();
 }
 
 /// PHP 池用量查询。
@@ -159,7 +149,7 @@ fn shouldReject(len: usize) bool {
     const eff = g_config.effective_limit;
     if (eff == 0) return false; // 不限
 
-    return g_live.load(.acquire) + len > eff;
+    return track.usage() + len > eff;
 }
 
 /// 计数 allocator：包装 c_allocator，累计分配字节并参与全局计数。
@@ -188,7 +178,7 @@ const CountingAllocator = struct {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         const p = std.heap.c_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.total += len;
-        trackAlloc(len);
+        track.trackAlloc(len);
         return p;
     }
 
@@ -198,11 +188,11 @@ const CountingAllocator = struct {
             if (new_len > memory.len) {
                 const delta = new_len - memory.len;
                 self.total += delta;
-                trackAlloc(delta);
+                track.trackAlloc(delta);
             } else {
                 const delta = memory.len - new_len;
                 self.total -= delta;
-                trackFree(delta);
+                track.trackFree(delta);
             }
             return true;
         }
@@ -216,11 +206,11 @@ const CountingAllocator = struct {
             if (new_len > memory.len) {
                 const delta = new_len - memory.len;
                 self.total += delta;
-                trackAlloc(delta);
+                track.trackAlloc(delta);
             } else {
                 const delta = memory.len - new_len;
                 self.total -= delta;
-                trackFree(delta);
+                track.trackFree(delta);
             }
         }
         return new_ptr;
@@ -229,32 +219,10 @@ const CountingAllocator = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.total -= memory.len;
-        trackFree(memory.len);
+        track.trackFree(memory.len);
         std.heap.c_allocator.rawFree(memory, alignment, ret_addr);
     }
 };
-
-fn trackAlloc(len: usize) void {
-    const cur = g_live.fetchAdd(len, .monotonic) + len;
-    updatePeak(cur);
-}
-
-fn trackFree(len: usize) void {
-    // 饱和减法：直接用 fetchSub 在计数已被减到 0 时会 wrap 成天文数字，
-    // 使限额判断彻底失效（表现为「永不超限」）。CAS 循环保证下限为 0。
-    var old = g_live.load(.acquire);
-    while (true) {
-        const new = if (old > len) old - len else 0;
-        old = g_live.cmpxchgWeak(old, new, .release, .acquire) orelse return;
-    }
-}
-
-fn updatePeak(cur: usize) void {
-    var old = g_peak.load(.acquire);
-    while (cur > old) {
-        old = g_peak.cmpxchgWeak(old, cur, .release, .acquire) orelse return;
-    }
-}
 
 pub const RequestArena = struct {
     counting: CountingAllocator,
@@ -271,6 +239,9 @@ pub const RequestArena = struct {
             throwOom("request arena: out of memory");
             return null;
         };
+        // 实例自身的堆分配也计入 memtrack——usage() 要回答
+        // 「框架 c_allocator 一共占了多少」，不能漏掉实例这块
+        track.trackAlloc(@sizeOf(RequestArena));
         self.counting = .{};
         self.arena = std.heap.ArenaAllocator.init(self.counting.allocator());
         self.deinited = false;
@@ -301,6 +272,7 @@ pub const RequestArena = struct {
     fn rsDeinit(data: ?*anyopaque) callconv(.c) void {
         const self: *RequestArena = @ptrCast(@alignCast(data.?));
         self.deinit();
+        track.trackFree(@sizeOf(RequestArena));
         std.heap.c_allocator.destroy(self);
     }
 };
@@ -321,10 +293,10 @@ const testing = std.testing;
 /// 必须关闭 account_to_php：单测不链接 PHP 运行时，一旦触发
 /// recomputeLimit 就会调用 phpglue_memory_limit 等 extern 符号而崩溃。
 fn resetGlobals() void {
-    g_live.store(0, .release);
-    g_peak.store(0, .release);
+    track.resetForTests();
     g_since_check.store(0, .release);
     g_config = .{ .account_to_php = false };
+    Cleanup.flush(); // 清空可能残留的注册表（其内存也计入 usage）
 }
 
 test "arena: 分配 + 计数 + 释放" {
@@ -362,17 +334,22 @@ test "arena: 全局计数跨实例累加" {
     Cleanup.flush();
 }
 
-test "arena: deinit 后全局计数回落" {
+test "arena: deinit 后子分配计数回落（实例内存待 RSHUTDOWN 释放）" {
     resetGlobals();
     const arena = RequestArena.init().?;
     _ = arena.allocator().alloc(u8, 4096) catch unreachable;
     try testing.expect(usage() >= 4096);
 
     arena.deinit();
-    // ArenaAllocator.deinit 会释放全部子分配，触发 CountingAllocator.free
-    try testing.expectEqual(@as(usize, 0), usage());
+    // ArenaAllocator.deinit 释放全部子分配（触发 CountingAllocator.free）。
+    // 剩余 = 实例自身（init trackAlloc @sizeOf=48）+ cleanup 注册表
+    // （register 触发的 16×16=256，占用量随历史扩容变化，故不断言精确值）。
+    // 关键断言：4096 的子分配已回落，剩余远小于它。
+    try testing.expect(usage() < 4096);
 
     Cleanup.flush();
+    // flush 触发 rsDeinit → destroy + trackFree，并释放注册表，全部归零
+    try testing.expectEqual(@as(usize, 0), usage());
 }
 
 test "arena: peak 记录峰值且不回落" {

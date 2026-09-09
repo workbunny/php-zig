@@ -6,8 +6,11 @@
 //!
 //! 注册表自身用 c_allocator 动态扩容（初始 16，翻倍增长），RSHUTDOWN 时
 //! 释放，不引入额外泄漏——其生命周期 = 请求生命周期，由 flush() 兜底。
+//! 扩容/释放计入 memtrack：这样 Arena.usage() 才能回答「框架 c_allocator
+//! 一共占了多少」，而不仅是 RequestArena 子分配。
 
 const std = @import("std");
+const track = @import("memtrack.zig");
 
 /// 清理回调签名（C ABI，与 Cleanup.register 一致）
 pub const CleanupFn = *const fn (data: ?*anyopaque) callconv(.c) void;
@@ -27,8 +30,10 @@ pub fn register(fn_: CleanupFn, data: ?*anyopaque) void {
         const new_cap: usize = if (entries.len == 0) 16 else entries.len * 2;
         const new_entries = std.heap.c_allocator.alloc(Entry, new_cap) catch
             @panic("cleanup registry: out of memory");
+        track.trackAlloc(new_entries.len * @sizeOf(Entry));
         if (len > 0) {
             @memcpy(new_entries[0..len], entries[0..len]);
+            track.trackFree(entries.len * @sizeOf(Entry));
             std.heap.c_allocator.free(entries);
         }
         entries = new_entries;
@@ -46,6 +51,7 @@ pub fn flush() void {
         entries[i].fn_(entries[i].data);
     }
     if (entries.len > 0) {
+        track.trackFree(entries.len * @sizeOf(Entry));
         std.heap.c_allocator.free(entries);
         entries = &.{};
     }

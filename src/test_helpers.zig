@@ -7,12 +7,14 @@ const php_types = @import("php_types.zig");
 const mod = @import("module.zig");
 const std = @import("std");
 
-// 引入以收集其 test 块（cleanup / arena 的单元测试不依赖 PHP 运行时）
+// 引入以收集其 test 块（cleanup / arena / memtrack 的单元测试不依赖 PHP 运行时）
 const cleanup = @import("cleanup.zig");
 const arena = @import("arena.zig");
+const memtrack = @import("memtrack.zig");
 comptime {
     _ = cleanup;
     _ = arena;
+    _ = memtrack;
 }
 
 // ＝＝ IS_* 类型常量正确性 ＝＝

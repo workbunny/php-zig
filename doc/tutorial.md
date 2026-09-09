@@ -838,10 +838,15 @@ phpzig.Cleanup.register(myCleanupFn, data);
 被 OOM killer 杀死。故框架提供可观测 + 可约束两层：
 
 ```zig
-// 可观测：进程级计数（跨全部 arena 实例）
+// 可观测：进程级计数（跨全部 c_allocator 分配，不止 arena）
 phpzig.Arena.usage();   // 当前 Zig 侧活跃占用
 phpzig.Arena.peak();    // 进程内峰值（RSHUTDOWN 后仍保留）
 ```
+
+> **usage() 的覆盖面**：不只 RequestArena 子分配。框架自身所有 c_allocator
+> 分配（RequestArena 实例、cleanup 注册表扩容）经 `memtrack.zig` 统一记账，
+> 故 `usage()` 回答的是「**框架 Zig 侧 c_allocator 一共占了多少**」——
+> 这也是它能在集成测试里断言「RSHUTDOWN 后归零」检测框架自身泄漏的原因。
 
 ```ini
 ; INI 配置（MINIT 自动读取）
