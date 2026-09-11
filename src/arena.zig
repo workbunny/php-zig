@@ -17,6 +17,10 @@ const Cleanup = @import("cleanup.zig");
 const track = @import("memtrack.zig");
 const c = @import("php_c.zig");
 
+/// 记账 / 限额作用域。定义在 memtrack（最底层、无 import 依赖），此处转发
+/// 供下游与测试引用，避免在 arena 侧再造一个同名枚举导致两套语义。
+pub const Scope = track.Scope;
+
 // ＝＝＝＝ 限额配置 ＝＝＝＝
 
 pub const Config = struct {
@@ -85,6 +89,41 @@ pub fn configureFromIni() void {
         .account_to_php = Ini.getBool("phpzig.arena_account_to_php", true),
         .check_interval = @intCast(@max(0, Ini.getLong("phpzig.arena_check_interval", 64 * 1024))),
     });
+}
+
+// ＝＝＝＝ 常驻级额度 ＝＝＝＝
+//
+// 与请求级额度完全独立：常驻内存【不】参与 memory_limit 核算（它跨请求存活，
+// 用「每请求的 PHP 池剩余」去约束它会把两个口径混在一起——常驻越多，每个请求
+// 可用的 arena 额度越小）。故常驻级只有自己的显式上限。
+//
+// 额度默认 0（不设防）：容器/进程级内存预算属部署环境策略，骨架不替下游决策
+// （见 doc/boundary.md）。要防 OOM kill 请在 INI 里显式设值。
+var g_resident_limit = std.atomic.Value(usize).init(0);
+
+/// 设置常驻级额度（字节）。0 = 不设防（默认）。
+/// 进程级语义，应在 MINIT / 启动期定好。
+pub fn configureResident(limit: usize) void {
+    g_resident_limit.store(limit, .release);
+}
+
+/// 从 INI 载入常驻级额度。由 Module 在 **MINIT** 调用。
+///
+/// 与请求级额度放在 RINIT 不同：常驻级是进程级语义，INI 值取启动时的
+/// 那份即可，perdir 的按请求覆盖对它没有意义。
+///
+/// 读取的项：
+///   phpzig.resident_limit  字节，0 = 不设防（支持 64M 简写由 PHP 解析）
+///
+/// 未注册该 INI 项时按默认值处理，故本函数可安全调用。
+pub fn configureResidentFromIni() void {
+    const Ini = @import("ini.zig");
+    configureResident(@intCast(@max(0, Ini.getLong("phpzig.resident_limit", 0))));
+}
+
+/// 当前常驻级有效额度（字节）。0 = 不限。
+pub fn residentLimit() usize {
+    return g_resident_limit.load(.acquire);
 }
 
 /// 当前活跃占用（字节）——转发到 memtrack：计数已收敛为
@@ -164,7 +203,22 @@ fn recomputeLimit() void {
 /// 降频：每次 alloc 都读 PHP 池用量代价过高（zend_memory_usage 要遍历 ZendMM
 /// 统计），故累积到 check_interval 才重新核算一次。误差有界——最多多占
 /// check_interval 字节，相对 OOM 阈值可忽略。
-fn shouldReject(len: usize) bool {
+///
+/// 额度按 scope 分流：请求级只读请求级账本——常驻内存（可能从 MINIT 起就
+/// 存在、跨请求不释放）【不可能】影响这里的判定。混用两个账本会产生极隐蔽
+/// 的失效：常驻内存越大，每个请求可用的 Arena 额度越小。
+fn shouldReject(scope: Scope, len: usize) bool {
+    switch (scope) {
+        .resident => {
+            // 常驻级只有自己的显式额度，不读 memory_limit、不做降频核算
+            // （这里没有任何昂贵的 PHP 侧调用，无需 check_interval 机制）。
+            const eff = g_resident_limit.load(.acquire);
+            if (eff == 0) return false; // 不设防（默认）
+            return track.usageScope(.resident) + len > eff;
+        },
+        .request => {},
+    }
+
     if (g_limit.load(.acquire) == 0 and !g_account_to_php.load(.acquire)) {
         return false; // 完全未开启限制，不检查
     }
@@ -177,14 +231,16 @@ fn shouldReject(len: usize) bool {
     const eff = g_effective_limit;
     if (eff == 0) return false; // 不限
 
-    return track.usage() + len > eff;
+    return track.usageScope(.request) + len > eff;
 }
 
-/// 计数 allocator：包装 c_allocator，累计分配字节并参与全局计数。
-/// 作为 RequestArena 的 backing，arena 的 free 是 no-op，故计数在 arena
+/// 计数 allocator：包装 c_allocator，累计分配字节并参与**所属作用域**的记账。
+/// 作为 Arena 的 backing，arena 的 free 是 no-op，故计数在 arena
 /// 存活期间单调增长，deinit 时随子分配释放而回落。
 const CountingAllocator = struct {
     total: usize = 0,
+    /// 记账与限额归属的作用域，由 Arena 在 init 时写入。
+    scope: Scope = .request,
 
     fn allocator(self: *CountingAllocator) std.mem.Allocator {
         return .{
@@ -199,14 +255,15 @@ const CountingAllocator = struct {
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+
         // reject 语义：超限返回 null，由调用方拿到 error.OutOfMemory 后
         // 自行决定降级还是抛异常——框架不替下游决策
-        if (shouldReject(len)) return null;
+        if (shouldReject(self.scope, len)) return null;
 
-        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         const p = std.heap.c_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.total += len;
-        track.trackAlloc(len);
+        track.trackAlloc(self.scope, len);
         return p;
     }
 
@@ -216,11 +273,11 @@ const CountingAllocator = struct {
             if (new_len > memory.len) {
                 const delta = new_len - memory.len;
                 self.total += delta;
-                track.trackAlloc(delta);
+                track.trackAlloc(self.scope, delta);
             } else {
                 const delta = memory.len - new_len;
                 self.total -= delta;
-                track.trackFree(delta);
+                track.trackFree(self.scope, delta);
             }
             return true;
         }
@@ -234,11 +291,11 @@ const CountingAllocator = struct {
             if (new_len > memory.len) {
                 const delta = new_len - memory.len;
                 self.total += delta;
-                track.trackAlloc(delta);
+                track.trackAlloc(self.scope, delta);
             } else {
                 const delta = memory.len - new_len;
                 self.total -= delta;
-                track.trackFree(delta);
+                track.trackFree(self.scope, delta);
             }
         }
         return new_ptr;
@@ -247,63 +304,179 @@ const CountingAllocator = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
         self.total -= memory.len;
-        track.trackFree(memory.len);
+        track.trackFree(self.scope, memory.len);
         std.heap.c_allocator.rawFree(memory, alignment, ret_addr);
     }
 };
 
-pub const RequestArena = struct {
-    counting: CountingAllocator,
-    arena: std.heap.ArenaAllocator,
-    deinited: bool,
+/// 统一 Arena 实现：同一套分配 / 记账 / 限额 / 兜底逻辑，按 scope 分两种配置。
+///
+/// | 维度 | `.request` | `.resident` |
+/// |---|---|---|
+/// | 生命周期 | 请求级，RSHUTDOWN 兜底 | 模块级，MSHUTDOWN 回收 |
+/// | 额度来源 | min(arena_limit, memory_limit 剩余) | resident_limit |
+/// | 记账归属 | usageScope(.request) | usageScope(.resident) |
+/// | 方法 | allocator / deinit / bytesAllocated | 同左 |
+///
+/// 差异只有两处：额度来源、是否注册 RSHUTDOWN 钩子。两者共享同一套
+/// CountingAllocator 与 reject 语义，故用同一个泛型表达——避免两份会各自
+/// 漂移的实现（尤其 reject 判定这类「改一处要同步另一处」的逻辑）。
+fn ArenaOf(comptime scope: Scope) type {
+    return struct {
+        const Self = @This();
 
-    /// 堆分配实例并自动注册 RSHUTDOWN 回收（bailout-safe）。
-    ///
-    /// OOM 时**不 panic**——生产环境 panic 等于进程崩溃，且调用方无从补救。
-    /// 改为设置 PHP 异常并返回 null：调用方 `orelse return` 即可让 PHP 传播
-    /// 异常，也可自行降级后继续。
-    pub fn init() ?*RequestArena {
-        const self = std.heap.c_allocator.create(RequestArena) catch {
-            throwOom("request arena: out of memory");
-            return null;
-        };
-        // 实例自身的堆分配也计入 memtrack——usage() 要回答
-        // 「框架 c_allocator 一共占了多少」，不能漏掉实例这块
-        track.trackAlloc(@sizeOf(RequestArena));
-        self.counting = .{};
-        self.arena = std.heap.ArenaAllocator.init(self.counting.allocator());
-        self.deinited = false;
-        Cleanup.register(rsDeinit, self);
-        return self;
-    }
+        const oom_msg: [:0]const u8 = if (scope == .request)
+            "request arena: out of memory"
+        else
+            "resident arena: out of memory";
 
-    /// 获取 arena 的 allocator，供 ArrayList/HashMap 等 Zig 数据结构使用。
-    pub fn allocator(self: *RequestArena) std.mem.Allocator {
-        return self.arena.allocator();
-    }
+        // 进程级单例状态（仅 .resident 实例化时被引用）。
+        // 放在泛型内是因为它只对常驻级有意义；.request 下这两个变量不会被
+        // 引用，也不会有任何分配。
+        //
+        // 用自旋锁而非 std.Io.Mutex：后者需要 Io 实例（事件循环），扩展侧
+        // 没有；临界区内只有一次 malloc + 几次赋值，不存在阻塞，自旋足够。
+        // Zig 0.16 已移除 std.Thread.Mutex，故不依赖标准库互斥量。
+        var shared_lock: std.atomic.Mutex = .unlocked;
+        var shared_ptr: ?*Self = null;
 
-    /// 释放 arena 全部子分配（幂等，可安全多次调用）。
-    /// 正常路径用 `defer arena.deinit()`；bailout 场景由 RSHUTDOWN 兜底。
-    /// 注意：`ArenaAllocator.deinit` 本身非幂等（不置空链表），故用 deinited 标志保护。
-    pub fn deinit(self: *RequestArena) void {
-        if (self.deinited) return;
-        self.arena.deinit();
-        self.deinited = true;
-    }
+        inline fn lockShared() void {
+            while (!shared_lock.tryLock()) std.atomic.spinLoopHint();
+        }
 
-    /// 本实例累计分配字节数（arena 场景下 free 为 no-op，故为存活期间的占用量）
-    pub fn bytesAllocated(self: *const RequestArena) usize {
-        return self.counting.total;
-    }
+        inline fn unlockShared() void {
+            shared_lock.unlock();
+        }
 
-    /// RSHUTDOWN 清理回调：幂等释放子分配 + 销毁堆实例。
-    fn rsDeinit(data: ?*anyopaque) callconv(.c) void {
-        const self: *RequestArena = @ptrCast(@alignCast(data.?));
-        self.deinit();
-        track.trackFree(@sizeOf(RequestArena));
-        std.heap.c_allocator.destroy(self);
-    }
-};
+        counting: CountingAllocator,
+        arena: std.heap.ArenaAllocator,
+        deinited: bool,
+
+        /// 堆分配实例。请求级额外注册 RSHUTDOWN 回收（bailout-safe）；
+        /// 常驻级不注册任何请求级钩子——它不随请求结束而回收。
+        ///
+        /// OOM 时**不 panic**——生产环境 panic 等于进程崩溃，且调用方无从补救。
+        /// 改为设置 PHP 异常并返回 null：调用方 `orelse return` 即可让 PHP 传播
+        /// 异常，也可自行降级后继续。
+        pub fn init() ?*Self {
+            const self = std.heap.c_allocator.create(Self) catch {
+                throwOom(oom_msg);
+                return null;
+            };
+            // 实例自身的堆分配也计入 memtrack——usage() 要回答
+            // 「该作用域 c_allocator 一共占了多少」，不能漏掉实例这块
+            track.trackAlloc(scope, @sizeOf(Self));
+            self.counting = .{ .scope = scope };
+            self.arena = std.heap.ArenaAllocator.init(self.counting.allocator());
+            self.deinited = false;
+
+            // ★ 生命周期差异的唯一落点：仅请求级挂 RSHUTDOWN 兜底
+            if (scope == .request) Cleanup.register(rsDeinit, self);
+            return self;
+        }
+
+        /// 获取 arena 的 allocator，供 ArrayList/HashMap 等 Zig 数据结构使用。
+        /// 分配由本 Arena 兜底回收（请求级 RSHUTDOWN、常驻级手动 deinit/destroy）。
+        pub fn allocator(self: *Self) std.mem.Allocator {
+            return self.arena.allocator();
+        }
+
+        /// 非托管分配入口：返回裸 `c_allocator` —— **不记账、不限额、不回收**。
+        ///
+        /// 语义上等价于直接用 `std.heap.c_allocator`，此处存在的意义是让「绕过
+        /// 托管」这件事在代码里显式、可检索。明确放弃的安全属性：
+        ///   1. 不进 `usageScope(scope)`，默认不可观测（要观测请自行
+        ///      `Memtrack.trackAlloc/trackFree` 注入）；
+        ///   2. 不受本 Arena 的额度约束（请求级 arena_limit / 常驻级
+        ///      resident_limit 都管不到它）；
+        ///   3. bailout（longjmp 跳过 defer）时无兜底，忘记释放即真泄漏。
+        ///
+        /// 非必要不使用。
+        pub fn unsafeAllocator(self: *Self) std.mem.Allocator {
+            _ = self;
+            return std.heap.c_allocator;
+        }
+
+        /// 释放 arena 全部子分配（幂等，可安全多次调用）。
+        /// 正常路径用 `defer arena.deinit()`；请求级 bailout 场景由 RSHUTDOWN 兜底。
+        /// 注意：`ArenaAllocator.deinit` 本身非幂等（不置空链表），故用 deinited 标志保护。
+        pub fn deinit(self: *Self) void {
+            if (self.deinited) return;
+            self.arena.deinit();
+            self.deinited = true;
+        }
+
+        /// 本实例累计分配字节数（arena 场景下 free 为 no-op，故为存活期间的占用量）
+        pub fn bytesAllocated(self: *const Self) usize {
+            return self.counting.total;
+        }
+
+        /// 释放子分配 + 销毁实例自身。【仅 `.resident` 可用】
+        ///
+        /// 请求级实例的销毁归 RSHUTDOWN 的 rsDeinit ——若允许手动 destroy，
+        /// Cleanup 注册表里会留下指向已释放内存的条目，RSHUTDOWN 时野指针。
+        pub fn destroy(self: *Self) void {
+            if (scope != .resident) @compileError(
+                "destroy() 仅 ResidentArena 可用；请求级实例由 RSHUTDOWN 自动销毁",
+            );
+            self.releaseInstance();
+        }
+
+        /// 进程级共享实例。**【仅 `.resident` 可用】**
+        ///
+        /// 常驻内存天然是「一个进程一份」，故提供单例便利入口：首次调用惰性创建，
+        /// 由框架在 MSHUTDOWN 自动释放（见 `shutdown`）。并发首次调用由互斥量
+        /// 串行化，ZTS 下安全。
+        ///
+        /// 生命周期：跨请求存活，**不**随请求结束回收。FPM 下各 worker 进程各有
+        /// 一份，不跨进程共享。
+        pub fn shared() ?*Self {
+            if (scope != .resident) @compileError("shared() 仅 ResidentArena 可用");
+            lockShared();
+            defer unlockShared();
+            if (shared_ptr == null) shared_ptr = Self.init();
+            return shared_ptr;
+        }
+
+        /// 释放 `shared()` 创建的实例并归零其账目（幂等）。
+        /// 由框架在 MSHUTDOWN 调用，也可由下游提前调用做精确控制。
+        /// 注意：释放后再次 `shared()` 会重建一个空实例，数据不保留。
+        pub fn shutdown() void {
+            if (scope != .resident) @compileError("shutdown() 仅 ResidentArena 可用");
+            lockShared();
+            defer unlockShared();
+            if (shared_ptr) |inst| {
+                inst.releaseInstance();
+                shared_ptr = null;
+            }
+        }
+
+        /// 内部：归还子分配 + 记账回落 + 销毁堆实例。两条生命周期路径共用。
+        fn releaseInstance(self: *Self) void {
+            self.deinit();
+            track.trackFree(scope, @sizeOf(Self));
+            std.heap.c_allocator.destroy(self);
+        }
+
+        /// RSHUTDOWN 清理回调：仅请求级注册此回调（见 init）。
+        fn rsDeinit(data: ?*anyopaque) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(data.?));
+            self.releaseInstance();
+        }
+    };
+}
+
+/// 请求级 Arena：跟随请求生命周期，RSHUTDOWN 兜底回收（含 bailout 路径），
+/// 额度取 min(phpzig.arena_limit, memory_limit 剩余)，超限按 reject 语义拒绝。
+pub const RequestArena = ArenaOf(.request);
+
+/// 常驻级 Arena：跨请求存活，**不**随请求结束回收，额度取
+/// `phpzig.resident_limit`（默认 0 = 不设防），不参与 `memory_limit` 核算。
+///
+/// 两种用法：
+///   - `ResidentArena.shared()` —— 进程级单例，MSHUTDOWN 自动释放（推荐）
+///   - `ResidentArena.init()`   —— 独立实例，由调用方 `destroy()` 手动释放
+pub const ResidentArena = ArenaOf(.resident);
 
 inline fn throwOom(msg: [:0]const u8) void {
     php_probes.throw_oom(msg.ptr, msg.len);
@@ -323,6 +496,8 @@ const testing = std.testing;
 fn resetGlobals() void {
     track.resetForTests();
     configure(.{ .account_to_php = false });
+    configureResident(0); // 常驻额度复位，避免测试间串味
+    ResidentArena.shutdown(); // 清掉可能残留的常驻单例（其内存也计入 usage）
     Cleanup.flush(); // 清空可能残留的注册表（其内存也计入 usage）
 }
 
@@ -467,4 +642,136 @@ test "arena: 跳过 defer 由 RSHUTDOWN 兜底（bailout 路径）" {
     Cleanup.flush();
     // 计数应回落，否则说明 RSHUTDOWN 路径漏了释放
     try testing.expectEqual(@as(usize, 0), usage());
+}
+
+// ＝＝＝＝ 双作用域隔离回归（红线）＝＝＝＝
+//
+// 这两个用例守住一条硬约束：请求级的 shouldReject 只读请求级账本。
+// 若两个作用域被混成同一个计数器，就会出现「常驻内存越大，每个请求可用的
+// arena 额度越小」——表现为本地正常、上线加载完整数据后全量报 OutOfMemory。
+
+test "arena: 常驻计数不挤占请求级额度（红线回归）" {
+    resetGlobals();
+    configure(.{ .limit = 128 * 1024, .account_to_php = false });
+
+    // 模拟下游在 MINIT 登记 100MB 常驻内存（如常驻词典）
+    track.trackAlloc(.resident, 100 * 1024 * 1024);
+
+    // 请求级账本必须纹丝不动 —— 它是 shouldReject 的基数
+    try testing.expectEqual(@as(usize, 0), usage());
+    try testing.expectEqual(@as(usize, 100 * 1024 * 1024), track.usageScope(.resident));
+
+    // 账本若被混用，这里的 32KB 分配会因为「已占 100MB」而被 reject
+    const arena = RequestArena.init().?;
+    const buf = arena.allocator().alloc(u8, 32 * 1024) catch unreachable;
+    try testing.expectEqual(@as(usize, 32 * 1024), buf.len);
+
+    arena.deinit();
+    Cleanup.flush();
+    track.trackFree(.resident, 100 * 1024 * 1024);
+    try testing.expectEqual(@as(usize, 0), track.total());
+}
+
+test "arena: 请求级分配不污染常驻账本" {
+    resetGlobals();
+    const arena = RequestArena.init().?;
+    _ = arena.allocator().alloc(u8, 4096) catch unreachable;
+
+    try testing.expect(usage() >= 4096);
+    try testing.expectEqual(@as(usize, 0), track.usageScope(.resident));
+
+    arena.deinit();
+    Cleanup.flush();
+    try testing.expectEqual(@as(usize, 0), track.total());
+}
+
+// ＝＝＝＝ 常驻级（resident）＝＝＝＝
+
+test "arena: 常驻级限额生效 —— 超限返回 OutOfMemory（reject）" {
+    resetGlobals();
+    configureResident(64 * 1024);
+
+    const arena = ResidentArena.init().?;
+    const a = arena.allocator();
+
+    // 额度内应成功
+    const first = a.alloc(u8, 32 * 1024) catch unreachable;
+    try testing.expectEqual(@as(usize, 32 * 1024), first.len);
+
+    // 持续分配至超限
+    var rejected = false;
+    for (0..64) |_| {
+        _ = a.alloc(u8, 8 * 1024) catch {
+            rejected = true;
+            break;
+        };
+    }
+    try testing.expect(rejected);
+
+    arena.destroy();
+    try testing.expectEqual(@as(usize, 0), track.total());
+}
+
+test "arena: 常驻级不随请求结束回收（Cleanup.flush 不影响）" {
+    resetGlobals();
+    const arena = ResidentArena.init().?;
+    _ = arena.allocator().alloc(u8, 4096) catch unreachable;
+    try testing.expect(track.usageScope(.resident) >= 4096);
+
+    // 模拟请求结束：flush 只清请求级资源，常驻实例与数据必须原样保留
+    Cleanup.flush();
+    try testing.expect(track.usageScope(.resident) >= 4096);
+
+    arena.destroy();
+    try testing.expectEqual(@as(usize, 0), track.total());
+}
+
+test "arena: shared() 单例幂等 + shutdown 归零" {
+    resetGlobals();
+
+    const a1 = ResidentArena.shared().?;
+    const a2 = ResidentArena.shared().?;
+    try testing.expect(a1 == a2); // 同一实例，不是新建
+
+    _ = a1.allocator().alloc(u8, 1024) catch unreachable;
+    try testing.expect(track.usageScope(.resident) >= 1024);
+
+    ResidentArena.shutdown();
+    ResidentArena.shutdown(); // 幂等
+    try testing.expectEqual(@as(usize, 0), track.total());
+
+    // 释放后可重建（数据不保留，属预期语义）
+    try testing.expect(ResidentArena.shared() != null);
+    ResidentArena.shutdown();
+    try testing.expectEqual(@as(usize, 0), track.total());
+}
+
+// ＝＝＝＝ 非托管入口（unsafe）＝＝＝＝
+
+test "arena: unsafeAllocator 是裸 c_allocator（不记账、不受额度约束）" {
+    resetGlobals();
+    configure(.{ .limit = 1, .account_to_php = false }); // 请求级额度压到 1 字节
+
+    const arena = RequestArena.init().?;
+    const ua = arena.unsafeAllocator();
+
+    // 基线：实例自身 + Cleanup 注册表（init 时注册，均计入请求级账本）。
+    // 必须先确认基线非 0，否则「unsafe 不进账本」这条断言会因记账整体失效
+    // 而虚假通过。
+    const baseline = track.total();
+    try testing.expect(baseline > 0);
+
+    // 绕过额度：即使请求级额度只有 1 字节，unsafe 分配也应成功
+    const buf = ua.alloc(u8, 8192) catch unreachable;
+    try testing.expectEqual(@as(usize, 8192), buf.len);
+
+    // 且不进账本 —— unsafe 分配前后总账分文不差
+    try testing.expectEqual(baseline, track.total());
+
+    ua.free(buf);
+    try testing.expectEqual(baseline, track.total());
+
+    arena.deinit();
+    Cleanup.flush();
+    try testing.expectEqual(@as(usize, 0), track.total());
 }

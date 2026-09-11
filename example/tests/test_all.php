@@ -703,6 +703,64 @@ $got2 = hello_arena_fill(2000);
 test('关闭限额后恢复分配', 128000, $got2);
 
 // ============================================================
+// 31. 统一观测出口 + 常驻级（ResidentArena）+ 非托管入口（unsafe）
+// ============================================================
+echo "\n=== 31. 常驻级 Arena 与统一观测 ===\n";
+//
+// 三条性质只有 PHP 侧能验证：
+//   a. request / resident 是两套物理隔离的账本（互不挤占）
+//   b. resident 不随请求结束回收（MSHUTDOWN 时仍 > 0，见 myMshutdown 的 marker）
+//   c. unsafeAllocator 不记账、不受额度约束
+//
+// 注意口径：request 账本含框架自身开销（Cleanup 注册表、Arena 实例与节点），
+// 故断言一律用「增量」而非绝对值。
+
+$report0 = hello_arena_report();
+test('观测出口返回三档', true,
+     isset($report0['total'], $report0['request'], $report0['resident']));
+test('观测口径自洽：total = request + resident', true,
+     $report0['total'] === $report0['request'] + $report0['resident']);
+
+// 常驻额度由 MINIT 从 phpzig.resident_limit 载入（测试 INI 设为 1M）
+test('resident_limit 从 INI 载入', 1048576, hello_resident_limit());
+
+// ——— 常驻写入：只动 resident 账本 ———
+$reqBefore = $report0['request'];
+$resBefore = $report0['resident'];
+hello_resident_put(0, 'persisted-across-requests');
+hello_resident_put(1, str_repeat('y', 4096));
+$report1 = hello_arena_report();
+test('常驻写入后 resident 账本上涨', true, $report1['resident'] > $resBefore);
+test('常驻写入不触碰 request 账本', $reqBefore, $report1['request']);
+test('常驻数据可读回', 'persisted-across-requests', hello_resident_get(0));
+test('常驻数据可读回（4KB）', 4096, strlen(hello_resident_get(1)));
+test('未写入的槽位返回 null', null, hello_resident_get(7));
+
+// ——— 红线：常驻占用不得挤占请求级额度 ———
+// 把请求级额度设为「当前请求级占用 + 32KB」，再申请 16KB。
+// 若两个账本被混用，常驻占用的几十 KB 会直接撑爆额度，这 16KB 必然被拒。
+$cur = hello_arena_report();
+hello_arena_set_limit($cur['request'] + 32768, false);
+$got = hello_arena_fill(250);   // 250 × 64 = 16000 字节
+test('常驻占用不挤占请求级额度（红线）', 16000, $got);
+hello_arena_set_limit(0, false);
+
+// ——— 非托管入口：既不记账，也不受额度约束 ———
+// 请求级额度压到 1 字节 → 受管路径必然失败，unsafe 必须成功。
+// 断言用「增量远小于申请量」而非绝对相等：init() 自身的框架开销会进账。
+hello_arena_set_limit(1, false);
+$before = hello_arena_report();
+test('unsafe 分配成功（远超请求级额度）', true, hello_unsafe_alloc(1048576));
+$after = hello_arena_report();
+test('unsafe 分配不进账本（1MB 申请 / 账本增量 < 4KB）', true,
+     ($after['total'] - $before['total']) < 4096);
+hello_arena_set_limit(0, false);
+
+// ——— 手动回收：显式释放常驻单例后账目归零 ———
+hello_resident_release();
+test('显式回收后常驻账目归零', 0, hello_arena_report()['resident']);
+
+// ============================================================
 // 结果汇总
 // ============================================================
 $total = $passed + $failed;

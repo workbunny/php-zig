@@ -19,6 +19,8 @@
 | 6 | 线程模型无关 | 请求级状态 `threadlocal`（cleanup 注册表、arena 派生额度），进程级计数原子（memtrack），限额按请求从 INI 载入——ZTS 与 NTS 行为一致 | Zig 单测（线程隔离用例）+ CI 矩阵 |
 | 7 | 版本 / 平台适配 | 不硬编码 PHP 版本常量：`ZEND_MODULE_API_NO`、`ZEND_ACC_*`、`sizeof(zend_internal_arg_info)` 由 C glue 编译期取自 PHP 头文件 | CI 矩阵 PHP 8.2~8.5 |
 | 8 | 逃生路径 | 骨架未覆盖的 Zend API，下游可自建 C glue，与内置 glue 同机制共存 | [`tutorial.md`](tutorial.md) |
+| 9 | 两个内存作用域隔离 | 请求级 / 常驻级是两套**物理隔离**账本：`shouldReject` 只读请求级，常驻内存不挤占任何请求的 Arena 额度 | Zig 单测（红线回归）+ `test_all.php` §31 |
+| 10 | 常驻内存生命周期 | `ResidentArena.shared()` 由框架在 MSHUTDOWN 释放；请求级在 RSHUTDOWN 释放（含真实 bailout 路径） | `test_bailout.php`（请求级归零 vs 常驻级存活） |
 
 ### 线程模型：ZTS 与 NTS 的行为一致性
 
@@ -38,7 +40,7 @@ PHP 侧已吃掉 ZTS/NTS 的差异：扩展拿到的 `execute_data`、zval、`EG
 
 | # | 项 | 为什么骨架不管 | 下游该做什么 |
 |:--:|---|---|---|
-| 1 | 下游自己的 `c_allocator` / 裸 malloc | `memtrack` 只覆盖框架内部的分配，下游调用点骨架看不见 | 优先用 `RequestArena`；确需裸分配则自行记账 |
+| 1 | 下游自己的 `c_allocator` / 裸 malloc | `memtrack` 只覆盖框架内部的分配，下游调用点骨架看不见 | 优先用 `RequestArena` / `ResidentArena`；确需裸分配则用 `Memtrack.trackAlloc`/`trackFree` 注入观测，或接受不可见 |
 | 2 | Zig 侧自开线程 | 这类线程没有 RINIT/RSHUTDOWN，也拿不到请求上下文——与 ZTS/NTS 无关，是通用约束 | 需要的数据显式传入或走 IPC；线程内不要用 `RequestArena`/`Cleanup` |
 | 3 | 绕过 `PhpType` 的取参 | 骨架提供弱转换 API，拦不住 `isLong() else 0` 这类写法 | 用 `toLong()`/`toDouble()`/`asString()`；要约束就声明 `Args`/`ArgTypes` |
 | 4 | 跨请求 / 跨进程存活的指针 | MINIT 期持久内存、opcache 共享内存上的 `op_array`/`class_entry` 挂 Zig 指针会跨请求甚至跨进程悬垂 | 只在请求生命周期内持有 Zend 结构指针 |
@@ -48,14 +50,21 @@ PHP 侧已吃掉 ZTS/NTS 的差异：扩展拿到的 `execute_data`、zval、`EG
 | 8 | Valgrind / 长跑审计 | 非实时、依赖环境；骨架侧已有归零断言 | 归下游（含下游自己的裸分配） |
 | 9 | 参数个数校验 | 内部函数少参不抛 `ArgumentCountError`，由 handler 判断——当前行为特征 | handler 内用 `callNumArgs()` 判断并 `Throw` |
 | 10 | 返回值移交之后的生命周期 | `returnString`/`returnZval` 之后所有权归引擎 | 不缓存已移交的 zval 指针 |
+| 11 | `unsafeAllocator()` 的分配 | 语义即「明确放弃托管」：不记账、不受额度约束、bailout 时无兜底 | 非必要不使用；用则自控释放时机与 OOM 后果 |
+| 12 | 常驻内存的容器上限 | `resident_limit` 默认 0（不设防），框架不做 cgroup 感知 | 按部署环境在 INI 设值，或基于 `usageScope(.resident)` 自建告警 |
 
 ## 三、下游自查
 
-1. 请求级内存：自己的裸分配是否换成 `RequestArena`，或已自行记账。
+1. 内存归属：自己的裸分配是否换成 `RequestArena`（请求内）或 `ResidentArena`
+   （跨请求），或已用 `Memtrack.trackAlloc`/`trackFree` 注入观测。
 2. 泄漏探针：循环 5 万次后断言内存增量 < 64KB（模板见 `example/tests/test_all.php`
    的内存增长探针段，含反向验证控制组）。
-3. 归零断言：请求结束后 `Arena.usage()` 回到基线。
+3. 归零断言：请求结束后 `Arena.usage()` 回到基线；常驻级在 MSHUTDOWN 后归零。
 4. bailout 模板：`example/tests/test_bailout.php`，三组对照（正常返回 / Zig 侧 E_ERROR /
    回调内 E_USER_ERROR），可照搬成自己扩展的回归用例。
 5. 语料矩阵：新函数补进 `test_corpus.php`，保证任意类型不崩溃。
 6. 自建 C glue：见 [`tutorial.md`](tutorial.md) 逃生路径。
+7. 常驻内存：`ResidentArena.init()` 的实例是否已 `destroy()`（`shared()` 单例由框架
+   在 MSHUTDOWN 释放）；持有常驻指针的模块级静态是否在 `shutdown()` 时清空。
+8. unsafe 自查：`unsafeAllocator()` 的每一笔是否都有对应释放；若已用裸记账 API
+   注入观测，释放时是否同步 `trackFree`（漏掉会让计数永久虚高，由第 3 条兜住）。

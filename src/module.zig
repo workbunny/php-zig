@@ -851,7 +851,9 @@ pub fn Module(comptime opts: ModuleOptions) type {
     const has_ini = opts.ini.len > 0;
     const has_observer = opts.observer != null;
     const needs_minit_wrapper = has_classes or opts.constants.len > 0 or opts.minit != null or has_ini or has_observer;
-    const needs_mshutdown_wrapper = opts.mshutdown != null or has_ini;
+    // 无条件注册：常驻 Arena（ResidentArena.shared()）的生命终点是模块卸载，
+    // 没有这条 wrapper 它必然泄漏——与下游是否声明 mshutdown / 有无 INI 无关。
+    const needs_mshutdown_wrapper = true;
 
     return struct {
         var function_entries: [opts.functions.len + 1]ZendFunctionEntry = undefined;
@@ -1225,8 +1227,12 @@ pub fn Module(comptime opts: ModuleOptions) type {
             registerIniEntries(module_number);
             // 挂载 PHP 侧实现的探针（内存额度查询、OOM 抛异常）：函数指针在
             // MINIT 后不再改动，各请求线程读到同一份，故保持进程级全局。
-            // 限额本身不在这里读——见 phpzigRinit。
+            // 请求级限额本身不在这里读——见 phpzigRinit。
             Arena.bindPhpProbes();
+            // 常驻级额度是进程级语义，故在 MINIT 读（perdir 的按请求覆盖对它
+            // 没有意义）。放在下游 minit 钩子之前，钩子里可用 configureResident
+            // 覆盖。
+            Arena.configureResidentFromIni();
             if (opts.observer) |obs| {
                 c.phpglue_observer_register(
                     obs.fcall_begin,
@@ -1266,8 +1272,11 @@ pub fn Module(comptime opts: ModuleOptions) type {
         }
         fn phpzigMshutdown(type_: c_int, module_number: c_int) callconv(.c) c_int {
             if (has_ini) c.phpglue_unregister_ini_entries(module_number);
-            if (opts.mshutdown) |hook| return hook(type_, module_number);
-            return 0;
+            const rc: c_int = if (opts.mshutdown) |hook| hook(type_, module_number) else 0;
+            // 常驻 Arena 的生命终点是模块卸载（不是请求结束）。放在下游钩子之后，
+            // 让下游还能在钩子里读到常驻占用做泄漏自查。幂等，重复调用安全。
+            Arena.ResidentArena.shutdown();
+            return rc;
         }
         fn phpzigRinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
             // 限额按请求载入：INI 值可被 perdir 机制按请求改变，且 ZTS 下 PG

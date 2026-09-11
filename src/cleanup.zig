@@ -38,10 +38,10 @@ pub fn register(fn_: CleanupFn, data: ?*anyopaque) void {
         const new_cap: usize = if (entries.len == 0) 16 else entries.len * 2;
         const new_entries = std.heap.c_allocator.alloc(Entry, new_cap) catch
             @panic("cleanup registry: out of memory");
-        track.trackAlloc(new_entries.len * @sizeOf(Entry));
+        track.trackAlloc(.request, new_entries.len * @sizeOf(Entry));
         if (len > 0) {
             @memcpy(new_entries[0..len], entries[0..len]);
-            track.trackFree(entries.len * @sizeOf(Entry));
+            track.trackFree(.request, entries.len * @sizeOf(Entry));
             std.heap.c_allocator.free(entries);
         }
         entries = new_entries;
@@ -59,7 +59,7 @@ pub fn flush() void {
         entries[i].fn_(entries[i].data);
     }
     if (entries.len > 0) {
-        track.trackFree(entries.len * @sizeOf(Entry));
+        track.trackFree(.request, entries.len * @sizeOf(Entry));
         std.heap.c_allocator.free(entries);
         entries = &.{};
     }

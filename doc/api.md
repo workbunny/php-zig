@@ -617,8 +617,98 @@ limit、按水位发告警等策略由下游基于 `usage()` / `peak()` 自行�
 |---|---|
 | `init()` | 堆分配实例，自动注册 RSHUTDOWN 回收（bailout-safe） |
 | `allocator()` | 获取 `std.mem.Allocator` |
+| `unsafeAllocator()` | 非托管入口，见下文「非托管入口」 |
 | `deinit()` | 释放全部子分配（幂等） |
 | `bytesAllocated()` | 累计分配字节数 |
+
+### ResidentArena（常驻级内存池）
+
+与 `RequestArena` 是**同一个泛型实现**（`ArenaOf(scope)`）的两个实例，差异只有
+两处：额度来源、是否注册生命周期钩子。
+
+| | `RequestArena` | `ResidentArena` |
+|---|---|---|
+| 生命周期 | 请求，RSHUTDOWN 兜底回收 | 模块，MSHUTDOWN 回收 |
+| 额度来源 | `min(arena_limit, memory_limit 剩余)` | `resident_limit`（不读 `memory_limit`） |
+
+两种用法：
+
+```zig
+// 单例（推荐）：进程级共享，并发首次调用由自旋锁串行化，
+// 框架在 MSHUTDOWN 自动释放（myMshutdown 钩子之后、INI 注销之后）
+const res = phpzig.ResidentArena.shared() orelse return;
+_ = res.allocator().alloc(u8, 1 << 20) catch {};
+
+// 独立实例：生命周期完全由调用方负责
+const res2 = phpzig.ResidentArena.init() orelse return;
+defer res2.destroy();   // 注意是 destroy()：既释放子分配，也销毁实例自身
+```
+
+| 方法 | 说明 |
+|---|---|
+| `shared()` | 进程级单例，惰性创建（**仅 `.resident` 可用**） |
+| `shutdown()` | 释放 `shared()` 实例并归零账目（幂等，**仅 `.resident` 可用**） |
+| `init()` | 独立实例 |
+| `destroy()` | 释放子分配 + 销毁实例自身（**仅 `.resident` 可用**） |
+| `allocator()` / `deinit()` / `bytesAllocated()` | 同 `RequestArena` |
+| `unsafeAllocator()` | 非托管入口 |
+
+`destroy()` 与 `deinit()` 的区别：`deinit()` 只回收子分配、实例还在（请求级由
+RSHUTDOWN 的 `rsDeinit` 负责销毁）；`destroy()` 连实例一起销毁。请求级**不提供**
+`destroy()` —— 手动销毁会让 `Cleanup` 注册表留下指向已释放内存的条目。
+
+`resident_limit` 默认 `0`（不设防）。常驻内存跨请求存活，FPM 下各 worker 各有一份，
+**不跨进程共享**，重启即丢。
+
+### 统一观测（Memtrack）
+
+两个作用域是**物理隔离**的两套账本：
+
+```zig
+phpzig.Memtrack.usageScope(.request);   // 请求级活跃占用
+phpzig.Memtrack.usageScope(.resident);  // 常驻级活跃占用
+phpzig.Memtrack.peakScope(.resident);   // 常驻级峰值
+phpzig.Memtrack.total();                // 进程全景 = request + resident
+
+phpzig.Arena.usage();                   // 等价 usageScope(.request)，兼容保留
+phpzig.Arena.peak();
+```
+
+隔离是硬约束：`shouldReject` 的请求级分支只读请求级账本，常驻内存**不可能**挤占
+某个请求的 Arena 额度。若两者混用一个计数器，会出现「常驻内存越大，每个请求可用
+的额度越小」——表现为本地正常、上线加载完整数据后全量报 OutOfMemory。
+
+**口径**：`usageScope(scope)` 是该作用域内**全部** Zig 侧分配，含框架自身开销
+（`Cleanup` 注册表、Arena 实例与内部节点），不只是业务申请量。做归零断言时按
+增量比较，不要用绝对值。
+
+框架自身的分配全部记在请求级账本（`Cleanup` 注册表扩容、`RequestArena` 实例与
+节点）。常驻级账本只含 `ResidentArena` 的实例、节点与子分配。
+
+### 非托管入口（unsafeAllocator）
+
+`allocator()` 与 `unsafeAllocator()` 是两个**正交**于作用域的视图：前者由框架托管
+（记账 + 限额 + 兜底回收），后者是裸 `c_allocator`。
+
+| 你想要的 | 怎么做 | 观测 | 限额 | 兜底 |
+|---|---|:--:|:--:|:--:|
+| 受管 | `arena.allocator()` | ✅ | ✅ | ✅ |
+| 裸 + 可观测 | `unsafeAllocator()` + `Memtrack.trackAlloc/trackFree` | ✅ | ❌ | ❌ |
+| 纯裸 | `unsafeAllocator()` | ❌ | ❌ | ❌ |
+
+语义上等价于直接用 `std.heap.c_allocator`，方法存在的意义是让「绕过托管」在代码里
+显式、可检索。明确放弃三项安全属性（不记账 / 不受额度约束 / bailout 无兜底），
+**非必要不使用**；用则自控释放时机与 OOM 后果。
+
+裸记账原语保留公开，用于框架看不见的指针（第三方 C 库返回、`mmap` 等）：
+
+```zig
+phpzig.Memtrack.trackAlloc(.resident, len);   // 只动计数，不碰内存
+phpzig.Memtrack.trackFree(.resident, len);    // 释放方负责注销
+```
+
+漏掉 `trackFree` 会让计数永久虚高（框架没有逐块记录，无法代为修正）——由归零
+断言兜住。
 
 ### Cleanup（清理注册）
 

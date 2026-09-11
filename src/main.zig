@@ -42,8 +42,11 @@ pub const Ini = @import("ini.zig");
 pub const Cleanup = @import("cleanup.zig");
 pub const PhpType = @import("module.zig").PhpType;
 pub const RequestArena = @import("arena.zig").RequestArena;
+pub const ResidentArena = @import("arena.zig").ResidentArena;
 pub const Arena = @import("arena.zig");
 pub const ArenaConfig = @import("arena.zig").Config;
+pub const Scope = @import("arena.zig").Scope;
+pub const Memtrack = @import("memtrack.zig");
 pub const Fiber = @import("fiber.zig");
 pub const Observer = @import("observer.zig");
 

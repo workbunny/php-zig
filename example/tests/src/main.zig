@@ -1059,6 +1059,123 @@ fn helloArenaSetLimit(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     phpzig.Return.returnBool(rv, true);
 }
 
+// ＝＝ 统一观测出口（scope 分档 + 非托管入口）＝＝
+//
+// 观测口径：usageScope(.request) 含框架自身的请求级开销（Cleanup 注册表、
+// Arena 实例与内部节点），不只是业务申请量；unsafeAllocator 的分配则【不】
+// 进任何账本 —— 这两条必须由集成测试断言，否则下游会按错误口径做容量规划。
+
+/// 一次拿到三个数：total（进程全景）/ request / resident。
+/// 这是"统一观测 API"的下游出口范例 —— 框架只提供原语，要不要暴露给 PHP
+/// 由下游决定。
+fn helloArenaReport(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    var arr = phpzig.Array.init(rv);
+    arr.setAssocLong("total", @intCast(phpzig.Memtrack.total()));
+    arr.setAssocLong("request", @intCast(phpzig.Memtrack.usageScope(.request)));
+    arr.setAssocLong("resident", @intCast(phpzig.Memtrack.usageScope(.resident)));
+}
+
+/// 当前常驻级额度（字节，0 = 不设防）。由 MINIT 从 phpzig.resident_limit 载入。
+fn helloResidentLimit(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(rv, @intCast(phpzig.Arena.residentLimit()));
+}
+
+// ＝＝ 常驻级（ResidentArena）：跨请求存活 ＝＝
+//
+// 常驻内容区基址指向 ResidentArena 内的内存，其生命周期 = 模块生命周期，
+// 故可存放在模块级静态里。注意 release 时必须置空，否则悬垂。
+const RES_SLOTS = 8;
+const RES_SLOT_CAP = 8192;
+
+var g_res_base: ?[*]u8 = null;
+var g_res_lens: [RES_SLOTS]usize = @splat(0);
+
+fn residentBase() ?[*]u8 {
+    if (g_res_base) |b| return b;
+    const arena = phpzig.ResidentArena.shared() orelse return null;
+    const buf = arena.allocator().alloc(u8, RES_SLOTS * RES_SLOT_CAP) catch return null;
+    @memset(buf, 0);
+    g_res_base = buf.ptr;
+    return g_res_base;
+}
+
+/// 写入第 i 个常驻槽位，返回写入字节数（-1 = 槽位非法或分配失败）
+fn helloResidentPut(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const idx = phpzig.Return.callArg(ed, 1).toLong();
+    const s = phpzig.Return.callArg(ed, 2).toStringVal();
+    if (idx < 0 or idx >= RES_SLOTS or s.len > RES_SLOT_CAP) {
+        phpzig.Return.returnLong(rv, -1);
+        return;
+    }
+    const base = residentBase() orelse {
+        phpzig.Return.returnLong(rv, -1);
+        return;
+    };
+    const i: usize = @intCast(idx);
+    const slot: [*]u8 = base + i * RES_SLOT_CAP;
+    @memcpy(slot[0..s.len], s);
+    g_res_lens[i] = s.len;
+    phpzig.Return.returnLong(rv, @intCast(s.len));
+}
+
+/// 读回第 i 个常驻槽位；无内容返回 null
+fn helloResidentGet(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const idx = phpzig.Return.callArg(ed, 1).toLong();
+    if (idx < 0 or idx >= RES_SLOTS) {
+        phpzig.Return.returnNull(rv);
+        return;
+    }
+    const base = residentBase() orelse {
+        phpzig.Return.returnNull(rv);
+        return;
+    };
+    const i: usize = @intCast(idx);
+    const len = g_res_lens[i];
+    if (len == 0) {
+        phpzig.Return.returnNull(rv);
+        return;
+    }
+    const slot: [*]u8 = base + i * RES_SLOT_CAP;
+    phpzig.Return.returnString(rv, slot[0..len]);
+}
+
+/// 显式回收常驻区（演示"手动回收"入口）：释放单例并清空模块静态，
+/// 否则静态里的指针会悬垂。
+fn helloResidentRelease(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.ResidentArena.shutdown();
+    g_res_base = null;
+    g_res_lens = @splat(0);
+    phpzig.Return.returnBool(rv, true);
+}
+
+// ＝＝ 非托管入口（unsafeAllocator）＝＝
+//
+// 语义上等价于直接用 std.heap.c_allocator：不记账、不受限额约束、无兜底。
+// 这里故意把指针留在静态里（不释放），用来验证它对账本"零影响"。
+var g_unsafe_held: ?[]u8 = null;
+
+fn helloUnsafeAlloc(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    if (n <= 0) {
+        phpzig.Return.returnFalse(rv);
+        return;
+    }
+    const arena = phpzig.RequestArena.init() orelse {
+        phpzig.Return.returnFalse(rv);
+        return;
+    };
+    defer arena.deinit();
+
+    // unsafeAllocator 不受该 arena 的额度约束，也不进 usage 账本
+    const buf = arena.unsafeAllocator().alloc(u8, @intCast(n)) catch {
+        phpzig.Return.returnFalse(rv);
+        return;
+    };
+    buf[0] = 0xAB;
+    g_unsafe_held = buf; // 故意泄漏到进程结束，证明它确实"不被追踪"
+    phpzig.Return.returnTrue(rv);
+}
+
 // ＝＝ 真实 bailout（longjmp）兜底探针 ＝＝
 //
 // bailout 是 PHP 的 longjmp：直接跳出整个调用栈，Zig 的 defer 会被跳过，
@@ -1121,6 +1238,13 @@ fn helloBailoutProbe(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
         phpzig.Return.returnNull(rv);
         return;
     };
+
+    // 同时在常驻级写入一笔。bailout 之后它必须【存活】到 MSHUTDOWN，
+    // 与请求级「MSHUTDOWN 计数归零」构成对照 —— 这是「常驻内存不随请求结束
+    // 回收」在真实 longjmp 路径下的唯一证据（单测里只能靠手动 flush 模拟）。
+    if (phpzig.ResidentArena.shared()) |res| {
+        _ = res.allocator().alloc(u8, 32 * 1024) catch {};
+    }
 
     if (mode == 1) {
         // Zig 侧致命错误：php_error_docref(E_ERROR) → zend_bailout → longjmp
@@ -1279,10 +1403,14 @@ fn myMinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
 
 /// MSHUTDOWN：此时请求已结束、Cleanup 已 flush，全局计数应为 0。
 /// 未设置 marker 路径时（父进程跑完整个测试脚本也会走到这里）自动跳过。
+/// MSHUTDOWN：此时请求已结束、Cleanup 已 flush，请求级计数应为 0；
+/// 而常驻级计数应当 **> 0** —— 这正是「常驻内存不随请求结束回收」的证据。
+/// 该钩子由框架安排在 ResidentArena.shutdown() 之前调用。
 fn myMshutdown(type_: c_int, module_number: c_int) callconv(.c) c_int {
     _ = type_;
     _ = module_number;
     appendMarker("mshutdown-usage", phpzig.Arena.usage());
+    appendMarker("mshutdown-resident-usage", phpzig.Memtrack.usageScope(.resident));
     return 0;
 }
 
@@ -1399,6 +1527,20 @@ comptime {
             phpzig.FunctionDesc.create("hello_obs_fiber_switch", helloObsFiberSwitch),
             phpzig.FunctionDesc.create("hello_obs_fiber_destroy", helloObsFiberDestroy),
             phpzig.FunctionDesc.create("hello_obs_last_func", helloObsLastFunc),
+            // 统一观测出口 + 常驻级 + 非托管入口
+            phpzig.FunctionDesc.create("hello_arena_report", helloArenaReport),
+            phpzig.FunctionDesc.create("hello_resident_limit", helloResidentLimit),
+            phpzig.FunctionDesc.createWithParams("hello_resident_put", helloResidentPut, &.{
+                phpzig.ParamDesc.create("index"),
+                phpzig.ParamDesc.create("value"),
+            }),
+            phpzig.FunctionDesc.createWithParams("hello_resident_get", helloResidentGet, &.{
+                phpzig.ParamDesc.create("index"),
+            }),
+            phpzig.FunctionDesc.create("hello_resident_release", helloResidentRelease),
+            phpzig.FunctionDesc.createWithParams("hello_unsafe_alloc", helloUnsafeAlloc, &.{
+                phpzig.ParamDesc.create("n"),
+            }),
         },
         .minit = myMinit,
         .mshutdown = myMshutdown,
@@ -1406,6 +1548,9 @@ comptime {
             phpzig.IniEntry.createLong("hello.max_items", "100"),
             phpzig.IniEntry.createString("hello.greeting", "Hi"),
             phpzig.IniEntry.createBool("hello.enabled", "1"),
+            // 框架的常驻级额度项：由 configureResidentFromIni 在 MINIT 读取。
+            // 0 = 不设防（默认）；测试里设为 1M 以便验证 reject 生效。
+            phpzig.IniEntry.createLong("phpzig.resident_limit", "1048576"),
         },
         .ini_notify = iniNotify,
         .constants = &.{

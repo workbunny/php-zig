@@ -201,7 +201,9 @@ Hello from php-zig!
 | 对象属性 | ✅ | `readProperty` / `writeProperty` + `instanceOf` + `toObject()` |
 | 资源类型 | ✅ | `Resource.register/store/fetch` |
 | 请求级内存池 | ✅ | `RequestArena` + `Cleanup.register`（bailout-safe，RSHUTDOWN 回收） |
-| Zig 侧内存治理 | ✅ | `Arena.usage/peak` 进程级原子计数 + INI 限额（默认参与 `memory_limit` 额度）；容器感知与告警由下游实现 |
+| 常驻级内存池 | ✅ | `ResidentArena`（跨请求存活，MSHUTDOWN 回收，独立 `resident_limit`）；`shared()` 进程级单例 |
+| 统一内存观测 | ✅ | `Memtrack.usageScope/peakScope/total` 两套物理隔离账本（request / resident）+ `unsafeAllocator` 非托管入口 |
+| Zig 侧内存治理 | ✅ | 进程级原子计数 + INI 限额（请求级默认参与 `memory_limit` 额度）；容器感知与告警由下游实现 |
 | 闭包导出 | ✅ | `Closure.create` 从 Zig 函数创建 PHP Closure |
 | Fiber 协程 | ✅ | 只读查询（isFiber/getStatus/getCurrent/getReturn）+ 控制操作（create/start/suspend_/resume_/throw，走 PHP 原生方法复用校验） |
 | Observer 观察代理 | ✅ | 五类观察点静态注册（fcall begin/end、error、function_declared、class_linked、fiber init/switch/destroy）+ `funcName` |
@@ -288,43 +290,82 @@ const Counter = struct { count: i64 = 0 };
 phpzig.ClassDesc.createObject("Counter", &.{ /* methods */ }, Counter, counterInit, counterDtor);
 ```
 
-**3. 请求级内存管理——bailout-safe**
+**3. 内存管理——两个作用域，一套实现**
 
-明确「PHP 用 PHP 的、Zig 用 Zig 的」边界：PHP 数据结构由 PHP 请求池兜底，Zig 自己分配的内存用 `RequestArena`（请求级内存池）或 `Cleanup.register` 兜底。两者在 bailout（`longjmp` 跳过 `defer`）后都保证回收：
+明确「PHP 用 PHP 的、Zig 用 Zig 的」边界：PHP 数据结构由 PHP 请求池兜底，Zig
+自己分配的内存走 Arena。`RequestArena` 与 `ResidentArena` 是**同一个泛型实现**
+（`ArenaOf(scope)`）的两个实例，差异只有两处：额度来源、是否注册 RSHUTDOWN 钩子。
+
+| | `RequestArena` | `ResidentArena` |
+|---|---|---|
+| 生命周期 | 请求级，RSHUTDOWN 兜底回收 | 模块级，MSHUTDOWN 回收（`shared()` 单例由框架负责） |
+| 额度来源 | `min(arena_limit, memory_limit 剩余)` | `resident_limit`（**不读 `memory_limit`**） |
+| 创建方式 | 请求内 `init()` | `shared()` 进程级单例，或 `init()` + 手动 `destroy()` |
+
+两个作用域共用同一套 reject 语义；请求级在 bailout（`longjmp` 跳过 `defer`）
+后仍保证回收：
 
 ```zig
 const arena = phpzig.RequestArena.init() orelse return;  // OOM 抛异常，不 panic
 defer arena.deinit();          // 正常路径，bailout 时 RSHUTDOWN 兜底
 const a = arena.allocator();
+
+// 常驻：跨请求存活，MSHUTDOWN 自动释放
+const res = phpzig.ResidentArena.shared() orelse return;
+_ = res.allocator().alloc(u8, 1 << 20) catch {};
 ```
 
-Zig 侧内存**不受 `memory_limit` 约束**——`RequestArena` 的 backing 是 `c_allocator`，
+Zig 侧内存**不受 `memory_limit` 约束**——Arena 的 backing 是 `c_allocator`，
 不进 PHP 请求池。这既是特性（大块临时内存不触发 `memory_limit`），也是风险：
 进程可在 PHP 侧完全无感知的情况下逼近容器上限被 OOM killer 杀死。故框架提供
 可观测与可约束两层：
 
 ```zig
-phpzig.Arena.usage();   // 当前 Zig 侧占用（跨全部 arena 实例的进程级计数）
-phpzig.Arena.peak();    // 进程内峰值
+phpzig.Memtrack.usageScope(.request);   // 请求级占用
+phpzig.Memtrack.usageScope(.resident);  // 常驻级占用
+phpzig.Memtrack.total();                // 进程全景（request + resident）
+phpzig.Arena.usage();                   // 等价 usageScope(.request)，兼容保留
 ```
+
+**两套账本物理隔离**：请求级的限额判定只读请求级账本（`shouldReject` 的基数），
+常驻内存**不可能**挤占某个请求的 Arena 额度。混用会产生极隐蔽的失效——常驻越大，
+每个请求可用的额度越小，表现为「本地正常、上线加载完整数据后全量报 OutOfMemory」。
 
 ```ini
-phpzig.arena_limit = 0              ; 字节，0 = 不以此项限制
+phpzig.arena_limit = 0              ; 请求级显式上限，0 = 不以此项限制
 phpzig.arena_account_to_php = 1     ; 参与 memory_limit 额度核算（默认开）
 phpzig.arena_check_interval = 65536 ; 降频阈值，默认 64K
+phpzig.resident_limit = 0           ; 常驻级上限，0 = 不设防（默认）
 ```
 
-额度取 `arena_limit` 与 `memory_limit` 剩余的较小者；超限按 **reject** 语义返回
-`error.OutOfMemory`，由业务代码自行决定降级还是抛异常。
+请求级额度取 `arena_limit` 与 `memory_limit` 剩余的较小者；常驻级只看
+`resident_limit`。超限均按 **reject** 语义返回 `error.OutOfMemory`，由业务代码
+自行决定降级还是抛异常。
 
-两处使用前提与边界：
+### 非托管入口（`unsafeAllocator`）
+
+`arena.unsafeAllocator()` 返回裸 `c_allocator`，语义是**明确放弃**该 Arena 的
+托管、额度与兜底：
+
+| 你想要的 | 怎么做 | 观测 | 限额 | 兜底 |
+|---|---|:--:|:--:|:--:|
+| 受管 | `arena.allocator()` | ✅ | ✅ | ✅ |
+| 裸 + 可观测 | `unsafeAllocator()` + `Memtrack.trackAlloc/trackFree` | ✅ | ❌ | ❌ |
+| 纯裸 | `unsafeAllocator()` | ❌ | ❌ | ❌ |
+
+「受限额保护」只有受管路径能提供——这是 unsafe 的实质代价。非必要不使用；
+一旦使用，释放时机与 OOM 后果均由下游自控。
+
+三处使用前提与边界：
 
 - **真实 PHP 探针由 `moduleInit` 在 MINIT 挂载**（`Arena.bindPhpProbes()`）。
-  绕过 `moduleInit` 直接使用 `RequestArena` 会退化为内建空实现——不施加 PHP
-  侧额度，但不崩溃。这是安全方向的降级。
+  绕过 `moduleInit` 直接使用 Arena 会退化为内建空实现——不施加 PHP 侧额度，
+  但不崩溃。这是安全方向的降级。
 - **框架只提供能力，不做容器感知与告警**。读 cgroup limit、按水位告警等策略
-  由下游基于 `usage()` / `peak()` 自行实现——php-zig 是骨架，不该替业务决定
-  在特定部署环境下的内存策略。
+  由下游基于 `usageScope()` / `total()` 自行实现——php-zig 是骨架，不该替业务
+  决定在特定部署环境下的内存策略。
+- **`resident_limit` 默认 0（不设防）**。常驻内存的增长默认不受框架约束，
+  FPM 下各 worker 进程各有一份、不跨进程共享，重启即丢。
 
 **4. 极简注册入口——`moduleInit(@This())`**
 

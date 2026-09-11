@@ -12,7 +12,11 @@
  *                         先跑，读到的正是「被跳过的 defer 本该释放的字节」。
  *                         对照组 < 4K，bailout 组 ≥ 64K
  *   reached-after-call=1  触发点之后的代码执行到；bailout 组不应出现
- *   mshutdown-usage=N     MSHUTDOWN 时全局计数，两组都应为 0
+ *   mshutdown-usage=N     MSHUTDOWN 时【请求级】计数，三组都应为 0
+ *   mshutdown-resident-usage=N
+ *                         MSHUTDOWN 时【常驻级】计数，三组都应 > 0。
+ *                         与上一条构成对照：请求级已被 RSHUTDOWN 回收，常驻级
+ *                         跨越请求继续存活 —— 这就是「常驻」的定义。
  *
  * 用法：php -d extension=... test_bailout.php
  */
@@ -31,6 +35,8 @@ if (!function_exists('hello_bailout_probe')) {
 
 /** 探针在 arena 里分配的字节数，用来区分「defer 跑没跑」 */
 const HOLD_BYTES = 65536;
+/** 探针在常驻级写的字节数，用来验证它跨越请求存活 */
+const RESIDENT_BYTES = 32768;
 
 function check(string $name, bool $ok, string $detail = ''): void
 {
@@ -104,9 +110,17 @@ function assertBailoutRecovered(string $label, int $code, bool $signaled, array 
         'held=' . ($kv['held-usage'] ?? 'n/a')
     );
     check(
-        "{$label}：兜底回收生效（MSHUTDOWN 计数归零）",
+        "{$label}：兜底回收生效（请求级 MSHUTDOWN 计数归零）",
         ($kv['mshutdown-usage'] ?? null) === '0',
         'mshutdown=' . ($kv['mshutdown-usage'] ?? 'n/a')
+    );
+    // 与上一条成对：同一次 MSHUTDOWN 里请求级归零、常驻级仍挂着。
+    // 只断言请求级归零会被「常驻也被误回收」这类缺陷漏过。
+    check(
+        "{$label}：常驻级跨越请求存活（MSHUTDOWN 时仍 > 0）",
+        isset($kv['mshutdown-resident-usage'])
+            && (int)$kv['mshutdown-resident-usage'] >= RESIDENT_BYTES,
+        'resident=' . ($kv['mshutdown-resident-usage'] ?? 'n/a')
     );
 }
 
@@ -123,9 +137,15 @@ check(
     'held=' . ($kv['held-usage'] ?? 'n/a')
 );
 check(
-    'MSHUTDOWN 计数归零',
+    'MSHUTDOWN 计数归零（请求级）',
     ($kv['mshutdown-usage'] ?? null) === '0',
     'mshutdown=' . ($kv['mshutdown-usage'] ?? 'n/a')
+);
+check(
+    '常驻级跨越请求存活（MSHUTDOWN 时仍 > 0）',
+    isset($kv['mshutdown-resident-usage'])
+        && (int)$kv['mshutdown-resident-usage'] >= RESIDENT_BYTES,
+    'resident=' . ($kv['mshutdown-resident-usage'] ?? 'n/a')
 );
 // 对照组不是陪跑：没有它，「held 很大」无法与 arena 内部开销区分，
 // 断言就失去判别力。
