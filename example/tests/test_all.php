@@ -289,15 +289,57 @@ test('hello_reduce() → sum 1+2+3+4 = 10', 10, hello_reduce());
 
 echo "\n=== 16. 边界情况 ===\n";
 
-// 弱转换语义：3.7→3、4.2→4（PHP 截断），相加得 7。
+// cast 语义：3.7→3、4.2→4（`(int)` 截断），相加得 7。
 // 旧断言 `0+0=0` 锁定的是「isLong() else 0」——string/float 一律当 0，
-// 与 PHP 语义不符，已在 v0.10.1 改为官方弱转换（zval_get_long）。
-test('add 带小数 → 弱转换截断 3+4=7', 7, add(3.7, 4.2));
+// 与 PHP 行为不符，已在 v0.10.1 改为引擎 cast 转换（zval_get_long）。
+test('add 带小数 → cast 截断 3+4=7', 7, add(3.7, 4.2));
 test('hello_pop 空数组 → null', null, hello_pop([]));
 test('hello_strlen 非字符串 → null', null, @hello_strlen(123));
 test('hello_concat 参数不足 → null', null, @hello_concat('a'));
 test('hello_name 非字符串 → null', null, @hello_name(123));
 test('hello_iterate 非数组 → null', null, @hello_iterate('not_array'));
+
+// cast 取值（v0.11.4 新增）：`(string)$v` 语义，与 PHP 里写 `(string)$v` 同一条路径。
+// 与 toStringVal() 的差别是**语义**：这里 int/float/bool/null/resource 会被真正转成字符串，
+// array → "Array"（附 E_WARNING），object 走 __toString()。
+// 注意上方几个函数的 `null` 不是取值语义造成的，而是 handler 自己 isString 校验后的返回——
+// 两层各司其职：取值原语只管转换，要不要拒绝由 handler 决定。
+test('cast_string(123) → "123"', '123', hello_cast_string(123));
+test('cast_string(1.5) → "1.5"', '1.5', hello_cast_string(1.5));
+test('cast_string(true) → "1"', '1', hello_cast_string(true));
+test('cast_string(false) → ""', '', hello_cast_string(false));
+test('cast_string(null) → ""', '', hello_cast_string(null));
+test('cast_string("abc") → "abc"', 'abc', hello_cast_string('abc'));
+test('cast_string(对象 __toString) → 走 __toString', 's', hello_cast_string(new class {
+    public function __toString(): string { return 's'; }
+}));
+
+$castRes = fopen('php://memory', 'r');
+test(
+    'cast_string(资源) → "Resource id #N"',
+    true,
+    str_starts_with(hello_cast_string($castRes), 'Resource id #')
+);
+
+// 数组 → "Array" + E_WARNING：这里断值，提示就地吞掉；
+// 「该提示必须出现」由 test_corpus 按坐标声明断言。
+set_error_handler(static fn(): bool => true);
+$castArr = hello_cast_string([1, 2]);
+restore_error_handler();
+test('cast_string([1,2]) → "Array"（附 E_WARNING，见 test_corpus）', 'Array', $castArr);
+
+// 无 __toString 的对象：引擎抛 Error，castString 返回 null → handler 立即返回，不返回假值。
+$castErr = null;
+try {
+    hello_cast_string(new stdClass);
+} catch (\Error $e) {
+    $castErr = $e->getMessage();
+}
+test(
+    'cast_string(无 __toString 的对象) → 抛 Error 且不返回假值',
+    true,
+    $castErr !== null && str_contains($castErr, 'could not be converted to string')
+);
 
 // ============================================================
 // 17. comptime struct 反射 arg_info

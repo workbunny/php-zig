@@ -71,7 +71,8 @@ void phpglue_set_function_entry(void *entry,
  * ================================================================ */
 
 uint8_t     phpglue_zval_type(zval *zv)              { return Z_TYPE_P(zv); }
-/* 取值走官方弱转换（zval_get_long/double），而非 Z_LVAL_P 直读：
+/* 取值走引擎 cast 转换（zval_get_long/double，等价 PHP 里写 `(int)$v`），
+ * 而非 Z_LVAL_P 直读：
  *
  * 背景：内部函数的 arginfo 类型校验只在 ZEND_DEBUG 构建下进行（zend_execute.c
  * 的 zend_internal_call_should_throw 包在 #if ZEND_DEBUG 里），Release 构建下
@@ -79,9 +80,10 @@ uint8_t     phpglue_zval_type(zval *zv)              { return Z_TYPE_P(zv); }
  * 没有任何引擎层校验。若此处直读 Z_LVAL_P，string/array 等类型会被当成
  * zend_long 解读（读到 union 里的指针低位），返回看似合理却错误的数字。
  *
- * zval_get_long 是官方弱转换：IS_LONG 直接返回（快路径无开销），其他类型
- * 按 PHP 语义转换，永不返回垃圾指针。这也正是「拿到什么按什么处理」——
- * 转不了的类型会得到 PHP 定义的结果而非 UB。 */
+ * zval_get_long 正是 cast 语义：IS_LONG 直接返回（快路径无开销），其他类型
+ * 按 PHP 的 cast 规则转换，永不返回垃圾指针。代价是它**不拒绝**不可转换类型
+ * （object → 1 并附 warning），即与内置函数的参数语义（ZPP 弱模式）不同——
+ * 这是有意选择，理由见 doc/boundary.md 的「取值语义」节。 */
 zend_long   phpglue_zval_get_long(zval *zv)          { return zval_get_long(zv); }
 double      phpglue_zval_get_double(zval *zv)        { return zval_get_double(zv); }
 /* 非字符串一律返回 NULL / 0：Z_STRVAL_P 不做类型检查，对非字符串读到的是
@@ -98,6 +100,28 @@ size_t      phpglue_zval_get_string_len(zval *zv)    {
     return Z_STRLEN_P(zv);
 }
 zend_array *phpglue_zval_get_array(zval *zv)         { return Z_ARRVAL_P(zv); }
+/* `(string)$v` cast 语义。走 zval_try_get_string 而非 zval_get_string：
+ * 后者对「无 __toString 的对象」会抛 Error 但**仍返回一个空串**，两者无法区分；
+ * try 版明确返回 NULL，于是「转换失败」变成可判定的返回值（Zig 侧 `orelse return`）。
+ *
+ * 注意 zval_try_get_string 对 IS_STRING 也是**新引用**（zend_string_copy），
+ * 因此返回值在所有分支上所有权一致：调用方一律负责释放。 */
+uint8_t phpglue_zval_cast_string(zval *zv, phpglue_str_t *out) {
+    zend_string *s = zval_try_get_string(zv);
+    if (s == NULL) {
+        return 0;   /* 无 __toString 的对象：Error 已抛 */
+    }
+    out->val = ZSTR_VAL(s);
+    out->len = ZSTR_LEN(s);
+    out->handle = s;
+    return 1;
+}
+void phpglue_str_free(phpglue_str_t *s) {
+    if (s->handle != NULL) {
+        zend_string_release((zend_string *) s->handle);
+        s->handle = NULL;
+    }
+}
 
 /* ================================================================
  * zval 构造

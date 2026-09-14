@@ -50,6 +50,20 @@ pub extern fn phpglue_zval_get_string_val(zv: *T.Zval)  [*c]const u8;
 pub extern fn phpglue_zval_get_string_len(zv: *T.Zval)  usize;
 pub extern fn phpglue_zval_get_array(zv: *T.Zval)       *T.ZendArray;
 
+// ＝＝＝＝ cast 取值（产生副本，所有权转移） ＝＝＝＝
+
+/// cast 结果：数据区 + 不透明所有权令牌（布局由 C glue 持有，Zig 侧不解读 handle）
+pub const PhpGlueStr = extern struct {
+    val: [*c]const u8,
+    len: usize,
+    handle: ?*anyopaque,
+};
+
+/// `(string)$v` cast：成功返回 1 并填充 out（新引用，须 phpglue_str_free）；
+/// 失败返回 0（对象无 __toString，异常已抛）
+pub extern fn phpglue_zval_cast_string(zv: *T.Zval, out: *PhpGlueStr) u8;
+pub extern fn phpglue_str_free(s: *PhpGlueStr)                        void;
+
 // ＝＝＝＝ zval 构造 ＝＝＝＝
 
 pub extern fn phpglue_zval_set_null(zv: *T.Zval)                                 void;

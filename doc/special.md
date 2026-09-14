@@ -1065,9 +1065,9 @@ static zend_always_inline bool zend_internal_call_should_throw(...)
 ### 结论
 
 1. arginfo 类型标注的价值：Reflection / IDE / 文档 + ZEND_DEBUG 构建的运行时检查。
-2. **Release 下运行时不强制**——取值必须走官方弱转换（见下节），不能依赖 arginfo 兜底。
+2. **Release 下运行时不强制**——取值必须走引擎 cast 转换（见下节），不能依赖 arginfo 兜底。
 
-## 取值必须走官方弱转换（zval_get_long），不能 Z_LVAL_P 直读
+## 取值必须走引擎 cast 转换（zval_get_long），不能 Z_LVAL_P 直读
 
 ### 问题
 
@@ -1079,9 +1079,33 @@ static zend_always_inline bool zend_internal_call_should_throw(...)
 
 ### 解决方案
 
-`phpglue_zval_get_long/double` 改用官方弱转换 `zval_get_long()`/`zval_get_double()`：IS_LONG/IS_DOUBLE 快路径直读零开销，其他类型按 PHP 语义转换（`"1"`→1、`null`→0、`[]`→0），**永不返回垃圾指针**。
+`phpglue_zval_get_long/double` 改用引擎 cast 转换 `zval_get_long()`/`zval_get_double()`：IS_LONG/IS_DOUBLE 快路径直读零开销，其他类型按 PHP 语义转换（`"1"`→1、`null`→0、`[]`→0），**永不返回垃圾指针**。
 
-这符合「拿到什么按什么处理」原则——与 PHP 内置函数（handler 用 `zend_parse_parameters`）行为一致。
+这符合「拿到什么按什么处理」原则：**可转换类型**上与 PHP 内置函数的 `zend_parse_parameters` 一致（`"1"`→1、`1.9`→1、`null`→0、`[]`→0）。
+
+### 不可转换类型：与 ZPP 不是同一个东西
+
+| 入参 | php-zig `toLong()`（`zval_get_long`） | PHP 内置函数（ZPP `'l'`） |
+|---|---|---|
+| `object` | `Warning: Object of class X could not be converted to int` + 值 `1` | `TypeError`（异常） |
+| `array` | 静默 `0`（空）/ `1`（非空） | `TypeError` |
+| `resource` | 静默取句柄 | `TypeError` |
+
+即本框架选的是 **cast（操作符）语义**（与 `$obj + 1` 完全一致——它走的就是同一个
+`zval_get_long`），不是内部函数的 **ZPP 参数语义**。理由是框架没有 ZPP 等价物
+（见上节：Release 下引擎不做校验），而 cast 语义**永不返回垃圾指针**。
+
+**因此不提供"拒绝式"取值 API**（如 `tryToLong()`）：那会把 `add(3.7, 4.2)` 从 PHP 行为
+里的 `7` 变成「类型不符」，引入一套与 PHP 不一致的行为。**要约束就声明 `Args`/`ArgTypes`**，
+而不是换取值函数。代价要说清：「长度 / 索引 / 额度」这类控制参数收到 object 时会静默变成
+`1`（只伴随一条 warning），在意就自己校验。
+
+> 别把这句读成"永远不加取值 API"：v0.11.4 起的 `castString()` 是**另一种 cast**
+> （`(string)$v` 语义：照 PHP 规则转换，转不成才抛），不是"拒绝式取值 API"。
+> 两者按需选择，不存在"严格版 / 宽松版"的关系。
+
+`test_corpus.php` 把这条语义**按坐标**固化成断言：cast 位上收到 object 语料，必须恰好
+出现 1 条 int/float 转换警告——声明之外的任何诊断都判拒绝（见 `example/tests/isolation.php`）。
 
 ## 模块级函数的 flags 从未传递（ZEND_ACC_HAS_TYPE_HINTS 失效）
 
@@ -1130,21 +1154,48 @@ PhpType.string.unionWith(PhpType.long).nullable()   // string|int|null
 
 `MAY_BE_NULL` 位与 `_ZEND_TYPE_NULLABLE_BIT` **同值**（`0x2`）——PHP 里 `?int` 与 `int|null` 完全等价，`nullable()` 就是 `unionWith(null_)`。
 
-## 联合类型不拦截隐式转换：`strict_types` 与内部函数
+## 声明了类型也不拦截：arg_info 与 `strict_types` 对 php-zig 函数都不生效
 
-### 问题
+### 原生内部函数：拦截发生在 handler 里
 
-以为声明 `int $a` 后传 `"123"` 会抛 TypeError——实测不会。
+以为声明 `int $a` 后传 `"123"` 会抛 TypeError——实测不会。原生内部函数的拦截来自
+handler 内部的 `zend_parse_parameters`（ZPP），**不是** arg_info：
 
-### 实测结论（php-src + 运行时双确认）
-
-1. `declare(strict_types=1)` 对内部函数**生效**，由**调用方文件**决定。
+1. `declare(strict_types=1)` 对原生内部函数**生效**，由**调用方文件**决定。
 2. 但可隐式转换的（`"123"`→int、`1.9`→int、`true`→int）**永不报错**，静默转换。
 3. 只有无法转换的（array→string、null→非 nullable）才抛 TypeError。
 
+### php-zig 函数：两条路都是空的
+
+- **引擎侧**：`zend_internal_call_should_throw`（含参数个数与类型两重校验）整段包在
+  `#if ZEND_DEBUG` 里，php-src `Zend/zend_execute.c` 的注释原文是
+  *「This is only checked in debug builds. In release builds, we trust that arginfo
+  matches what is enforced by `zend_parse_parameters`」* → Release 构建下 arg_info
+  既不校验类型，也不校验参数个数（后者解释了 `boundary.md` 的「少参不抛
+  `ArgumentCountError`」）。
+- **handler 侧**：php-zig 的 handler 不走 ZPP——这正是它防 UB 的方式（走cast 语义，
+  见上一节）。
+
+实测（PHP 8.2.28 / 8.4.19 双确认，`declare(strict_types=1)` 写在**调用方**文件里，
+且这些函数的 arg_info 在 Reflection 中确实可见）：
+
+| 调用 | php-zig | 原生 |
+|---|---|---|
+| `add([], 2)`（声明 `int $a`） | 返回 `2`（`[]` 的 cast 结果是 0） | — |
+| `hello_format([], 3)`（声明 `string $name`） | 返回 `" is 3 years old"` | — |
+| `str_repeat([], 3)`（handler 内 ZPP） | — | `TypeError` |
+
 ### 含义
 
-类型标注挡住「类别错误」（防 UB），挡不住「转换后的值域问题」。测试断言须分三类：TypeError / 转换后的值 / 不崩溃。
+`Args`/`ArgTypes`/`createFrom` 是**契约层**：Reflection、IDE、文档、以及 ZEND_DEBUG
+构建下的断言。它**不是运行时保证**，`strict_types` 也补不上这一层。要真拦截只有一条路：
+**handler 内显式校验**（`isLong()`/`isString()` + `Throw`），见 `boundary.md` §二 第 3、9 条。
+
+因此测试断言对 php-zig 函数只剩两类：**转换后的值** / **不崩溃**；`TypeError` 那一类只在
+原生函数上才成立。`test_corpus.php` 正是按「转换后的值」建的坐标表。
+
+这是**有意**的选择——框架跟随 `(int)$v` 这类 cast 语义，而不是内部函数的 ZPP 参数语义。三条理由、
+代价，以及"要严格就该怎么做"，见 [`boundary.md`](boundary.md) 的「取值语义」节。
 
 ## `<name>Args` 命名不匹配必须编译错误（防约束静默失效）
 

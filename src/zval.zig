@@ -7,6 +7,22 @@ const T = @import("php_types.zig");
 const Array = @import("array.zig").Array;
 const Object = @import("object.zig").Object;
 
+/// `(string)$v` cast 的结果。**持有新引用**，必须 `deinit()` —— 与
+/// `asString()`/`toStringVal()`（借用 zval 内部指针、不转移所有权）不同。
+pub const CastString = struct {
+    raw: c.PhpGlueStr,
+
+    pub fn slice(self: CastString) []const u8 {
+        return self.raw.val[0..self.raw.len];
+    }
+
+    /// 释放副本。接收 `*CastString` 而非按值：按值会释放**副本里**的令牌，
+    /// 原值仍留着已释放的 handle —— 那是个等待二次释放的雷。
+    pub fn deinit(self: *CastString) void {
+        c.phpglue_str_free(&self.raw);
+    }
+};
+
 pub const Zval = struct {
     ptr: *T.Zval,
 
@@ -59,6 +75,22 @@ pub const Zval = struct {
         const val = c.phpglue_zval_get_string_val(self.ptr) orelse return null;
         const len = c.phpglue_zval_get_string_len(self.ptr);
         return val[0..len];
+    }
+
+    /// `(string)$v` cast 语义 —— 与 PHP 里写 `(string)$v` 走同一条路径。
+    ///
+    /// 与 `toStringVal()` 的差别是**语义**而非严格度：这里 int/float/bool/null/resource
+    /// 会被真正转成字符串（`123`→`"123"`、`1.5`→`"1.5"`、`true`→`"1"`、`null`→`""`），
+    /// array → `"Array"`（附 E_WARNING），object 走 `__toString()`；
+    /// 而 `toStringVal()` 只认字符串、其余一律给空串。
+    ///
+    /// 结果持有新引用，用 `deinit()` 释放（`var s = ... orelse return; defer s.deinit();`）。
+    /// 返回 null 表示**转换失败且异常已抛**（对象无 `__toString`，PHP 抛 `Error`）：
+    /// 此时必须立即返回，不要带着半初始化状态继续执行。
+    pub fn castString(self: Zval) ?CastString {
+        var out: c.PhpGlueStr = undefined;
+        if (c.phpglue_zval_cast_string(self.ptr, &out) == 0) return null;
+        return .{ .raw = out };
     }
     pub fn toBool(self: Zval) bool            { return c.phpglue_zval_is_true(self.ptr) != 0; }
 

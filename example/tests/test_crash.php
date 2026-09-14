@@ -10,13 +10,17 @@
  * 捕获信号并精确定位到具体用例。没有 fork 能力时（非 CLI）跳过。
  *
  * 断言理念：危险测试的核心断言是「**不崩溃**」，其次才是行为可预期
- * （弱转换语义 / TypeError / 优雅降级），**不是**返回值精确相等。
+ * （cast 语义 / TypeError / 优雅降级），**不是**返回值精确相等。
+ *
+ * 诊断同样纳入判据：本文件的每个用例都是越界探针，预期诊断按用例声明
+ * （$allowDiags）。声明之外的任何诊断、以及致命错误退出，都算拒绝 ——
+ * 否则「不崩溃」会掩盖「靠致命错误退出」这种情况。收集与分类见 isolation.php。
  *
  * 用法：php -d extension=... test_crash.php
  */
 
 $passed = 0;
-$failed = 0;
+$rejected = 0;
 $skipped = 0;
 
 if (!function_exists('pcntl_fork')) {
@@ -24,70 +28,53 @@ if (!function_exists('pcntl_fork')) {
     exit(0);
 }
 
+require __DIR__ . '/isolation.php';
+
 /**
- * fork 隔离执行。子进程退出码编码：
- *   0 = 正常返回
- *   3 = 抛了异常（可诊断，不视为崩溃）
- *   信号 = 崩溃（SEGV/ABRT 等，测试失败）
+ * fork 隔离执行一个用例，按标签与诊断分类判定。
+ *
+ * 标签词汇（isolation.php 的 isolateTag）：return / throw / fatal / exit(N) / CRASH(信号)
+ *   CRASH        永远拒绝
+ *   'no-crash'   期望：return 与 throw 都通过（核心断言是「不崩溃」）
+ *   具体标签     精确匹配
+ *   fatal/exit(N) 一律拒绝：致命错误退出不是「不崩溃」，是「没崩但死了」
+ *
+ * @param list<string> $expect     允许的标签
+ * @param list<string> $allowDiags 该用例允许出现的诊断正则（默认空 = 不该有任何诊断）
  */
-function crashTest(string $name, callable $fn, array $expect = ['no-crash']): void {
-    global $passed, $failed, $skipped;
+function crashTest(string $name, callable $fn, array $expect = ['no-crash'], array $allowDiags = []): void {
+    global $passed, $rejected, $skipped;
 
-    $pid = pcntl_fork();
-    if ($pid === 0) {
-        // 子进程
-        ob_start();
-        try {
-            $fn();
-            ob_end_clean();
-            exit(0);
-        } catch (\TypeError $e) {
-            ob_end_clean();
-            exit(3); // TypeError 是预期的 PHP 行为
-        } catch (\Throwable $e) {
-            ob_end_clean();
-            exit(3);
-        }
-    }
-    pcntl_waitpid($pid, $status);
+    $res = forkIsolate($fn);
+    $tag = isolateTag($res);
 
-    $tag = '';
-    if (pcntl_wifexited($status)) {
-        $code = pcntl_wexitstatus($status);
-        if ($code === 0) {
-            $tag = 'return';
-        } elseif ($code === 3) {
-            $tag = 'throw';
-        } else {
-            $tag = "exit($code)";
-        }
-    } elseif (pcntl_wifsignaled($status)) {
-        $sig = pcntl_wtermsig($status);
-        $name_sig = match ($sig) { 11 => 'SEGV', 6 => 'ABRT', 4 => 'ILL', default => "SIG$sig" };
-        $tag = "CRASH($name_sig)";
-    } else {
-        $tag = 'unknown';
-    }
+    $crashed = $res['signal'] !== null;
+    $badExit = !$crashed && ($res['outcome'] === 'fatal' || $res['outcome'] === 'lost');
+    $bad = unexpectedDiags($res['diags'], $allowDiags);
 
-    // 判定：
-    //   崩溃（CRASH）永远失败
-    //   'no-crash' 期望：return / throw 都通过（核心断言是「不崩溃」）
-    //   具体期望（如 'throw'）：精确匹配 tag
-    $crash = str_starts_with($tag, 'CRASH');
     $ok = false;
-    if (!$crash) {
-        if (in_array('no-crash', $expect, true)) {
-            $ok = true; // return 或 throw 都算不崩溃
-        } elseif (in_array($tag, $expect, true)) {
-            $ok = true;
-        }
+    if (!$crashed && !$badExit) {
+        $ok = in_array('no-crash', $expect, true) || in_array($tag, $expect, true);
     }
+    if ($bad !== []) {
+        $ok = false;
+    }
+
     if ($ok) {
         $passed++;
-        echo "  ✓ $name  [{$tag}]\n";
+        $extra = $res['diags'] !== [] ? '  诊断 ' . count($res['diags']) . ' 条（已声明）' : '';
+        echo "  ✓ $name  [{$tag}]$extra\n";
     } else {
-        $failed++;
-        echo "  ✗ $name  —— 期望 " . implode('/', $expect) . "，实际 {$tag}" . ($crash ? '（崩溃！）' : '') . "\n";
+        $rejected++;
+        $why = $crashed ? '崩溃！'
+            : ($badExit ? '意外退出（致命错误不是「不崩溃」）' : '');
+        echo "  ✗ $name  —— 期望 " . implode('/', $expect) . "，实际 {$tag}" . ($why !== '' ? "（$why）" : '') . "\n";
+        if ($res['thrown'] !== null) {
+            echo "      抛出：{$res['thrown']}\n";
+        }
+        foreach ($bad as $b) {
+            echo "      意外诊断：$b\n";
+        }
     }
 }
 
@@ -97,7 +84,7 @@ function crashTest(string $name, callable $fn, array $expect = ['no-crash']): vo
 echo "\n=== A. 数值类：错误类型入参（不崩溃即可）===\n";
 foreach ([
     'add(1,2)'             => fn() => add(1, 2),
-    'add("1","2") 弱转换'   => fn() => add("1", "2"),
+    'add("1","2") cast 语义' => fn() => add("1", "2"),
     'add(PHP_INT_MAX,1) 溢出' => fn() => add(PHP_INT_MAX, 1),
     'add(PHP_INT_MIN,-1)'  => fn() => add(PHP_INT_MIN, -1),
     'add(null, 2)'         => fn() => add(null, 2),
@@ -215,9 +202,25 @@ crashTest('hello_sum(1) 少参', fn() => hello_sum(1));
 crashTest('add(1,2,3) 多参', fn() => add(1, 2, 3));
 
 // ============================================================
+// G. cast 取值（`(string)$v`）—— 诊断必须按用例声明
+// ============================================================
+echo "\n=== G. cast 取值 ===\n";
+$castRes = fopen('php://memory', 'r');
+crashTest('hello_cast_string(123)', fn() => hello_cast_string(123));
+crashTest('hello_cast_string(1.5)', fn() => hello_cast_string(1.5));
+crashTest('hello_cast_string(null)', fn() => hello_cast_string(null));
+crashTest('hello_cast_string(资源)', fn() => hello_cast_string($castRes));
+crashTest('hello_cast_string(obj __toString)', fn() => hello_cast_string($toStr));
+crashTest('hello_cast_string(对象无 __toString) → 抛 Error', fn() => hello_cast_string(new stdClass), ['throw']);
+crashTest('hello_cast_string() 无参', fn() => hello_cast_string());
+crashTest('hello_cast_string(array) 附 E_WARNING', fn() => hello_cast_string([1, 2]), ['no-crash'], ['/^Array to string conversion$/']);
+crashTest('hello_cast_string(深嵌套数组)', fn() => hello_cast_string($deep), ['no-crash'], ['/^Array to string conversion$/']);
+crashTest('hello_cast_string(循环引用数组)', fn() => hello_cast_string($cyclic), ['no-crash'], ['/^Array to string conversion$/']);
+
+// ============================================================
 // 结果汇总
 // ============================================================
 echo "\n========================================\n";
-echo "崩溃隔离测试：通过 {$passed}，失败 {$failed}，跳过 {$skipped}\n";
-echo $failed === 0 ? "全部通过\n" : "有失败项！\n";
-exit($failed === 0 ? 0 : 1);
+echo "崩溃隔离测试：通过 {$passed}，拒绝 {$rejected}，跳过 {$skipped}\n";
+echo $rejected === 0 ? "全部通过\n" : "有拒绝项！\n";
+exit($rejected === 0 ? 0 : 1);

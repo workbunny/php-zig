@@ -233,13 +233,22 @@ public_magic_tostring → __toString（魔术方法）
 `isArray()` / `isObject()` / `isResource()` / `isCallable()` / `isIterable()` /
 `isScalar()` / `isEmpty()` / `isNumeric()`
 
-### 取值（弱转换，PHP 语义）
+### 取值（cast 语义）
 
-> **语义修正**：这些是官方弱转换（`zval_get_long` 等），不是强转直读。
-> 背景：内部函数 arginfo 类型校验只在 ZEND_DEBUG 构建生效（见 special.md），
-> Release 下 handler 收到原始未转换 zval。直读 `Z_LVAL_P` 会把 string/array
-> 的指针当 long 解读（返回看似合理的垃圾值）；弱转换按 PHP 语义转换，
+> 这些走引擎的 **cast 转换**（`zval_get_long` 等），等价 PHP 里写 `(int)$v`，
+> 不是字段直读。背景：内部函数 arginfo 类型校验只在 ZEND_DEBUG 构建生效
+> （见 special.md），Release 下 handler 收到原始未转换 zval；直读 `Z_LVAL_P`
+> 会把 string/array 的指针当 long 解读（返回看似合理的垃圾值），cast 转换则
 > **永不返回垃圾指针**。判断原始类型用 `isLong()` 等。
+>
+> **对 object / array / resource 不抛异常**：object 得 `1`（伴随
+> `Warning: Object of class X could not be converted to int`），array 得 `0`/`1`，
+> resource 得句柄。这是 PHP **操作符**语义（`$obj + 1` 走同一条 `zval_get_long`），
+> 与内置函数的 ZPP（抛 `TypeError`）不同——对照表见 [special.md](special.md)。
+> 需要约束就在 handler 内显式校验（`isLong()` + `Throw`）：`Args`/`ArgTypes` 只影响
+> Reflection 与 ZEND_DEBUG 构建，Release 下引擎不拦截。
+> 取值跟随 **cast 语义**而非内置函数的 ZPP 参数语义，这是有意为之——理由与代价见
+> [`boundary.md`](boundary.md) 的「取值语义」节。
 
 | 方法 | 返回 | 语义 |
 |---|---|---|
@@ -248,6 +257,21 @@ public_magic_tostring → __toString（魔术方法）
 | `toBool()` | `bool` | `zval_is_true` |
 | `toStringVal()` | `[]const u8` | 非字符串返回**空串**（底层防野指针） |
 | `asString()` | `?[]const u8` | 非字符串返回 null（区分「空串」与「类型不符」） |
+| `castString()` | `?CastString` | `(string)$v` cast 语义：`123`→`"123"`、`1.5`→`"1.5"`、`true`→`"1"`、`null`→`""`、resource→`"Resource id #N"`、array→`"Array"`（附 E_WARNING）、object 走 `__toString()` |
+
+`castString()` 与前两个的所有权语义不同：**它持有新引用**，必须释放。
+
+```zig
+var s = phpzig.Return.callArg(ed, 1).castString() orelse return; // null = 已抛异常
+defer s.deinit();
+phpzig.Return.returnString(rv, s.slice());
+```
+
+返回 null 表示**转换失败且异常已抛**（对象无 `__toString` 时 PHP 抛 `Error`）——
+此时必须立即返回，不要带着半初始化状态继续执行。
+
+三者分工：`asString()` 判类型、`toStringVal()` 要一个安全的字符串默认值、
+`castString()` 要 PHP 的 `(string)` 转换结果。
 
 ### 赋值
 

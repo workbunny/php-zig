@@ -54,7 +54,7 @@ pub fn php_add(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    // toLong() 是官方弱转换（zval_get_long）："1"→1、null→0、[]→0，
+    // toLong() 是 cast 语义（等价 (int)$v）："1"→1、null→0、[]→0，
     // 永不返回垃圾值。此前用 `isLong() else 0` 会绕过转换——string 被当 0，
     // add("1","2") 返回 0 而非 3，与 PHP 语义不符。
     const x = a.toLong();
@@ -654,8 +654,10 @@ fn helloArenaSum(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void
 
 fn cleanupOnShutdown(data: ?*anyopaque) callconv(.c) void {
     _ = data;
-    // 清理回调在 RSHUTDOWN 执行（bailout 后同样触发），此处输出 stderr 便于人工观察
-    std.debug.print("phpzig cleanup: request shutdown\n", .{});
+    // 清理回调在 RSHUTDOWN 执行（bailout 后同样触发）。
+    // 此处不打印：stderr 留给「意外」—— 诊断一律走测试的显式回传通道
+    // （见 example/tests/isolation.php）；「回调确实在 RSHUTDOWN 跑到了」
+    // 已由 test_bailout 的 marker（held-usage，在 bailout 下断言）程序化覆盖。
 }
 
 fn helloCleanupRegister(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
@@ -1395,6 +1397,22 @@ const helloTypedArgsArgs = struct {
     count: i64,
 };
 
+/// cast 取值演示：`(string)$v` 语义（与 PHP 里写 `(string)$v` 同一条路径）。
+/// 对象无 `__toString` 时 castString 返回 null（引擎已抛 Error）——此时立即返回，
+/// 不带着半初始化状态继续跑。
+fn helloCastString(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    if (phpzig.Return.callNumArgs(ed) < 1) {
+        phpzig.Return.returnNull(rv);
+        return;
+    }
+    var s = phpzig.Return.callArg(ed, 1).castString() orelse {
+        phpzig.Return.returnNull(rv);
+        return;
+    };
+    defer s.deinit();
+    phpzig.Return.returnString(rv, s.slice());
+}
+
 /// callable 伪类型
 fn helloCallableArg(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const cb = phpzig.Return.callArg(ed, 1);
@@ -1516,6 +1534,8 @@ comptime {
             // php_hello_world / php_version / php_add 已由 @This() 自动发现，此处无需列出
             phpzig.FunctionDesc.create("hello_name", helloName),
             phpzig.FunctionDesc.createWithParams("hello_strlen", helloStrlen, &.{phpzig.ParamDesc.create("str")}),
+            // cast 取值（`(string)$v` 语义）——语料矩阵把它当「转得成就转、转不成就抛」的样例
+            phpzig.FunctionDesc.createWithParams("hello_cast_string", helloCastString, &.{phpzig.ParamDesc.create("v")}),
             phpzig.FunctionDesc.createWithParams("hello_concat", helloConcat, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
             phpzig.FunctionDesc.createWithParams("hello_divide", helloDivide, &.{ phpzig.ParamDesc.create("a"), phpzig.ParamDesc.create("b") }),
             phpzig.FunctionDesc.createWithParams("hello_iterate", helloIterate, &.{phpzig.ParamDesc.create("arr")}),
@@ -1735,7 +1755,7 @@ fn calcAdd(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c)
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    const x = a.toLong(); // 弱转换（PHP 语义），同 php_add
+    const x = a.toLong(); // cast 语义，同 php_add
     const y = b.toLong();
     const sum, const overflowed = @addWithOverflow(x, y);
     if (overflowed != 0) {
@@ -1752,7 +1772,7 @@ fn calcMultiply(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callcon
     }
     const a = phpzig.Return.callArg(execute_data, 1);
     const b = phpzig.Return.callArg(execute_data, 2);
-    phpzig.Return.returnLong(return_value, a.toLong() * b.toLong()); // 弱转换
+    phpzig.Return.returnLong(return_value, a.toLong() * b.toLong()); // cast 语义
 }
 
 fn calcSubtract(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {

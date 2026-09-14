@@ -116,6 +116,34 @@ size_t      phpglue_zval_get_string_len(zval *zv);
 zend_array *phpglue_zval_get_array(zval *zv);
 
 /* ================================================================
+ * cast 取值（`(string)$v` 语义，**产生副本**，所有权转移给调用方）
+ *
+ * 与上一节的取值 API 相反：这些函数新建 zend_string，调用方必须释放。
+ * 为什么需要它：`toStringVal()` 对非字符串返回空串（防野指针的安全默认），
+ * 而 `(string)$v` 会把 123 变成 "123"、array 变成 "Array"、对象走 __toString()。
+ * 两者是不同语义，各服务不同场合，不互相替代。
+ * ================================================================ */
+
+/** cast 结果：val/len 是数据区（有效至 phpglue_str_free 之前），
+ *  handle 是不透明的所有权令牌，不解读、只转交。 */
+typedef struct {
+    const char *val;
+    size_t      len;
+    void       *handle;
+} phpglue_str_t;
+
+/** `(string)$v` 语义，与 PHP 里写 `(string)$v` 走同一条路径（zval_try_get_string）：
+ *  int/float/bool/null/resource → 字符串；array → "Array" + E_WARNING；
+ *  object → __toString()。
+ *
+ *  成功返回 1，`out` 收到**新引用**（必须 phpglue_str_free）；
+ *  失败返回 0（对象无 __toString，异常已抛），`out` 未定义——
+ *  调用方此时必须立即返回，不要带着半初始化的状态继续执行。 */
+uint8_t phpglue_zval_cast_string(zval *zv, phpglue_str_t *out);
+/** 释放 cast 结果（幂等：释放后 handle 置空） */
+void    phpglue_str_free(phpglue_str_t *s);
+
+/* ================================================================
  * zval 构造
  * ================================================================ */
 

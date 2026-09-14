@@ -6,6 +6,48 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
 > 发布不破坏 API**（`0.11.0 → 0.11.1` 兼容）；**y 版本可能破坏 API**
 > （`0.11 → 0.12` 需查本节）。变更均以本节为准。
 
+## [0.11.4] - 2026-09-14
+
+> z 版本发布，无 API 变更：新增一个取值入口，既有取值语义一字未改。
+
+### 新增
+
+- `Zval.castString()`：`(string)$v` cast 语义，与 PHP 里写 `(string)$v` 同一条路径
+  （`zval_try_get_string`）——`123`→`"123"`、`1.5`→`"1.5"`、`true`→`"1"`、`null`→`""`、
+  resource→`"Resource id #N"`、array→`"Array"`（附 `E_WARNING`）、object 走 `__toString()`。
+  结果持有新引用（须 `deinit()`）；返回 null = **转换失败且异常已抛**（对象无
+  `__toString` 时 PHP 抛 `Error`），调用方须立即返回。
+- `toLong()` / `toDouble()` / `toStringVal()` / `asString()` 语义与签名**不变**。
+
+### 修复
+
+- 崩溃隔离测试的退出码判据：致命错误退出（`exit=255`）此前被记成「通过」，
+  现判拒绝 —— 致命退出不是「不崩溃」。
+- 示例扩展的 cleanup 探针不再向 stderr 打印：诊断一律走显式回传通道，
+  stderr 留给「意外」。
+
+### 测试
+
+- 新增 `example/tests/isolation.php`：三个隔离型测试共用。子进程内关闭 `log_errors` 与
+  `display_errors`（`log_errors` 是唯一能穿透 `ob_start` 的通道，此前警告正是从 fd 2
+  漏进 CI 日志），诊断经 socketpair 回传后按坐标分类：该有的必须有、不该有的不能有。
+- 诊断按坐标预先声明：数值 cast 位 × object = **21** 条、字符串 cast 位 × array = **4** 条（引擎的
+  int/float 转换与 Array to string conversion 警告），bailout B/C 组各 1 条探针 Fatal error
+  （本组断言对象）；其余诊断、致命退出、预期未命中一律拒绝。四套测试的 `stderr` 恢复为空。
+- 新增 `hello_cast_string` 与 10 个崩溃用例；诊断白名单按用例声明（`$allowDiags`）。
+- 判别力验证：抹掉一处 cast 位声明 / 虚报一处 / 抹掉 `cast-str` 规则，分别精确报出
+  3 条意外 + 3 条未命中、4 条意外诊断。
+- 规模：功能 229 → **239**，语料 408 → **432**（17 → 18 函数），崩溃隔离 59 → **69**，
+  bailout **22**，Zig 单测 87 不变。
+
+### 文档
+
+- `boundary.md` 新增「取值语义：跟随 cast（操作符）语义，**不**模仿 ZPP」：ZPP 基准
+  对照表、三条理由（缺上下文 / 内部实现细节会随版本漂移 / cast 语义精确可得）、代价，
+  以及「要严格就声明 + handler 内显式校验」。
+- `special.md` / `api.md`：arg_info 在 Release 不校验、`strict_types` 对 php-zig 函数
+  不生效（8.2 / 8.4 双版本实测）；说明这是**有意**选择，不是待修的缺陷。
+
 ## [0.11.3] - 2026-09-14
 
 > z 版本发布，无 API 变更。

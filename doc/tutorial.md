@@ -138,7 +138,7 @@ fn greet(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) v
 
 fn add(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     if (phpzig.Return.callNumArgs(ed) < 2) { phpzig.Return.returnNull(rv); return; }
-    // toLong() 是官方弱转换（"1"→1、null→0），与 PHP 语义一致；
+    // toLong() 是 cast 语义（等价 (int)$v："1"→1、null→0），与 PHP 行为一致；
     // 不要用 `if (isLong()) ... else 0`——那会绕过转换，add("1","2") 返回 0
     const a = phpzig.Return.callArg(ed, 1).toLong();
     const b = phpzig.Return.callArg(ed, 2).toLong();
@@ -295,7 +295,7 @@ if (arg.isEmpty()) { ... }      // 等价 PHP empty()
 if (arg.isNumeric()) { ... }    // int/float/数值字符串
 ```
 
-**取值是官方弱转换（PHP 语义），不是类型洁癖**：
+**取值是 cast 语义（等价 `(int)$v`），不是类型洁癖**：
 
 ```zig
 // toLong() = zval_get_long：IS_LONG 直读（快路径零开销），其他按 PHP 转换
@@ -306,12 +306,17 @@ const b: bool   = arg.toBool();      // zval_is_true
 // 字符串：非字符串返回空串（底层防野指针），要区分用 asString()
 const s: []const u8  = arg.toStringVal();  // 非字符串 → ""
 const opt: ?[]const u8 = arg.asString();   // 非字符串 → null
+
+// cast 取值：`(string)$v` 语义（123→"123"、array→"Array"+E_WARNING、object 走 __toString）
+// 结果持有新引用，必须 deinit；返回 null = 转换失败且异常已抛（对象无 __toString）
+var cs = arg.castString() orelse return;
+defer cs.deinit();
 ```
 
 **为什么不能直读字段**：内部函数的 arginfo 类型校验只在 ZEND_DEBUG 构建生效
 （详见 special.md），Release 下 handler 可能收到任意类型。若直读 `Z_LVAL_P`
 /`Z_STRVAL_P`，会把 string/array 的指针当数值/字符串解读——不崩溃时返回
-「看似合理却错误的数字」。弱转换保证**永不返回垃圾指针**。
+「看似合理却错误的数字」。cast 语义保证**永不返回垃圾指针**。
 
 ### zval 设值
 
@@ -1165,7 +1170,7 @@ pub fn php_hello(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     phpzig.Return.returnString(rv, "Hello");
 }
 
-// 有参函数——参数由伴生 struct 反射（toLong 弱转换，溢出转 float）
+// 有参函数——参数由伴生 struct 反射（取值走 cast 语义，溢出转 float）
 pub fn php_add(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const a = phpzig.Return.callArg(ed, 1).toLong();
     const b = phpzig.Return.callArg(ed, 2).toLong();
@@ -1217,9 +1222,10 @@ zig build test
 ```bash
 cd example/tests
 zig build -Dphp=/usr/local
-php -d extension=zig-out/lib/libext-tests.so test_all.php     # 功能 200/200
-php -d extension=zig-out/lib/libext-tests.so test_crash.php   # 崩溃隔离 59/59（fork + 信号检测）
-php -d extension=zig-out/lib/libext-tests.so test_corpus.php  # 语料矩阵 312/312（任意类型 × API 不崩溃）
+php -d extension=zig-out/lib/libext-tests.so test_all.php     # 功能 239/239
+php -d extension=zig-out/lib/libext-tests.so test_crash.php   # 崩溃隔离 69/69（fork + 信号检测）
+php -d extension=zig-out/lib/libext-tests.so test_corpus.php  # 语料矩阵 432/432（任意类型 × API 不崩溃，诊断分类）
+php -d extension=zig-out/lib/libext-tests.so test_bailout.php # bailout 兜底 22/22（真实 longjmp）
 ```
 
 最小示例（`example/hello/`）构建与运行：

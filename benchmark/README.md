@@ -131,8 +131,8 @@ PHP 8.4.19 (NTS) / Linux / 30 万次迭代 × 5 轮取中位数（zig 侧经 7 �
    换成混合类型的 `mixed` 反而 0.89x。
 
 > 注：单用例跨轮波动可达 ±0.1x（容器调度抖动），结论看整体分布而非单值。
-> 最近的 v0.10.2 改动（取值弱转换、flags 传递）经实测**零性能影响**——
-> 弱转换对 IS_LONG 快路径是 inline 直读，benchmark 参数均为 mixed 不触发
+> 最近的 v0.10.2 改动（取值 cast 语义、flags 传递）经实测**零性能影响**——
+> cast 语义对 IS_LONG 快路径是 inline 直读，benchmark 参数均为 mixed 不触发
 > HAS_TYPE_HINTS 运行时检查。
 
 ### `array_read` 的 1.41x
