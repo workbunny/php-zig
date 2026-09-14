@@ -210,7 +210,7 @@ Hello from php-zig!
 | INI 配置 | ✅ | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知 |
 | 序列化 | ✅ | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize() |
 | phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 78 项 + PHP 集成测试：功能 200 / 崩溃隔离 59 / 类型语料 312 / bailout 兜底 14 |
+| 测试 | ✅ | Zig 单元测试 87 项 + PHP 集成测试：功能 229 / 崩溃隔离 59 / 类型语料 408 / bailout 兜底 17 |
 
 ### 两种注册哲学，并存
 

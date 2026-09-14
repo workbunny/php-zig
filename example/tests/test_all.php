@@ -105,6 +105,24 @@ test('hello_name("Bob") 返回问候语', 'Hello, Bob!', hello_name('Bob'));
 test('hello_name() 无参返回 null', null, @hello_name());
 test('version() 返回版本字符串', 'php-zig v0.9.0', version());
 
+// 结构性断言：模块函数必须【全部】注册。
+//
+// 背景：PHP 8.2/8.3 上 Zig 侧的函数表 stride 与 PHP 不一致（8.4 的
+// zend_function_entry 多两个字段，32 → 40 字节），PHP 按自己的 stride 迭代，
+// 读到零值即判定为表尾哨兵 —— 结果是**只注册了第一个函数**。
+// 此前本节只断言前两个函数，恰好都落在被注册的那一条上，"少注册"完全不可见。
+//
+// 名单覆盖注册顺序的首、中、尾；末尾项尤其关键——任何提前截断都会让它消失。
+$expectedFns = [
+    'hello_world', 'version', 'add',                                   // 自动发现段
+    'hello_name', 'hello_strlen', 'hello_concat', 'hello_iterate',
+    'hello_object', 'hello_pop', 'hello_zip',                          // 显式段（靠前）
+    'hello_obs_last_func',                                             // 显式段（靠后）
+    'hello_arena_report', 'hello_resident_put', 'hello_unsafe_alloc',   // 末段
+];
+$missingFns = array_values(array_filter($expectedFns, fn($n) => !function_exists($n)));
+test('模块函数全部注册（结构断言，缺失项会被列出）', [], $missingFns);
+
 // ============================================================
 // 2. 返回值类型 — 9种全覆盖
 // ============================================================
@@ -601,8 +619,18 @@ test('funcInfo 内部函数无定义行号（lineno=0）', 0, hello_obs_info_lin
 test('funcInfo 参数个数为 0（hello_world 无参）', 0, hello_obs_info_num_args());
 
 // P0：现场信息——用户函数分支（obs_user_fn 由 PHP 定义）
+//
+// 结构断言必须先行：`internal = false` 在「回调根本没被调用」时同样成立
+// （快照停留在 reset 后的默认值），是典型的假阳性。此前 §28 只有快照字段
+// 断言，所以「用户函数完全没被观察」这类失效查不出来（实测：某环境下
+// 回调从未触发，而 internal/lineno/num_args 三项断言照旧通过）。
+// 故先用计数增量证明回调确实被调用过，再看快照字段。
 hello_obs_reset();
+$userFnBefore = hello_obs_begin_count();
 obs_user_fn(1, 2, 3);
+$userFnAfter = hello_obs_begin_count();
+test('用户函数回调确实被调用（结构断言：计数增长）', true, $userFnAfter > $userFnBefore);
+
 test('funcInfo 识别用户函数（internal=false）', false, hello_obs_info_internal());
 test('funcInfo 取到用户函数定义行号', true, hello_obs_info_lineno() > 0);
 test('funcInfo 参数个数为 3', 3, hello_obs_info_num_args());
@@ -759,6 +787,137 @@ hello_arena_set_limit(0, false);
 // ——— 手动回收：显式释放常驻单例后账目归零 ———
 hello_resident_release();
 test('显式回收后常驻账目归零', 0, hello_arena_report()['resident']);
+
+// ============================================================
+// 32. 参数元信息（arg_info）完整性与隔离
+// ============================================================
+echo "\n=== 32. 参数元信息（arg_info）===\n";
+//
+// 模块函数与类方法此前共用一块 arg_info 缓冲区，两个游标却各自从 0 开始，
+// 后初始化的一方覆盖先初始化的。而 Zend 只保存 arg_info 的**指针**不拷贝，
+// 于是模块函数的参数元信息变成别处条目的中段字节：8.4 实测
+// `ReflectionFunction('hello_concat')->getParameters()` 直接 SIGSEGV。
+//
+// 该缺陷的隐蔽性有两层：测试从不做参数内省；即使做了，hello_concat 与
+// Calculator::add 的参数名恰好都是 a/b，名字断言也会"通过"。
+// 故判别用例必须使用参数名与任何类方法都不同的函数（hello_resident_put）。
+
+$concatParams = array_map(
+    fn($p) => $p->getName(),
+    (new ReflectionFunction('hello_concat'))->getParameters()
+);
+test('模块函数参数名可反射（hello_concat）', ['a', 'b'], $concatParams);
+
+$putParams = array_map(
+    fn($p) => $p->getName(),
+    (new ReflectionFunction('hello_resident_put'))->getParameters()
+);
+test('模块函数参数名可反射（hello_resident_put，名字不与类方法雷同）', ['index', 'value'], $putParams);
+
+// 类方法侧必须**精确匹配**：只断言「名字非空」抓不到反方向的覆盖 ——
+// 模块函数盖掉类方法时，非空断言照样通过。
+$setParams = array_map(
+    fn($p) => $p->getName(),
+    (new ReflectionMethod('Counter', 'set'))->getParameters()
+);
+test('类方法参数名可反射（Counter::set，唯一名字）', ['v'], $setParams);
+
+$calcAddParams = array_map(
+    fn($p) => $p->getName(),
+    (new ReflectionMethod('Calculator', 'add'))->getParameters()
+);
+test('类方法参数名可反射（Calculator::add）', ['a', 'b'], $calcAddParams);
+
+// 全量兜底：所有类的方法参数名都不能为空
+$methodsOk = true;
+$badMethod = '';
+foreach ((new ReflectionClass('Calculator'))->getMethods() as $m) {
+    $names = array_map(fn($p) => $p->getName(), $m->getParameters());
+    foreach ($names as $n) {
+        if ($n === '') {
+            $methodsOk = false;
+            $badMethod = $m->getName();
+        }
+    }
+}
+test('类方法参数名可反射（全部）' . ($badMethod !== '' ? " —— $badMethod" : ''), true, $methodsOk);
+
+// ============================================================
+// 33. 类方法表注册完整性（结构断言）
+// ============================================================
+echo "\n=== 33. 类方法表注册完整性 ===\n";
+//
+// 与 §1 同构，也是这次缺陷的直接教训：类方法表同样按「运行时 stride +
+// 每个类一条哨兵」排布。单类 stride 错 → 该类方法缺失；多类时哨兵错位 →
+// **第 2 个类之后整张表消失**。
+//
+// 名单必须覆盖注册顺序的首、中、尾。末尾的 Counter 是最强判别点 ——
+// 它之前已有 10 个类，任何哨兵/游标错位都会先把它吃掉。
+//
+// 类形态各异，一并覆盖：0 方法类（MyAppException / MyAppError）、
+// 接口（Greetable）、struct 反射（BankAccount）、extends（SavingsAccount）、
+// extern struct 绑定（Counter）。
+$expectedClasses = [
+    'Calculator'     => ['add', 'multiply', 'subtract'],
+    'CalcConst'      => ['dummy'],
+    'BankAccount'    => ['__construct', 'getBalance', 'internal'],
+    'TestBank'       => ['__construct', 'getBalance', 'internal'],
+    'ManualProps'    => ['get'],
+    'SavingsAccount' => ['interest'],
+    'MyAppException' => [],
+    'MyAppError'     => [],
+    'Greetable'      => ['greet'],
+    'Person'         => ['greet'],
+    'Counter'        => ['increment', 'get', 'set'],
+];
+$missingMembers = [];
+foreach ($expectedClasses as $cls => $methods) {
+    if (!class_exists($cls) && !interface_exists($cls)) {
+        $missingMembers[] = $cls;
+        continue;
+    }
+    foreach ($methods as $m) {
+        if (!method_exists($cls, $m)) {
+            $missingMembers[] = "$cls::$m";
+        }
+    }
+}
+test('类与方法全部注册（结构断言，缺失项会被列出）', [], $missingMembers);
+
+// ============================================================
+// 34. 常驻额度 reject + 裸记账 API
+// ============================================================
+echo "\n=== 34. 常驻额度与裸记账 ===\n";
+//
+// 这两个契约此前只有 Zig 单测覆盖，PHP 侧是空白：
+//   - resident_limit 超限拒绝 = 「防 OOM kill」的对外承诺
+//   - Memtrack.trackAlloc / trackFree = 已公开文档化的 API，却零调用
+
+// ——— 常驻额度：超限应被拒（reject），且不崩溃 ———
+hello_resident_release();                       // 从干净状态起步
+$residentBaseline = hello_arena_report()['resident'];
+hello_resident_set_limit(65536);
+$filled = hello_resident_fill(2000);            // 请求 128KB，远超 64KB 额度
+test('常驻限额生效：超限后分配被拒（未崩溃）', true, $filled < 2000 * 64);
+test('常驻限额生效：实际分配未超额度上限', true, $filled <= 65536 + 65536);
+hello_resident_set_limit(0);                    // 复位（进程级配置）
+hello_resident_release();
+test('常驻回收后回到基线', $residentBaseline, hello_arena_report()['resident']);
+
+// ——— 裸记账 API：计入后再注销，必须对称归零 ———
+$ledgerBaseline = hello_arena_report()['resident'];
+$got = hello_ledger_probe(4096, false);
+test('裸记账探针返回注入字节数', 4096, $got);
+test('裸记账对称归零（计入 + 注销）', $ledgerBaseline, hello_arena_report()['resident']);
+
+// ——— 反向验证：漏注销必须让计数虚高 ———
+// 没有这一步，「对称归零」可能只是因为压根没记上（弱断言），
+// 也无法证明归零断言真有判别力。
+$leaked = hello_ledger_probe(8192, true);
+test('反向验证：探针确实注入成功', 8192, $leaked);
+test('反向验证：漏 trackFree 使计数虚高 8192B', $ledgerBaseline + 8192, hello_arena_report()['resident']);
+hello_ledger_cleanup();
+test('cleanup 注销后回落基线', $ledgerBaseline, hello_arena_report()['resident']);
 
 // ============================================================
 // 结果汇总

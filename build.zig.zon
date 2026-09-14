@@ -1,7 +1,7 @@
 .{
     .name = .phpzig,
     .fingerprint = 0x4612f9e1ec0f5a90,
-    .version = "0.11.2",
+    .version = "0.11.3",
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
@@ -12,6 +12,7 @@
         // 协议与文档
         "LICENSE",
         "README.md",
+        "CHANGELOG.md",
         "doc",
         // 源码与 C 胶水层
         "src",

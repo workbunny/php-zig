@@ -14,6 +14,19 @@ pub extern fn phpglue_module_build_id() [*c]const u8;
 // ＝＝＝＝ 编译期常量查询（ZEND_ACC_* 等，值由编译时 PHP 头文件决定） ＝＝＝＝
 
 pub extern fn phpglue_arginfo_entry_size() usize;
+/// sizeof(zend_function_entry) — 随 PHP 版本变化（8.4 追加两字段）。见 glue 注释。
+pub extern fn phpglue_function_entry_size() usize;
+/// sizeof(zend_module_entry) — 供 Zig 侧校验 extern struct 布局一致
+pub extern fn phpglue_module_entry_size() usize;
+/// 按目标版本布局写入一条 zend_function_entry（内部先清零；fname 传 null 即哨兵）
+pub extern fn phpglue_set_function_entry(
+    entry: *anyopaque,
+    fname: [*c]const u8,
+    handler: ?T.FunctionHandler,
+    arg_info: ?*const anyopaque,
+    num_args: u32,
+    flags: u32,
+) void;
 pub extern fn phpglue_acc_public()      u32;
 pub extern fn phpglue_acc_protected()   u32;
 pub extern fn phpglue_acc_private()     u32;

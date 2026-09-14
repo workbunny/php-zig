@@ -47,6 +47,17 @@ const char *phpglue_module_build_id(void);
 /** sizeof(zend_internal_arg_info)，由编译时 PHP 头文件决定 */
 size_t   phpglue_arginfo_entry_size(void);
 
+/** sizeof(zend_function_entry) — 随 PHP 版本变化（8.4 追加 frameless_function_infos /
+ *  doc_comment，32 → 40 字节）。框架的模块函数表是「裸字节缓冲 + 运行时 stride」，
+ *  布局只由本函数与 phpglue_set_function_entry 决定，Zig 侧不描述字段。
+ *
+ *  若在 Zig 侧硬编码某个版本的字段列表，另一版本上 PHP 会按自己的 stride 迭代，
+ *  读到零值即判定为表尾哨兵，表现为「只注册了第一个函数」。 */
+size_t   phpglue_function_entry_size(void);
+
+/** sizeof(zend_module_entry) — 供 Zig 侧校验 extern struct 布局与本版本一致 */
+size_t   phpglue_module_entry_size(void);
+
 /** 方法可见性标志 — 由编译时 PHP 头文件的 ZEND_ACC_* 决定 */
 uint32_t phpglue_acc_public(void);
 uint32_t phpglue_acc_protected(void);
@@ -60,6 +71,25 @@ size_t  phpglue_zval_size(void);
 
 /** ZTS 模式 — 返回 COMPILE_DL_ZTS，NTS PHP 返回 0，ZTS PHP 返回 1 */
 uint8_t phpglue_zts_mode(void);
+
+/* ================================================================
+ * zend_function_entry 写入 — 布局由 C 侧决定
+ * ================================================================ */
+
+/** 按目标版本的真实布局写入一条 zend_function_entry。
+ *
+ *  entry 指向 phpglue_function_entry_size() 字节的可写区，函数内部先整体清零：
+ *  - 本版本不存在的字段（8.2/8.3 无 frameless_function_infos / doc_comment）
+ *    与哨兵语义（fname == NULL）都由零值自然满足；
+ *  - fname 传 NULL 即写入表尾哨兵。
+ *
+ *  Zend 只保存 arg_info 的**指针**不拷贝，故它必须指向比函数表存活更久的存储。 */
+void phpglue_set_function_entry(void *entry,
+                                const char *fname,
+                                zif_handler handler,
+                                const zend_internal_arg_info *arg_info,
+                                uint32_t num_args,
+                                uint32_t flags);
 
 /* ================================================================
  * zval 类型查询

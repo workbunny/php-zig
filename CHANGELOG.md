@@ -6,51 +6,70 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
 > 发布不破坏 API**（`0.11.0 → 0.11.1` 兼容）；**y 版本可能破坏 API**
 > （`0.11 → 0.12` 需查本节）。变更均以本节为准。
 
-## [0.11.2] - 2026-09-11
+## [0.11.3] - 2026-09-14
 
-> z 版本发布，不破坏 API。新增 `ResidentArena` / `Memtrack` / `unsafeAllocator`；
-> `RequestArena` 的构造与用法不变，`Arena.usage()` / `peak()` 签名与语义不变。
+> z 版本发布，无 API 变更。
 
-### 常驻级内存池（ResidentArena）
+### 修复
 
-- **`RequestArena` 与 `ResidentArena` 合并为一个泛型实现 `ArenaOf(scope)`**：同一套
-  分配 / 记账 / 限额 / reject 语义，差异只有两处——额度来源、是否注册 RSHUTDOWN 钩子。
-  合并的直接收益是 reject 判定只有一份，消灭「改一处要同步另一处」这类必然漂移。
-- 常驻级生命周期挂在 **MSHUTDOWN**（模块卸载），额度取 `phpzig.resident_limit`
-  （新增 INI，默认 0 = 不设防），**不读 `memory_limit`**：常驻内存跨请求存活，用
-  「每请求的 PHP 池剩余」去约束它会把两个口径混在一起。
-- `ResidentArena.shared()` 进程级单例（自旋锁串行化惰性创建——Zig 0.16 已移除
-  `std.Thread.Mutex`，`std.Io.Mutex` 需要事件循环实例，故不依赖标准库互斥量）；
-  `shutdown()` 幂等；独立实例用 `destroy()` 手动释放。
-- 框架的 MSHUTDOWN wrapper 改为**无条件注册**：常驻单例的生命终点是模块卸载，
-  没有这条 wrapper 它必然泄漏，与下游是否声明 mshutdown / 有无 INI 无关。
+- **PHP 8.2/8.3 上只注册第一个模块函数**。函数表原先按 Zig 侧写死的 PHP 8.4 结构布局
+  排布，与 8.2/8.3 的实际 stride 不符，引擎读到零值即判为表尾哨兵，注册在第 1 个
+  函数之后终止。现改为裸字节缓冲 + 运行时 stride，布局与写入全部交给 C glue。
+- **带参模块函数的参数内省段错误**（`ReflectionFunction('hello_concat')->getParameters()`
+  在 PHP 8.4 上 SIGSEGV）。arg_info 缓冲区的分配游标由模块函数与类方法各自持有、
+  都从 0 开始，后注册的一方覆盖前一方。现统一为容器级游标 `arginfo_cursor`，
+  两侧顺序分配、互不重叠。
+- MINIT 新增两条校验：函数表 stride 上限、`ZendModuleEntry` 与 C 侧 `sizeof` 一致；
+  不符即 panic，不再静默少注册。
 
-### 统一内存观测（两个物理隔离的账本）
+### 新增
 
-- **`memtrack` 按 scope 拆成两套原子计数**（request / resident），`shouldReject` 的
-  请求级分支只读请求级账本。隔离是硬约束：混用会产生「常驻内存越大，每个请求可用的
-  Arena 额度越小」的隐蔽失效——本地正常、上线加载完整数据后全量报 OutOfMemory。
-  Zig 单测与集成测试各有一条红线回归守住它。
-- 新增 `Memtrack.usageScope/peakScope/total`，以及裸记账原语 `trackAlloc/trackFree`
-  （供框架看不见的指针注入观测：第三方 C 库返回、`mmap` 等）。
-- `phpzig.resident_limit` 在 **MINIT** 读取（进程级语义），与请求级额度在 RINIT 读取
-  （perdir 可变 + ZTS 下 PG 每线程一份）形成对照。
-
-### 非托管入口（unsafeAllocator）
-
-- `arena.unsafeAllocator()` 返回裸 `c_allocator`：不记账、不受额度约束、bailout 无兜底。
-  与 scope **正交**——两个作用域都提供且行为一致；存在的意义是让「绕过托管」显式可检索。
-- 责任边界写进 `doc/boundary.md`：unsafe 的释放时机与 OOM 后果由下游自控；「受限额
-  保护」只有受管路径能提供。
+- C glue：`phpglue_function_entry_size`、`phpglue_set_function_entry`、
+  `phpglue_module_entry_size`。
+- Zig：`FUNCTION_ENTRY_SIZE_MAX` 上限常量与容器级 `arginfo_cursor`；
+  删除 Zig 侧 `ZendFunctionEntry` 结构定义，函数表指针改为不透明类型。
 
 ### 测试
 
-- Zig 单测 78 → **87**：scope 隔离红线、常驻限额 reject、常驻不随请求回收、`shared()`
-  幂等、unsafe 不记账不限额。
-- 功能集成 201 → **213**（§31 常驻级与统一观测 12 项）。
-- bailout 14 → **17**：新增「常驻级跨越请求存活」断言，与「请求级 MSHUTDOWN 归零」成对
-  ——只断言请求级归零会被「常驻也被误回收」这类缺陷漏过。
-- 现有 8 个 arena 单测与全部既有集成用例**一行未改**，用于证明请求级行为等价。
+- 新增注册完整性结构断言：模块函数名单（覆盖注册顺序首 / 中 / 尾）、类方法表
+  （11 个类，含 0 方法类 / 接口 / struct 反射 / extends / extern struct 绑定）。
+- 新增参数元信息双侧精确匹配（模块函数 + 类方法）、常驻额度超限拒绝、
+  裸记账 API 对称归零（含漏 `trackFree` 的反向验证）。
+- 修正 §28 一处假阳性：用户函数回调未触发时 `internal = false` 同样成立，
+  改为断言计数增长。
+- 语料矩阵纳入常驻级 / 非托管 / 裸记账入口：13 → **17** 函数 × 24 语料。
+- 规模：功能 217 → **229**，语料 312 → **408**，Zig 单测 87 不变。
+
+## [0.11.2] - 2026-09-11
+
+> z 版本发布，不破坏 API。`RequestArena` 构造与用法不变，`Arena.usage()` / `peak()`
+> 签名与语义不变。
+
+### 新增
+
+- `ResidentArena`：常驻级内存池，跨请求存活，MSHUTDOWN 回收，额度取
+  `phpzig.resident_limit`（默认 0 = 不设防，不读 `memory_limit`）。
+- `RequestArena` 与 `ResidentArena` 合并为泛型实现 `ArenaOf(scope)`，reject 判定只有一份。
+- `ResidentArena.shared()` 进程级单例、`shutdown()`（幂等）、独立实例的 `destroy()`。
+- `Memtrack.usageScope` / `peakScope` / `total`：request 与 resident 两套独立账本。
+- `Memtrack.trackAlloc` / `trackFree`：裸记账原语，供框架看不见的指针注入观测。
+- `arena.unsafeAllocator()`：非托管入口，返回裸 `c_allocator`；两个作用域均提供。
+- INI `phpzig.resident_limit`（MINIT 读取）。
+
+### 变更
+
+- `memtrack` 按 scope 拆为两套原子计数；请求级限额判定只读请求级账本，
+  常驻内存不挤占请求额度。
+- 模块 MSHUTDOWN wrapper 改为无条件注册，用于释放常驻单例。
+- `doc/boundary.md` 补充 unsafe 的责任边界：释放时机与 OOM 后果由下游自控。
+
+### 测试
+
+- Zig 单测 78 → **87**：scope 隔离、常驻限额 reject、常驻不随请求回收、`shared()` 幂等、
+  unsafe 不记账不限额。
+- 功能集成 201 → **213**（§31 常驻级与统一观测）。
+- bailout 14 → **17**：新增「常驻级跨越请求存活」断言，与「请求级 MSHUTDOWN 归零」成对。
+- 现有 8 个 arena 单测与全部既有集成用例未改动。
 
 ## [0.11.1] - 2026-09-09
 

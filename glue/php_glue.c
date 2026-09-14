@@ -37,6 +37,35 @@ uint32_t phpglue_acc_final(void)          { return ZEND_ACC_FINAL; }
 size_t  phpglue_zval_size(void)           { return sizeof(zval); }
 uint8_t phpglue_zts_mode(void)            { return USING_ZTS; }
 
+/* 结构大小随版本变化的两个查询。调用方拿它做 stride / 布局校验，
+ * 从而不必在 Zig 侧描述字段——见 php_glue.h 的函数注释。 */
+size_t  phpglue_function_entry_size(void) { return sizeof(zend_function_entry); }
+size_t  phpglue_module_entry_size(void)   { return sizeof(zend_module_entry); }
+
+/* ================================================================
+ * zend_function_entry 写入
+ * ================================================================ */
+
+/* 先整体清零，再逐字段赋值：
+ * - 8.4 才有的 frameless_function_infos / doc_comment 在旧版本不存在，
+ *   清零 + 具名赋值让同一份代码在两种布局下都正确；
+ * - fname == NULL 即表尾哨兵，无需另写一套初始化。 */
+void phpglue_set_function_entry(void *entry,
+                                const char *fname,
+                                zif_handler handler,
+                                const zend_internal_arg_info *arg_info,
+                                uint32_t num_args,
+                                uint32_t flags)
+{
+    zend_function_entry *e = (zend_function_entry *) entry;
+    memset(e, 0, sizeof(*e));
+    e->fname = fname;
+    e->handler = handler;
+    e->arg_info = arg_info;
+    e->num_args = num_args;
+    e->flags = flags;
+}
+
 /* ================================================================
  * zval 类型查询与取值
  * ================================================================ */

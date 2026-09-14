@@ -1148,15 +1148,107 @@ fn helloResidentRelease(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     phpzig.Return.returnBool(rv, true);
 }
 
+/// 设置常驻级额度（字节，0 = 不设防）。测试用：把额度压小以验证 reject。
+/// 常驻额度是进程级语义，此处临时改写仅用于测试，末尾需复位。
+fn helloResidentSetLimit(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const v = phpzig.Return.callArg(ed, 1).toLong();
+    phpzig.Arena.configureResident(@intCast(@max(0, v)));
+    phpzig.Return.returnBool(rv, true);
+}
+
+/// 连续向常驻级分配 n 次 64 字节，返回实际成功字节数。
+/// 与 hello_arena_fill 同形：限额开启时会在中途失败（不崩溃）。
+fn helloResidentFill(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    if (n <= 0 or n > RES_FILL_MAX) {
+        phpzig.Return.returnLong(rv, 0);
+        return;
+    }
+    const arena = phpzig.ResidentArena.shared() orelse {
+        phpzig.Return.returnLong(rv, 0);
+        return;
+    };
+    const a = arena.allocator();
+    var total: T.zend_long = 0;
+    var i: T.zend_long = 0;
+    while (i < n) : (i += 1) {
+        const buf = a.alloc(u8, 64) catch break; // 限额开启时会在这里失败
+        buf[0] = 1;
+        total += 64;
+    }
+    phpzig.Return.returnLong(rv, total);
+}
+
+// ＝＝ 裸记账 API（Memtrack.trackAlloc / trackFree）＝＝
+//
+// 用途：把框架看不见的指针注入统一观测——第三方 C 库返回的缓冲、mmap、
+// 以及 unsafe 分配的裸块。语义是**只动计数，不碰内存、不碰生命周期**：
+// 注销由释放方负责，漏掉会让计数永久虚高。
+//
+// 这里走的就是文档给出的组合用法（unsafeAllocator 真分配 + 手工记账）。
+// forget = true 时故意漏掉注销，用于反向验证「归零断言有判别力」——
+// 没有这一步，「记账对称归零」的断言可能只是因为它压根没记上。
+// 记账归到 .resident 账本，避免污染 §30/§31 的请求级断言。
+
+const RES_FILL_MAX: i64 = 65536; // 4MB 量级，足够越过测试用的常驻额度
+
+var g_ledger_held: ?[]u8 = null;
+
+fn helloLedgerProbe(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const len = phpzig.Return.callArg(ed, 1).toLong();
+    const forget = phpzig.Return.callArg(ed, 2).toBool();
+    if (len <= 0 or len > PROBE_ALLOC_MAX) {
+        phpzig.Return.returnLong(rv, 0);
+        return;
+    }
+    const arena = phpzig.RequestArena.init() orelse {
+        phpzig.Return.returnLong(rv, 0);
+        return;
+    };
+    defer arena.deinit();
+
+    // unsafe 分配不经账本，故需手工注入 —— 正是"裸记账配合 unsafe"的用法
+    const buf = arena.unsafeAllocator().alloc(u8, @intCast(len)) catch {
+        phpzig.Return.returnLong(rv, 0);
+        return;
+    };
+    phpzig.Memtrack.trackAlloc(.resident, buf.len);
+
+    if (forget) {
+        g_ledger_held = buf; // 内存与计数都故意留着，由 cleanup 收尾
+    } else {
+        phpzig.Memtrack.trackFree(.resident, buf.len);
+        arena.unsafeAllocator().free(buf);
+    }
+    phpzig.Return.returnLong(rv, @intCast(buf.len));
+}
+
+/// 收尾：注销并释放 forget = true 留下的那一笔（幂等）。
+fn helloLedgerCleanup(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    if (g_ledger_held) |b| {
+        phpzig.Memtrack.trackFree(.resident, b.len);
+        std.heap.c_allocator.free(b);
+        g_ledger_held = null;
+    }
+    phpzig.Return.returnBool(rv, true);
+}
+
 // ＝＝ 非托管入口（unsafeAllocator）＝＝
 //
 // 语义上等价于直接用 std.heap.c_allocator：不记账、不受限额约束、无兜底。
 // 这里故意把指针留在静态里（不释放），用来验证它对账本"零影响"。
+//
+// ⚠️ 下面的 PROBE_ALLOC_MAX 是**测试探针自设的闸门，不是框架行为**。
+// 框架对 unsafe 路径不设任何上限（这正是它的语义）。但语料矩阵会把任意类型
+// 喂进来（含 PHP_INT_MAX），探针若照单全收就等于自己打破了「任意类型不崩溃」
+// 这条契约。故测试侧自行封顶，并把这个区分写在注释里，避免被误读成框架语义。
+const PROBE_ALLOC_MAX: i64 = 16 * 1024 * 1024;
+
 var g_unsafe_held: ?[]u8 = null;
 
 fn helloUnsafeAlloc(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const n = phpzig.Return.callArg(ed, 1).toLong();
-    if (n <= 0) {
+    if (n <= 0 or n > PROBE_ALLOC_MAX) {
         phpzig.Return.returnFalse(rv);
         return;
     }
@@ -1541,6 +1633,18 @@ comptime {
             phpzig.FunctionDesc.createWithParams("hello_unsafe_alloc", helloUnsafeAlloc, &.{
                 phpzig.ParamDesc.create("n"),
             }),
+            // 注册完整性 / 额度 / 账本的回归探针
+            phpzig.FunctionDesc.createWithParams("hello_resident_set_limit", helloResidentSetLimit, &.{
+                phpzig.ParamDesc.create("limit"),
+            }),
+            phpzig.FunctionDesc.createWithParams("hello_resident_fill", helloResidentFill, &.{
+                phpzig.ParamDesc.create("n"),
+            }),
+            phpzig.FunctionDesc.createWithParams("hello_ledger_probe", helloLedgerProbe, &.{
+                phpzig.ParamDesc.create("len"),
+                phpzig.ParamDesc.create("forget"),
+            }),
+            phpzig.FunctionDesc.create("hello_ledger_cleanup", helloLedgerCleanup),
         },
         .minit = myMinit,
         .mshutdown = myMshutdown,

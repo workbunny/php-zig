@@ -71,6 +71,14 @@ function coreFuncs(): array {
         'hello_zip'        => [fn($a, $b) => hello_zip($a, $b), 2],
         'hello_object'     => [fn($a) => hello_object($a), 1],
         'Calculator::add'  => [fn($a, $b) => Calculator::add($a, $b), 2],
+        // v0.11.2 新增的常驻级 / 非托管 / 裸记账入口：参数均未加约束，
+        // 「任意类型不崩溃」这条契约对它们此前从未验证过。
+        // 三者内部都有测试侧自设的上限（见 example/tests/src/main.zig），
+        // 否则 PHP_INT_MAX 之类语料会先打破这条契约。
+        'hello_resident_put' => [fn($a, $b) => hello_resident_put($a, $b), 2],
+        'hello_resident_get' => [fn($a) => hello_resident_get($a), 1],
+        'hello_unsafe_alloc' => [fn($a) => hello_unsafe_alloc($a), 1],
+        'hello_ledger_probe' => [fn($a, $b) => hello_ledger_probe($a, $b), 2],
     ];
 }
 

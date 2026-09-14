@@ -17,17 +17,12 @@ const ObserverConfig = @import("observer.zig").Config;
 
 // ＝＝ Zend 结构体布局（extern struct，必须与 C 布局一致） ＝＝
 // 字段顺序与 PHP 头文件定义严格对应。
-// 具体字段布局随编译时 PHP 头文件版本而定，无需在此定义版本号。
-
-pub const ZendFunctionEntry = extern struct {
-    fname: [*c]const u8 = null,
-    handler: ?T.FunctionHandler = null,
-    arg_info: ?*anyopaque = null,
-    num_args: u32 = 0,
-    flags: u32 = 0,
-    frameless_function_infos: ?*anyopaque = null,
-    doc_comment: [*c]const u8 = null,
-};
+//
+// 例外：`zend_function_entry` **不在 Zig 侧描述**。它随版本变化——8.4 追加了
+// frameless_function_infos / doc_comment，从 32 字节变成 40 字节。硬编码任一
+// 版本的字段列表，都会让另一版本上的函数表 stride 错位：PHP 按自己的 stride
+// 迭代，读到零值即判定为表尾哨兵，表现为「只注册了第一个函数」。
+// 故函数表是裸字节缓冲，布局与写入全部交给 C glue（phpglue_set_function_entry）。
 
 pub const ZendModuleEntry = extern struct {
     size: c_ushort = @sizeOf(ZendModuleEntry),
@@ -37,7 +32,9 @@ pub const ZendModuleEntry = extern struct {
     ini_entry: ?*anyopaque = null,
     deps: ?*anyopaque = null,
     name: [*c]const u8 = null,
-    functions: [*c]const ZendFunctionEntry = null,
+    /// 指向 zend_function_entry 数组。布局随 PHP 版本变化，故此处在 Zig 侧
+    /// 只作不透明指针处理，不解读其内容。
+    functions: ?*anyopaque = null,
     module_startup_func: ?T.ModuleLifecycleFn = null,
     module_shutdown_func: ?T.ModuleLifecycleFn = null,
     request_startup_func: ?T.ModuleLifecycleFn = null,
@@ -62,6 +59,12 @@ pub const ZendModuleEntry = extern struct {
 // 上限 64 字节在 64 位系统上覆盖了所有已知 PHP 版本的 arg_info 结构。
 
 const ARGINFO_ENTRY_SIZE_MAX: usize = 64;
+
+// ＝＝ zend_function_entry 缓冲区常量 ＝＝
+// 与 arg_info 同一套路：编译期上限 + initModule() 运行时校验。
+// 8.2/8.3 为 32 字节，8.4/8.5 为 40 字节（追加两个字段），64 留足余量。
+// 不在此描述字段列表——见文件头「Zend 结构体布局」处的说明。
+const FUNCTION_ENTRY_SIZE_MAX: usize = 64;
 
 // ＝＝ 参数描述符 ＝＝
 
@@ -856,11 +859,27 @@ pub fn Module(comptime opts: ModuleOptions) type {
     const needs_mshutdown_wrapper = true;
 
     return struct {
-        var function_entries: [opts.functions.len + 1]ZendFunctionEntry = undefined;
-        var class_method_entries: [total_class_methods]ZendFunctionEntry = undefined;
+        /// 模块函数表：裸字节缓冲，每条按 FUNCTION_ENTRY_SIZE_MAX 预留，
+        /// 实际 stride 是运行时读到的 function_entry_size（见 initModule）。
+        /// 末尾多留一条作为表尾哨兵（fname == NULL）。
+        var function_entries_buf: [@max(1, opts.functions.len + 1) * FUNCTION_ENTRY_SIZE_MAX]u8 align(8) = undefined;
+        /// 类方法表：同上。每张类方法表末尾各有一条哨兵（total_class_methods 已计入）。
+        var class_method_entries_buf: [@max(1, total_class_methods) * FUNCTION_ENTRY_SIZE_MAX]u8 align(8) = undefined;
         var class_method_ptrs: [opts.classes.len]?*anyopaque = undefined;
         var param_entries_buf: [total_param_bytes]u8 align(8) = undefined;
         var module_entry: ZendModuleEntry = undefined;
+
+        /// `zend_function_entry` 的实际字节数。initModule() 从 C 侧读入，之后只读。
+        var function_entry_size: usize = 0;
+
+        /// arg_info 缓冲区的统一分配游标。
+        ///
+        /// 模块函数与类方法共用 param_entries_buf，游标**必须共享**：此前两侧各持
+        /// 一个从 0 开始的游标，后初始化的一方会覆盖先初始化的 arg_info。而 Zend
+        /// 只保存 arg_info 的指针不拷贝，于是模块函数的参数元信息变成别处条目的
+        /// 中段字节——`ReflectionFunction(带参模块函数)->getParameters()` 直接
+        /// SIGSEGV，且因参数名巧合相同而在常规功能测试里完全不可见。
+        var arginfo_cursor: usize = 0;
 
         /// 将方法 flags 哨兵转换为运行时 ACC 标志。
         /// __construct → ACC_PUBLIC|ACC_CTOR，__destruct → ACC_PUBLIC|ACC_DTOR
@@ -908,11 +927,11 @@ pub fn Module(comptime opts: ModuleOptions) type {
         /// 否则含类型标注走 typed；否则走无类型原版。
         /// desc 为 comptime 参数：缓冲按**该函数自身**的参数个数精确分配，
         /// 而非模块级最大值——调用者无需关心总量，也不浪费栈空间。
-        fn resolveArgInfo(comptime desc: FunctionDesc, arginfo_offset: *usize) struct { ptr: ?*anyopaque, num: u32 } {
+        fn resolveArgInfo(comptime desc: FunctionDesc) struct { ptr: ?*anyopaque, num: u32 } {
             if (desc.arg_info) |a| return .{ .ptr = a, .num = 0 };
             if (desc.params.len == 0) return .{ .ptr = c.phpglue_get_empty_arg_info(), .num = 0 };
 
-            const off = arginfo_offset.*;
+            const off = arginfo_cursor;
             const byte_off = off * ARGINFO_ENTRY_SIZE_MAX;
 
             var name_ptrs: [desc.params.len][*c]const u8 = undefined;
@@ -970,7 +989,7 @@ pub fn Module(comptime opts: ModuleOptions) type {
                 );
             }
 
-            arginfo_offset.* += desc.params.len + 2; // header + params + sentinel
+            arginfo_cursor += desc.params.len + 2; // header + params + sentinel
 
             const base: [*]align(8) u8 = @as([*]align(8) u8, @ptrCast(&param_entries_buf));
             return .{
@@ -980,46 +999,65 @@ pub fn Module(comptime opts: ModuleOptions) type {
         }
 
         fn initFunctionEntries() void {
-            var off: usize = 0;
+            const base: [*]align(8) u8 = @ptrCast(&function_entries_buf);
             // inline：使每个 desc 成为 comptime 值，resolveArgInfo 得以按
             // 该函数自身的参数个数精确分配缓冲
             inline for (opts.functions, 0..) |desc, i| {
-                const ai = resolveArgInfo(desc, &off);
+                const ai = resolveArgInfo(desc);
                 // flags 此前留空（默认 0），导致 resolveFlags 算出的
                 // ZEND_ACC_HAS_TYPE_HINTS 从未传给 PHP——arg_info 的类型信息
                 // 因此只在 Reflection 里可见，运行时不做校验与转换。
-                function_entries[i] = .{
-                    .fname = desc.name.ptr,
-                    .handler = desc.handler,
-                    .arg_info = ai.ptr,
-                    .num_args = ai.num,
-                    .flags = resolveFlags(desc),
-                };
+                c.phpglue_set_function_entry(
+                    @ptrCast(base + i * function_entry_size),
+                    desc.name.ptr,
+                    desc.handler,
+                    ai.ptr,
+                    ai.num,
+                    resolveFlags(desc),
+                );
             }
-            function_entries[opts.functions.len] = .{};
+            // 表尾哨兵：fname == NULL，Zend 迭代函数表时据此终止
+            c.phpglue_set_function_entry(
+                @ptrCast(base + opts.functions.len * function_entry_size),
+                null,
+                null,
+                null,
+                0,
+                0,
+            );
         }
 
         fn initClassMethodEntries() void {
             var off: usize = 0;
-            var ps_off: usize = 0;
+            const base: [*]align(8) u8 = @ptrCast(&class_method_entries_buf);
             inline for (opts.classes, 0..) |cls, i| {
                 inline for (cls.methods, 0..) |method, j| {
-                    const ai = resolveArgInfo(method, &ps_off);
+                    // 不传游标：与模块函数共用 arginfo_cursor，顺序分配、互不覆盖
+                    const ai = resolveArgInfo(method);
                     // 接口方法须带 abstract 标志
                     const flags = if (cls.is_interface)
                         resolveFlags(method) | c.phpglue_acc_abstract()
                     else
                         resolveFlags(method);
-                    class_method_entries[off + j] = .{
-                        .fname = method.name.ptr,
-                        .handler = method.handler,
-                        .arg_info = ai.ptr,
-                        .num_args = ai.num,
-                        .flags = flags,
-                    };
+                    c.phpglue_set_function_entry(
+                        @ptrCast(base + (off + j) * function_entry_size),
+                        method.name.ptr,
+                        method.handler,
+                        ai.ptr,
+                        ai.num,
+                        flags,
+                    );
                 }
-                class_method_entries[off + cls.methods.len] = .{};
-                class_method_ptrs[i] = @ptrCast(@alignCast(&class_method_entries[off]));
+                // 每个类的方法表各自以哨兵结尾
+                c.phpglue_set_function_entry(
+                    @ptrCast(base + (off + cls.methods.len) * function_entry_size),
+                    null,
+                    null,
+                    null,
+                    0,
+                    0,
+                );
+                class_method_ptrs[i] = @ptrCast(base + off * function_entry_size);
                 off += cls.methods.len + 1;
             }
         }
@@ -1033,13 +1071,26 @@ pub fn Module(comptime opts: ModuleOptions) type {
             if (c.phpglue_arginfo_entry_size() > ARGINFO_ENTRY_SIZE_MAX) {
                 @panic("ARGINFO_ENTRY_SIZE_MAX too small for this PHP version");
             }
+            // zend_function_entry 布局校验：函数表是按运行时 stride 迭代的裸字节
+            // 缓冲，实际大小若超出编译期上限，stride 就会错位、PHP 把零值当哨兵，
+            // 表现为「只注册了第一个函数」。这里显式失败，不静默少注册。
+            function_entry_size = c.phpglue_function_entry_size();
+            if (function_entry_size > FUNCTION_ENTRY_SIZE_MAX) {
+                @panic("FUNCTION_ENTRY_SIZE_MAX too small for this PHP version");
+            }
+            // zend_module_entry 布局校验：Zig 侧 extern struct 必须与本版本 C 一致
+            if (c.phpglue_module_entry_size() != @sizeOf(ZendModuleEntry)) {
+                @panic("ZendModuleEntry layout mismatch with this PHP version");
+            }
 
+            // 模块函数与类方法共用 arg_info 缓冲，游标统一归零后顺序分配
+            arginfo_cursor = 0;
             initFunctionEntries();
             module_entry = .{
                 .size = @sizeOf(ZendModuleEntry),
                 .name = opts.name.ptr,
                 .version = opts.version.ptr,
-                .functions = &function_entries,
+                .functions = @ptrCast(&function_entries_buf),
                 .module_startup_func = minitPtr(),
                 .module_shutdown_func = mshutdownPtr(),
                 .request_startup_func = rinitPtr(),
