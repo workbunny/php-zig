@@ -1,0 +1,92 @@
+# php-zig 测试矩阵
+#
+# 从 PHP 8.2 向后支持：8.2 / 8.3 / 8.4 / 8.5 四版本并行跑
+#   1. Zig 单元测试（不依赖 PHP 运行时）
+#   2. 构建集成测试扩展（.so）
+#   3. PHP 集成测试三件套（test_all 功能 / test_crash 崩溃隔离 / test_corpus 语料矩阵）
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.2', '8.3', '8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Zig 0.16
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: 安装 PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          coverage: none
+
+      - name: 确保 PHP 开发头文件可用
+        run: |
+          set -euo pipefail
+          if ! command -v php-config >/dev/null 2>&1 || ! php-config --include-dir >/dev/null 2>&1; then
+            PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+            sudo apt-get update -y
+            sudo apt-get install -y "php${PHP_VER}-dev"
+          fi
+
+      - name: 定位 PHP SDK 并适配路径
+        # build_php_ext.zig 期望 <prefix>/include/php/main/php_config.h 结构；
+        # apt/ondrej 的头文件多一层 <api> 目录（include/php/<api>/main/...），
+        # 故用符号链接适配成框架期望的结构，-Dphp 仍作为唯一平台决策源。
+        run: |
+          set -euo pipefail
+          PREFIX=$(php-config --prefix)
+          INC_DIR=$(php-config --include-dir)
+          if [ -f "$PREFIX/include/php/main/php_config.h" ]; then
+            # 源码编译风格：prefix 直接含 include/php/main
+            PHP_SDK="$PREFIX"
+          elif [ -f "$INC_DIR/main/php_config.h" ]; then
+            # apt/ondrej 风格：include/php/<api>/main/php_config.h
+            mkdir -p /tmp/php-sdk/include
+            ln -sfn "$INC_DIR" /tmp/php-sdk/include/php
+            PHP_SDK="/tmp/php-sdk"
+          else
+            echo "无法定位 PHP 头文件（php-config --include-dir = $INC_DIR）" >&2
+            exit 1
+          fi
+          echo "PHP_SDK=$PHP_SDK" >> "$GITHUB_ENV"
+
+      - name: Zig 单元测试
+        run: zig build test --summary all
+
+      - name: 构建集成测试扩展
+        working-directory: example/tests
+        run: zig build -Dphp="$PHP_SDK" --summary all
+
+      # 集成测试三件套：功能正确 / 崩溃隔离 / 类型语料矩阵。
+      # 崩溃与语料文件用 fork 隔离，会触发 SIGSEGV/ABRT 时以非零退出码暴露，
+      # 由 fail-fast: false 保证单版本失败不阻塞其它版本。
+      - name: PHP 集成测试（功能）
+        working-directory: example/tests
+        run: php -d extension=zig-out/lib/libext-tests.so test_all.php
+
+      - name: PHP 集成测试（崩溃隔离）
+        working-directory: example/tests
+        run: php -d extension=zig-out/lib/libext-tests.so test_crash.php
+
+      - name: PHP 集成测试（类型语料矩阵）
+        working-directory: example/tests
+        run: php -d extension=zig-out/lib/libext-tests.so test_corpus.php
+
+      # 真实 bailout（longjmp）兜底：验证 defer 被跳过后 RSHUTDOWN 仍能回收
+      - name: PHP 集成测试（bailout 兜底）
+        working-directory: example/tests
+        run: php -d extension=zig-out/lib/libext-tests.so test_bailout.php
