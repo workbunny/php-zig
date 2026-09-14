@@ -67,6 +67,13 @@ function corpus(): array {
 const PAT_NUM_CONV = '/^Object of class .+ could not be converted to (int|float)$/';
 /** cast 警告：array → string 时发出（`(string)$v` 的官方语义） */
 const PAT_ARR_TO_STR = '/^Array to string conversion$/';
+/** PHP 8.5 起新增的 cast 警告（8.2–8.4 静默）：INF/NAN → int，以及 `(string)NAN`。
+ *  语料矩阵的预期表就是这类版本差异的登记处 —— 引擎改了 cast 行为，这里会以
+ *  「意外诊断」拒绝，直到按版本登记为止（CI 8.5 首次暴露的就是这两条）。 */
+const PAT_FLOAT_TO_INT = '/^The float .+ is not representable as an int, cast occurred$/';
+const PAT_NAN_TO_STR   = '/^unexpected NAN value was coerced to string$/';
+/** 8.5 起新增警告的启用门控（单独成常量，便于本地翻转自检） */
+const CAST_WARN_SINCE_85 = PHP_VERSION_ID >= 80500;
 
 /** 被测试的核心函数（覆盖数值/字符串/数组/序列化/混合参数）。
  *
@@ -117,16 +124,30 @@ function coreFuncs(): array {
  * @return list<string> 允许的诊断正则
  */
 function expectedDiags(array|string $rule, $val): array {
+    // 非有限浮点（INF/NAN）：8.5 起数值 cast 才警告，字符串 cast 只在 NAN 上警告
+    $nonFinite = CAST_WARN_SINCE_85 && is_float($val) && !is_finite($val);
+
     if (is_string($rule)) {
-        return match ($rule) {
-            // castString：array → "Array" + E_WARNING。
-            // 对象无 __toString → 抛 Error —— 异常不是诊断，故不计入。
-            'cast-str' => is_array($val) ? [PAT_ARR_TO_STR] : [],
-            default => [],
-        };
+        if ($rule !== 'cast-str') {
+            return [];
+        }
+        // castString：array → "Array" + E_WARNING。
+        // 对象无 __toString → 抛 Error —— 异常不是诊断，故不计入。
+        $out = is_array($val) ? [PAT_ARR_TO_STR] : [];
+        if ($nonFinite && is_nan($val)) {
+            $out[] = PAT_NAN_TO_STR;
+        }
+        return $out;
     }
-    if (is_object($val) && in_array(1, $rule, true)) {
+
+    if (!in_array(1, $rule, true)) {
+        return [];
+    }
+    if (is_object($val)) {
         return [PAT_NUM_CONV];
+    }
+    if ($nonFinite) {
+        return [PAT_FLOAT_TO_INT];
     }
     return [];
 }
@@ -195,8 +216,11 @@ foreach ($funcs as $fname => [$f, $arity, $rule]) {
 // ============================================================
 echo "矩阵结果：通过 {$passed}，拒绝 {$rejected}\n";
 echo "  崩溃 {$nCrash} · 意外退出 {$nBadExit} · 意外诊断 {$nUnexpected} · 预期未命中 {$nMissed}\n";
-echo "预期诊断：{$nExpectHit}/{$expectTotal} 命中";
-echo "（数值 cast 位 × object → int/float 警告；字符串 cast 位 × array → Array to string conversion）\n";
+$ruleDesc = '数值 cast 位 × object → int/float 警告；字符串 cast 位 × array → Array to string conversion';
+if (CAST_WARN_SINCE_85) {
+    $ruleDesc .= '；8.5 新增：INF/NAN → int、以及 (string)NAN';
+}
+echo "预期诊断：{$nExpectHit}/{$expectTotal} 命中（{$ruleDesc}）\n";
 
 if ($details) {
     echo "\n拒绝明细：\n";

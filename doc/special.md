@@ -1081,6 +1081,11 @@ static zend_always_inline bool zend_internal_call_should_throw(...)
 
 `phpglue_zval_get_long/double` 改用引擎 cast 转换 `zval_get_long()`/`zval_get_double()`：IS_LONG/IS_DOUBLE 快路径直读零开销，其他类型按 PHP 语义转换（`"1"`→1、`null`→0、`[]`→0），**永不返回垃圾指针**。
 
+**版本差异**：PHP 8.5 起，这条 cast 路径对 `INF`/`NAN` → int 会额外发出
+「The float INF is not representable as an int, cast occurred」，`(string)NAN` 发
+「unexpected NAN value was coerced to string」；8.2–8.4 静默。`test_corpus.php`
+按 `PHP_VERSION_ID` 门控声明这两条 —— 语料矩阵的预期表即版本差异的登记处。
+
 这符合「拿到什么按什么处理」原则：**可转换类型**上与 PHP 内置函数的 `zend_parse_parameters` 一致（`"1"`→1、`1.9`→1、`null`→0、`[]`→0）。
 
 ### 不可转换类型：与 ZPP 不是同一个东西
