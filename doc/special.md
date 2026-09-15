@@ -1163,8 +1163,8 @@ PhpType.string.unionWith(PhpType.long).nullable()   // string|int|null
 
 ### 原生内部函数：拦截发生在 handler 里
 
-以为声明 `int $a` 后传 `"123"` 会抛 TypeError——实测不会。原生内部函数的拦截来自
-handler 内部的 `zend_parse_parameters`（ZPP），**不是** arg_info：
+声明 `int $a` 后传 `"123"` **不**会被拒绝。原生内部函数的拦截来自 handler 内部的
+`zend_parse_parameters`（ZPP），**不是** arg_info：
 
 1. `declare(strict_types=1)` 对原生内部函数**生效**，由**调用方文件**决定。
 2. 但可隐式转换的（`"123"`→int、`1.9`→int、`true`→int）**永不报错**，静默转换。
@@ -1181,8 +1181,8 @@ handler 内部的 `zend_parse_parameters`（ZPP），**不是** arg_info：
 - **handler 侧**：php-zig 的 handler 不走 ZPP——这正是它防 UB 的方式（走cast 语义，
   见上一节）。
 
-实测（PHP 8.2.28 / 8.4.19 双确认，`declare(strict_types=1)` 写在**调用方**文件里，
-且这些函数的 arg_info 在 Reflection 中确实可见）：
+PHP 8.2.28 / 8.4.19 一致（`declare(strict_types=1)` 写在**调用方**文件；且这些函数的
+arg_info 在 Reflection 中可见）：
 
 | 调用 | php-zig | 原生 |
 |---|---|---|

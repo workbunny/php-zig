@@ -32,14 +32,16 @@ if [ "$SKIP_BUILD" = "1" ]; then
     echo "[1/2] 跳过编译（SKIP_BUILD=1），沿用既有产物"
 else
 echo "[1/2] 编译 php-zig 扩展（bench_zig，ReleaseFast）..."
-if ! BUILD_LOG=$(cd php_zig && "$ZIG" build -Dphp="$PHP_SDK" -Doptimize=ReleaseFast --cache-dir=/tmp/zig-cache --summary all 2>&1); then
+# 提示：--cache-dir 必须用空格分隔（Zig 0.16 只接受该形式）；--cache-dir=<path> 会被
+# 转发给 build runner 并报 unrecognized argument，外层 zig build 不解析它。
+if ! BUILD_LOG=$(cd php_zig && "$ZIG" build -Dphp="$PHP_SDK" -Doptimize=ReleaseFast --cache-dir /tmp/zig-cache --summary all 2>&1); then
     echo "$BUILD_LOG"
     if echo "$BUILD_LOG" | grep -qi "fingerprint"; then
         NEW_FP=$(echo "$BUILD_LOG" | grep -oE '0x[0-9a-fA-F]{16}' | tail -1)
         if [ -n "$NEW_FP" ]; then
             echo ">>> 首次构建：自动更新 fingerprint -> $NEW_FP"
             sed -i "s/\.fingerprint = 0x0,/.fingerprint = $NEW_FP,/" php_zig/build.zig.zon
-            (cd php_zig && "$ZIG" build -Dphp="$PHP_SDK" -Doptimize=ReleaseFast --cache-dir=/tmp/zig-cache --summary all)
+            (cd php_zig && "$ZIG" build -Dphp="$PHP_SDK" -Doptimize=ReleaseFast --cache-dir /tmp/zig-cache --summary all)
         else
             echo ">>> 无法自动确定 fingerprint，请按上方提示手动更新 php_zig/build.zig.zon" >&2
             exit 1

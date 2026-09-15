@@ -6,18 +6,13 @@
  *   test_crash.php  手动选择的危险边界（循环引用、魔术方法、畸形序列化）
  *   test_corpus.php 自动枚举的笛卡尔积（N 个代表值 × M 个核心函数）
  *
- * 判据两条（缺一不可）：
+ * 【判据】
  *   1. 不崩溃 —— fork 隔离下崩溃即信号
- *   2. 诊断在预期范围内 —— 见下
+ *   2. 诊断在预期范围内 —— 按坐标（函数 × 语料）预先声明，双向核对
  *
- * 【诊断为什么要分类】
- * 语料测试故意把 object 喂给走 cast 语义（toLong()/toDouble()）的函数，PHP 引擎
- * 必然发出「could not be converted to int」。这类诊断是**输入决定的**：给定
- * 「函数 × 语料」就能推导出它必然出现，所以它属于预期，不是缺陷 —— 正常范围内
- * 操作不会产生任何诊断，出现了就说明越界探针命中。
- * 但「预期」必须是可核对的，否则第 22 条意外诊断会淹没在这堆噪声里。故本文件：
- *   - 按坐标（函数 × 语料）预先声明预期诊断，双向核对（该有的必须有、不该有的不能有）
- *   - 诊断经 isolation.php 的回传通道收集，不再依赖 stderr
+ * 提示：预期诊断是**输入决定的**（object → int/float 警告、array → string 警告），
+ *       属正常产物而非缺陷；声明之外的任何一条、以及致命错误退出都判拒绝。
+ *       诊断经 isolation.php 的回传通道收集，不依赖 stderr。
  *
  * 返回值正确性由 test_all.php 覆盖，这里只验证边界行为。
  */
@@ -68,8 +63,8 @@ const PAT_NUM_CONV = '/^Object of class .+ could not be converted to (int|float)
 /** cast 警告：array → string 时发出（`(string)$v` 的官方语义） */
 const PAT_ARR_TO_STR = '/^Array to string conversion$/';
 /** PHP 8.5 起新增的 cast 警告（8.2–8.4 静默）：INF/NAN → int，以及 `(string)NAN`。
- *  语料矩阵的预期表就是这类版本差异的登记处 —— 引擎改了 cast 行为，这里会以
- *  「意外诊断」拒绝，直到按版本登记为止（CI 8.5 首次暴露的就是这两条）。 */
+ *  提示：本表即版本差异的登记处 —— 引擎改了 cast 行为而未在此登记时，会以
+ *       「意外诊断」判拒绝。 */
 const PAT_FLOAT_TO_INT = '/^The float .+ is not representable as an int, cast occurred$/';
 const PAT_NAN_TO_STR   = '/^unexpected NAN value was coerced to string$/';
 /** 8.5 起新增警告的启用门控（单独成常量，便于本地翻转自检） */
@@ -103,10 +98,9 @@ function coreFuncs(): array {
         'hello_zip'        => [fn($a, $b) => hello_zip($a, $b), 2, []],
         'hello_object'     => [fn($a) => hello_object($a), 1, []],
         'Calculator::add'  => [fn($a, $b) => Calculator::add($a, $b), 2, [1]],
-        // v0.11.2 新增的常驻级 / 非托管 / 裸记账入口：参数均未加约束，
-        // 「任意类型不崩溃」这条契约对它们此前从未验证过。
-        // 三者内部都有测试侧自设的上限（见 example/tests/src/main.zig），
-        // 否则 PHP_INT_MAX 之类语料会先打破这条契约。
+        // v0.11.2 的常驻级 / 非托管 / 裸记账入口：参数未加约束。
+        // 提示：三者内部有测试侧自设的上限（见 example/tests/src/main.zig），
+        //       否则 PHP_INT_MAX 之类语料会先打破「不崩溃」这条契约。
         'hello_resident_put' => [fn($a, $b) => hello_resident_put($a, $b), 2, [1]],
         'hello_resident_get' => [fn($a) => hello_resident_get($a), 1, [1]],
         'hello_unsafe_alloc' => [fn($a) => hello_unsafe_alloc($a), 1, [1]],

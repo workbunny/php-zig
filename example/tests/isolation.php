@@ -2,26 +2,21 @@
 /**
  * fork 隔离 + 诊断分类 —— crash / corpus / bailout 三个隔离型测试共用
  *
- * 【为什么要显式回传通道】
- * PHP 的诊断走两条互不相干的通道：
- *   display_errors → 输出缓冲，子进程的 ob_start() 能拦住
- *   log_errors     → SAPI 日志；CLI 下写 fd 2 stderr，ob_start() **拦不住**
- * 只关 display 时警告仍会漏进父进程日志。实测（PHP 8.4.19 / CLI）：
- *   php -d display_errors=0 -d log_errors=1 test_corpus.php   → 漏 21 条
- *   php -d log_errors=0                     test_corpus.php   → 漏 0 条
- * 泄漏通道是 log_errors，与 display_errors 无关 —— test_bailout 早就
- * ini_set('display_errors','0')，因为关错了通道所以没用。
+ * 【诊断的两条通道】
+ *   display_errors → 输出缓冲（子进程 ob_start() 可拦）
+ *   log_errors     → SAPI 日志；CLI 下写 fd 2，ob_start() **拦不住**
+ * 提示：子进程两条都关（只关 display 会把诊断漏进父进程日志）；诊断一律经本文件的
+ *       回传通道收集 —— 入账之后 stderr 上不该再出现任何输出。
  *
- * 【本文件做什么】
- * 把诊断从「副作用」变成「数据」：子进程内关掉两条通道，用
- * set_error_handler（非致命）+ register_shutdown_function（致命）捕获，
- * 经 socketpair 回到父进程，由调用方按坐标分类。
- * 副产品：stderr 变成真正的报警器 —— 诊断全部入账后它上面不该再有任何输出。
+ * 【能力】
+ * 诊断由「副作用」变为「数据」：set_error_handler（非致命）+
+ * register_shutdown_function（致命）捕获 → socketpair 回传 → 调用方按坐标分类。
+ * 退出码与信号一并回传，故「致命错误退出」与「正常返回」可区分。
  *
- * 【边界】
- * 回传走 socket，容量有限：单条消息截断到 ISOLATE_MSG_MAX、条数上限
- * ISOLATE_DIAG_MAX。父进程在 waitpid 之后才读，子进程若写满缓冲区会阻塞在
- * 写操作上、waitpid 永不返回 —— 所以这两个上限是死锁护栏，不是审美选择。
+ * 【上限】
+ * 回传走 socket：单条消息截断到 ISOLATE_MSG_MAX、条数上限 ISOLATE_DIAG_MAX。
+ * 提示：父进程在 waitpid 之后才读，写满缓冲区会让子进程阻塞在写操作上、
+ *       waitpid 永不返回 —— 两个上限是死锁护栏。
  */
 
 /** 单条诊断消息截断长度（字节） */
@@ -132,10 +127,10 @@ function isolateChildMain(callable $fn, $sock): void
     };
 
     set_error_handler(function (int $type, string $msg) use (&$diags, &$dropped): bool {
-        // E_USER_ERROR 必须放行（返回 false）：用户错误处理器返回 true 会**取消**它的
-        // 致命语义，trigger_error(E_USER_ERROR) 就退化成普通提示、bailout 不再发生
-        // —— 实测过，吞掉它会让 test_bailout 的 C 组变成 exit=0、defer 照跑。
-        // 放行不会造成泄漏：两条输出通道已在上方关闭，消息由 shutdown 处理器取回。
+        // E_USER_ERROR 必须放行（返回 false）。
+        // 提示：处理器返回 true 会**取消**它的致命语义 —— trigger_error(E_USER_ERROR)
+        //       退化成普通提示、bailout 不再发生（C 组会变成 exit=0 且 defer 照跑）。
+        // 放行不产生泄漏：两条输出通道已在上方关闭，消息由 shutdown 处理器取回。
         if ($type === E_USER_ERROR) {
             return false;
         }

@@ -18,10 +18,10 @@
  *                         与上一条构成对照：请求级已被 RSHUTDOWN 回收，常驻级
  *                         跨越请求继续存活 —— 这就是「常驻」的定义。
  *
- * 诊断也是断言对象：B/C 两组各自触发一条 Fatal error，它就是「bailout 确实发生」
- * 的证据，故按组声明为预期（恰好 1 条，且消息匹配探针），A 组则应为零诊断。
- * 收集与分类见 isolation.php —— 此前靠 ini_set('display_errors','0') 抑制，
- * 但致命错误经 log_errors 走 fd 2，压不住，于是漏进了 CI 日志。
+ * 诊断也是断言对象：B/C 两组各触发一条 Fatal error（「bailout 确实发生」的证据），
+ * 按组声明为预期（恰好 1 条且消息匹配探针），A 组为零诊断。
+ * 提示：致命错误经 log_errors 走 fd 2，ini_set('display_errors','0') 压不住 ——
+ *       收集与分类见 isolation.php。
  *
  * 用法：php -d extension=... test_bailout.php
  */
@@ -111,8 +111,8 @@ function assertBailoutRecovered(string $label, array $res, array $kv): void
         count($fatal) === 1 && preg_match(PAT_PROBE_FATAL, $fatal[0]['msg']) === 1,
         'fatal=' . count($fatal) . ($fatal !== [] ? ' [' . diagText($fatal[0]) . ']' : '')
     );
-    // C 组用 trigger_error(E_USER_ERROR) 触发 bailout，而 PHP 8.4 起该用法本身被弃用，
-    // 于是 8.4+ 会多一条 Deprecated。它由测试自己选择的触发方式决定，属预期；
+    // C 组用 trigger_error(E_USER_ERROR) 触发 bailout；PHP 8.4 起该用法本身被弃用，
+    // 8.4+ 因此多一条 Deprecated（属预期，由测试选择的触发方式决定）；
     // 其余任何非致命诊断都是意外。
     $unexpectedOther = unexpectedDiags($other, [PAT_TRIGGER_ERROR_DEPRECATED]);
     check(

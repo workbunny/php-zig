@@ -102,7 +102,7 @@ size_t      phpglue_zval_get_string_len(zval *zv)    {
 zend_array *phpglue_zval_get_array(zval *zv)         { return Z_ARRVAL_P(zv); }
 /* `(string)$v` cast 语义。走 zval_try_get_string 而非 zval_get_string：
  * 后者对「无 __toString 的对象」会抛 Error 但**仍返回一个空串**，两者无法区分；
- * try 版明确返回 NULL，于是「转换失败」变成可判定的返回值（Zig 侧 `orelse return`）。
+ * try 版对失败返回 NULL → 「转换失败」是可判定的返回值（Zig 侧 `orelse return`）。
  *
  * 注意 zval_try_get_string 对 IS_STRING 也是**新引用**（zend_string_copy），
  * 因此返回值在所有分支上所有权一致：调用方一律负责释放。 */

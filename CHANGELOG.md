@@ -29,14 +29,17 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
 ### 测试
 
 - 新增 `example/tests/isolation.php`：三个隔离型测试共用。子进程内关闭 `log_errors` 与
-  `display_errors`（`log_errors` 是唯一能穿透 `ob_start` 的通道，此前警告正是从 fd 2
-  漏进 CI 日志），诊断经 socketpair 回传后按坐标分类：该有的必须有、不该有的不能有。
-- 诊断按坐标预先声明：数值 cast 位 × object = **21** 条、字符串 cast 位 × array = **4** 条（引擎的
-  int/float 转换与 Array to string conversion 警告），bailout B/C 组各 1 条探针 Fatal error
-  （本组断言对象）；其余诊断、致命退出、预期未命中一律拒绝。四套测试的 `stderr` 恢复为空。
+  `display_errors`（`log_errors` 是唯一能穿透 `ob_start` 的通道），诊断经 socketpair
+  回传后按坐标分类：该有的必须有、不该有的不能有。
+- 诊断按坐标预先声明：数值 cast 位 × object = **21** 条、字符串 cast 位 × array = **4** 条
+  （引擎的 int/float 转换与 Array to string conversion 警告），bailout B/C 组各 1 条探针
+  Fatal error（本组断言对象）；其余诊断、致命退出、预期未命中一律拒绝。四套 `stderr` 为空。
 - 新增 `hello_cast_string` 与 10 个崩溃用例；诊断白名单按用例声明（`$allowDiags`）。
 - 语料预期表按 `PHP_VERSION_ID` 门控版本差异：8.5 起 `INF`/`NAN` → int 与 `(string)NAN`
-  各多 1 条引擎警告（CI 8.5 实测），8.2–8.4 静默；未登记的新行为会以「意外诊断」拒绝。
+  各多 1 条引擎警告，8.2–8.4 静默；未登记的新行为以「意外诊断」拒绝。
+- 新增 `benchmark/report.sh` 与 `.github/workflows/benchmark.yml`：手动 / 每周产出性能报告
+  （job summary + artifact，保留 90 天），复用 `run.sh`，发布前先过 `smoke.php` 三方语义校验，
+  只在 zig/C 比值 >3x 时失败；报告口径与本地一致（比值优先，绝对值跨 run 不可比）。
 - 判别力验证：抹掉一处 cast 位声明 / 虚报一处 / 抹掉 `cast-str` 规则，分别精确报出
   3 条意外 + 3 条未命中、4 条意外诊断。
 - 规模：功能 229 → **239**，语料 408 → **432**（17 → 18 函数），崩溃隔离 59 → **69**，
@@ -48,7 +51,7 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
   对照表、三条理由（缺上下文 / 内部实现细节会随版本漂移 / cast 语义精确可得）、代价，
   以及「要严格就声明 + handler 内显式校验」。
 - `special.md` / `api.md`：arg_info 在 Release 不校验、`strict_types` 对 php-zig 函数
-  不生效（8.2 / 8.4 双版本实测）；说明这是**有意**选择，不是待修的缺陷。
+  不生效（8.2 与 8.4 一致）；并写明这是**有意**选择，不是待修的缺陷。
 
 ## [0.11.3] - 2026-09-14
 

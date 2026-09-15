@@ -1,0 +1,126 @@
+# php-zig 性能基准报告
+#
+# 触发：手动（workflow_dispatch）+ 每周一定时。
+# 提示：push / PR 默认不跑 —— 共享 runner 的绝对值跨 run 不可比，且一次完整测量是分钟级；
+#       需要按变更触发时，打开下面注释掉的 push / pull_request 段（已带路径过滤）。
+#
+# 产物：该次运行的 job summary（markdown）+ artifact（TSV 与 md，保留 90 天）。
+# 报告由 benchmark/report.sh 生成，与本地 `bash report.sh results.tsv memory.tsv` 同口径。
+name: benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: 'bench.php 迭代次数（文档复现参数 300000）'
+        required: false
+        default: '100000'
+      rounds:
+        description: '取中位数的轮数（文档复现参数 5）'
+        required: false
+        default: '3'
+      mem_iters:
+        description: 'memory.php 用例重复次数（文档复现参数 200）'
+        required: false
+        default: '100'
+  schedule:
+    - cron: '0 3 * * 1'   # 每周一 03:00 UTC
+  # push:
+  #   branches: [master]
+  #   paths: ['benchmark/**', 'src/**', 'glue/**', 'build_php_ext.zig', '.github/workflows/benchmark.yml']
+  # pull_request:
+  #   paths: ['benchmark/**', 'src/**', 'glue/**']
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: 性能报告
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # schedule 触发时 inputs 为空 → 常量兜底；CI 参数比文档复现参数小一档
+      ITERS: ${{ github.event.inputs.iters || '100000' }}
+      ROUNDS: ${{ github.event.inputs.rounds || '3' }}
+      MEM_ITERS: ${{ github.event.inputs.mem_iters || '100' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Zig 0.16
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: 安装 PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'   # 与 README 的测量环境一致
+          coverage: none
+
+      - name: 确保 PHP 开发头文件可用
+        run: |
+          set -euo pipefail
+          if ! command -v php-config >/dev/null 2>&1 || ! php-config --include-dir >/dev/null 2>&1; then
+            PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+            sudo apt-get update -y
+            sudo apt-get install -y "php${PHP_VER}-dev"
+          fi
+
+      - name: 定位 PHP SDK 并适配路径
+        # 提示：build_php_ext.zig 期望 <prefix>/include/php/main/php_config.h；
+        # apt/ondrej 布局多一层 <api> 目录，用符号链接适配（同 test.yml）。
+        run: |
+          set -euo pipefail
+          PREFIX=$(php-config --prefix)
+          INC_DIR=$(php-config --include-dir)
+          if [ -f "$PREFIX/include/php/main/php_config.h" ]; then
+            PHP_SDK="$PREFIX"
+          elif [ -f "$INC_DIR/main/php_config.h" ]; then
+            mkdir -p /tmp/php-sdk/include
+            ln -sfn "$INC_DIR" /tmp/php-sdk/include/php
+            PHP_SDK="/tmp/php-sdk"
+          else
+            echo "无法定位 PHP 头文件（php-config --include-dir = $INC_DIR）" >&2
+            exit 1
+          fi
+          echo "PHP_SDK=$PHP_SDK" >> "$GITHUB_ENV"
+
+      - name: 编译并测量（zig ReleaseFast / gcc -O2 / 纯 PHP）
+        working-directory: benchmark
+        run: bash run.sh "$ITERS" "$ROUNDS" "$MEM_ITERS"
+
+      - name: 语义一致性校验
+        # 提示：数字以「三方同语义」为前提；函数缺失 / 扩展未加载 / 返回值分歧在此拦下
+        working-directory: benchmark
+        run: |
+          php -d extension=php_zig/zig-out/lib/libbench_zig.so smoke.php bench_zig
+          php -d extension=c_ext/bench_c.so smoke.php bench_c
+          php smoke.php pure_php
+
+      - name: 生成报告 → job summary
+        working-directory: benchmark
+        run: |
+          set -uo pipefail
+          # 守卫失败也要产出报告：先发 job summary，再以守卫结果退出
+          GUARD=0
+          BENCH_COMMIT="$(git rev-parse --short HEAD)" \
+          BENCH_PHP="$(php -r 'echo PHP_VERSION, " (", (PHP_ZTS ? "ZTS" : "NTS"), ")";')" \
+          BENCH_ZIG="$(zig version)" \
+          BENCH_CPU="$(awk -F: '/model name/{ sub(/^ +/, "", $2); print $2; exit }' /proc/cpuinfo)" \
+          BENCH_PARAMS="iters=$ITERS × rounds=$ROUNDS，mem_iters=$MEM_ITERS" \
+          MAX_RATIO=3 \
+          bash report.sh results.tsv memory.tsv report.md || GUARD=$?
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          exit $GUARD
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            benchmark/results.tsv
+            benchmark/memory.tsv
+            benchmark/report.md
+          retention-days: 90

@@ -46,6 +46,26 @@ php -d extension=c_ext/bench_c.so                     smoke.php bench_c
 php                                                   smoke.php pure_php
 ```
 
+### CI 报告
+
+`.github/workflows/benchmark.yml`（手动触发 + 每周一 03:00 UTC）跑同一套 `run.sh`，
+由 `report.sh` 汇总成一份 markdown，发布到该次运行的 **job summary**，并存为 artifact
+（`results.tsv` / `memory.tsv` / `report.md`，保留 90 天）。
+
+本地看同一份报告：
+
+```bash
+bash report.sh results.tsv memory.tsv     # 打印到 stdout
+MAX_RATIO=3 bash report.sh ...            # 带粗粒度守卫（超阈值退出 1）
+```
+
+| 口径 | 内容 |
+|---|---|
+| 参数 | CI 默认 10 万次 × 3 轮 / 内存 100；文档复现参数为 30 万 × 5 / 200 |
+| 可比性 | CI 报告的**绝对值**不与「性能结论」对比；可比的是同一次运行内的 **zig/C 比值** |
+| 门禁 | 仅当 zig/C 比值超 **3x** 才失败（构建配置事故量级）；正常波动与已知短板不触发 |
+| 前置 | `smoke.php` 三方语义校验；不一致即失败 |
+
 ## 用例
 
 ### 微观开销
@@ -131,7 +151,6 @@ PHP 8.4.19 (NTS) / Linux / 30 万次迭代 × 5 轮取中位数（zig 侧经 7 �
    换成混合类型的 `mixed` 反而 0.89x。
 
 > 注：单用例跨轮波动可达 ±0.1x（容器调度抖动），结论看整体分布而非单值。
-> 最近的 v0.10.2 改动（取值 cast 语义、flags 传递）经实测**零性能影响**——
 > cast 语义对 IS_LONG 快路径是 inline 直读，benchmark 参数均为 mixed 不触发
 > HAS_TYPE_HINTS 运行时检查。
 
@@ -201,8 +220,21 @@ phpzig.Arena.peak();    // 进程内峰值
 
 ## 已知限制
 
-- 结果受 CPU/负载波动影响，跨机器对比绝对值无意义；只保证同机同轮相对比值可复现。
-- `php_zig/build.zig.zon` 的 `fingerprint` 为占位值，首次 `zig build` 若报
-  `invalid fingerprint`，`run.sh` 会自动修复。
+- 结果受 CPU / 负载 / 内存布局影响，跨机器对比绝对值无意义。同机重复精度（PHP 8.4，
+  30 万 × 5，两次连测）：
+
+  | 口径 | 极差 | 中位 |
+  |---|---:|---:|
+  | zig/C 比值 | **0.15x**（`empty` 1.04x → 1.19x；`object` 0.83x → 0.70x） | 0.05x |
+  | 绝对值 | **±20%**（`empty`；<100 ns 的用例最大）| 2.4% |
+
+  C 侧**同一份未改动代码**同样漂移（`empty` 30.66 → 25.86 ns）——漂移来自环境，非实现差异。
+
+  > **提示**：小于上表的差异不归因于代码改动；判定某次改动需同机连跑多次取中位，
+  > 或只比较同一次运行内的比值。
+
+- `php_zig/build.zig.zon` 的 `fingerprint` 是 `paths`（`build.zig` / `build.zig.zon` / `src`）
+  内容的哈希：改动 `benchmark/php_zig/**` 之后必然失配，首次 `zig build` 会报
+  `invalid fingerprint`，`run.sh` 会自动修复（顺带改写该文件，无需手工处理）。
 - `method`/`closure` 的 C 侧与 php-zig 侧实现策略不同（键生成、闭包构造路径），
   绝对值受实现细节影响，看相对纯 PHP 的加速更有意义。
