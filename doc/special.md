@@ -1229,3 +1229,145 @@ pub const {name}Untyped = true;           // 故意不加约束（无参函数�
 `overrides`（ArgTypes）的校验都是**显式编译错误**而非静默：
 - 字段必须在 `Args` 中存在（防拼写错误）
 - 只能覆盖 `*T.Zval`（mixed）字段——反射已推出类型的字段不允许覆盖，冲突说明意图不清
+
+## `ZEND_CALL_NUM_ARGS_MASK` 不存在：实参个数必须用宏取
+
+### 问题
+
+用位运算从 `call_info` 取实参个数，在 PHP 8.x 上取不到正确值。
+
+### 根因
+
+`num_args` 在 PHP 7 编码于 `call_info` 低 16 位，8.x 改到 `This.u2.num_args`；`ZEND_CALL_NUM_ARGS_MASK` 这个宏并不存在，照着 PHP 7 的位布局写必然取错。
+
+### 解决方案
+
+一律用 `ZEND_CALL_NUM_ARGS()` 宏（C glue 暴露），不对 `call_info` 做位运算。
+
+## Linux/macOS 上 ZTS 检测恒为 false
+
+### 问题
+
+`detectZts` 在 Linux/macOS 上一律返回 false，ZTS 构建被误判为 NTS。
+
+### 根因
+
+`zts` 原先硬编码 false，且 `ZTS` 宏只在 Windows 定义——Linux/macOS 上根本拿不到可判定的符号。
+
+### 解决方案
+
+从 `php_config.h` 读 `#define ZTS 1`。注意 NTS 的头文件里是 `/* #undef ZTS */`，**含子串匹配必须带 `#define` 前缀**，否则 NTS 会被误判成 ZTS；`ZTS` 宏的读取提到平台分支之外。
+
+## C 侧 benchmark 扩展从未编译通过
+
+### 问题
+
+`benchmark/c_ext` 始终编译失败，基准的 C 对照组一直缺位。
+
+### 根因
+
+`ZEND_GET_MODULE(bench_c)` 展开为 `bench_c_module_entry`，而实际定义的模块入口名是 `bench_module_entry`，两者不一致。
+
+### 解决方案
+
+模块入口名与宏参数对齐；另补 `zend_exceptions.h`（用到异常 API 却未包含）。
+
+## 关联数组键名错乱：`strlen(key)` 与未终止切片
+
+### 问题
+
+用 Zig 侧 `[]const u8` 作键写关联数组，键名出现截断或错乱。
+
+### 根因
+
+`add_assoc_long` 等内部走 `strlen(key)`，而 Zig 的 `[]const u8` **不保证 NUL 结尾**（`std.fmt.bufPrint` 的返回值即如此）。`strlen` 会越过切片尾部继续读，键长与键内容都不可控。
+
+### 解决方案
+
+全部改用带 `key_len` 的 `_ex` 版本（`add_assoc_long_ex` 等），由 Zig 侧显式传 `key.len`。
+
+## `PhpFunc.call*Str` 泄漏临时字符串 zval
+
+### 问题
+
+反复调用 `call1Str` / `call2Str` 会持续增长内存，每次调用泄漏一个字符串 zval。
+
+### 根因
+
+为传参构造的临时字符串 zval 从未 `ptr_dtor`；调用方拿不到该 zval 的引用，无法代为释放。
+
+### 解决方案
+
+函数内 `defer phpglue_zval_ptr_dtor`。传 long 参数的版本不分配内存，无需释放。
+
+该缺陷由「内存增长探针」抓出（见下文探针小节），是探针这套防线存在的直接原因。
+
+## `Array.pop/shift` 返回栈地址（use-after-scope）
+
+### 问题
+
+`pop()` / `shift()` 返回 `?Zval`，读其数值时「看起来能用」，实际拿到的是已失效的栈地址。
+
+### 根因
+
+把内部栈上临时 zval 的地址包成 `?Zval` 返回，函数一返回该内存即失效；因栈帧未被覆盖，读数值往往仍能读到正确值，缺陷被掩盖。属 `Array.init()` 那类栈指针问题的同类复发。
+
+### 解决方案
+
+统一改为输出参数形态 `pop(*T.Zval) bool` / `shift(*T.Zval) bool`，由调用方提供存放位置。
+
+## 字符串返回路径多一次分配 + 拷贝
+
+### 问题
+
+返回字符串时多一次分配与 memcpy，`concat` 基准用例耗时 72.57 ns（对原生 C 1.94x）。
+
+### 根因
+
+`returnString` 走 `RETVAL_STRING`，即 `zend_string_init`——把已有的内容再分配一块内存并 memcpy 一遍。
+
+### 解决方案
+
+新增 `phpglue_string_alloc` / `phpglue_string_buffer` / `phpglue_return_string_ptr`，用 `ZVAL_STR` 把既有 `zend_string` 零拷贝移交给返回值。`concat` 用例 72.57 → 41.13 ns（1.94x → 1.11x）。
+
+## 泄漏类缺陷：既有测试体系测不出，须建增长探针
+
+### 问题
+
+内存泄漏（如前述 `call*Str` 泄漏临时 zval）在既有测试体系下**完全测不出**：单元测试不依赖 PHP 运行时；集成测试每用例只调一两次，泄漏几十字节淹没在请求池里，断言全绿。
+
+### 根因
+
+既有断言都是「值是否正确」与「是否崩溃」，没有一条断言「反复调用后内存是否收敛」。
+
+### 解决方案
+
+新增通用防线「内存增长探针」：把目标 API 循环调用数万次（`hello_mem_*` 系列），断言增量小于 64KB 预算（覆盖临时变量的正常抖动，但远小于「每次泄漏一个字符串」的量级），并配反向验证控制组保证探针本身有效。实现见 `example/tests/test_all.php` §29 与 `example/tests/src/main.zig` 的探针区。
+
+## PHP 8.2/8.3 上只注册第一个模块函数
+
+### 问题
+
+在 PHP 8.2/8.3 上模块只注册了函数表的第 1 个函数，其余静默丢失；8.4 正常。
+
+### 根因
+
+函数表原先按 Zig 侧写死的 **PHP 8.4 结构布局**（7 字段 / 40 字节）排布，而 8.2/8.3 是 5 字段（32 字节）。PHP 按自己的 stride 迭代 Zig 布局的表，读第 2 条时落在第 1 条尾部的 `doc_comment`（零值）→ 判为表尾哨兵，注册终止。
+
+### 解决方案
+
+函数表改为**裸字节缓冲 + 运行时 stride**，布局与字段写入全部交给 C glue（先清零再逐字段赋值，新版本独有字段与哨兵都由零值满足）。同时加 `FUNCTION_ENTRY_SIZE_MAX` 上限校验、`ZendModuleEntry` 与 C 侧 `sizeof` 一致性校验，不符即 MINIT panic——不再静默少注册。
+
+## 带参模块函数的参数内省段错误
+
+### 问题
+
+`ReflectionFunction('hello_concat')->getParameters()` 在 PHP 8.4 上 SIGSEGV。
+
+### 根因
+
+模块函数与类方法共用 `param_entries_buf`，但两侧各自持有分配游标且都从 0 开始，后初始化的一方覆盖先初始化者的 arg_info；Zend 只保存 arg_info 指针不拷贝，模块函数的参数元信息变成了别处条目的中段字节。
+
+### 解决方案
+
+游标提升为**容器级** `arginfo_cursor`，模块函数与类方法顺序分配、永不重叠，不再依赖「先函数后类」的初始化顺序。测试侧补参数元信息双侧精确匹配断言。

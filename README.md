@@ -152,6 +152,82 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
 - **请求级**：handler 内按内存归属分组——arena/cleanup 属 Zig 侧（RSHUTDOWN 兜底），Array/Zval 属 PHP emalloc 池（无需回收）；Observer 为旁路（不拦截）。普通 Throw 仅设置 `EG(exception)`、不 longjmp，defer 照常执行；真正跳过 defer 的是 bailout（OOM/超时/fatal/`exit`），此时由 arena/cleanup 在 RSHUTDOWN 兜底，故临时内存用 arena、系统资源用 cleanup，勿裸用 `c_allocator` 依赖 defer。
 - **对象级**：extern struct 绑定随对象创建/销毁，可跨请求存活。
 
+### 仓库结构
+
+```
+php-zig/
+├── build.zig               # 框架自身构建 / 模块导出 / 转发 build_php_ext
+├── build.zig.zon           # Zig 包清单（min zig 0.16.0，无外部依赖）
+├── build_php_ext.zig       # 构建辅助：addPhpExtension（-Dphp 平台识别 + ZTS 检测 + 透传）
+├── README.md               # 本文件：能力矩阵、架构、起步
+├── CHANGELOG.md            # 版本变更记录（0.11.0 起逐版本 + 0.1~0.10 能力归档）
+├── glue/
+│   ├── php_glue.h          # C 函数声明 + Zend 头文件（含 arg_info 模板、ACC 常量查询、契约注释）
+│   └── php_glue.c          # Zend 宏 → 普通 C 函数（覆盖全部语句级宏）
+├── src/
+│   ├── main.zig            # 库入口，re-export 全部公开接口
+│   ├── module.zig          # comptime Module()：函数/类/接口/方法/常量/属性注册、arg_info 生成、生命周期钩子
+│   ├── php_c.zig           # C glue extern fn 声明
+│   ├── php_config.zig      # 运行时 PHP API 版本 / build_id / ZTS 推导
+│   ├── php_types.zig       # Zend 类型定义：Zval extern struct、FunctionHandler、生命周期函数指针
+│   ├── zval.zig            # Zval 包装：类型判断、取值/设值、比较、算术、引用计数（incRef/decRef/separate）
+│   ├── array.zig           # Array 操作：增删查 + shift/unshift/merge/keys/values/slice/sort + filter/map/reduce
+│   ├── return.zig          # 返回值工具 + callNumArgs/callArg/getThis 参数获取
+│   ├── php_func.zig        # PHP 函数调用 Facade：call* + callZval
+│   ├── throw.zig           # PHP 异常/错误抛出（Exception + Error 家族 + 自定义类）
+│   ├── error.zig           # PHP 错误报告：docref/warning/notice
+│   ├── iterator.zig        # HashTable 内部指针迭代器（仅供 Array 内部使用）
+│   ├── object.zig          # 对象操作：属性读写/call + instanceOf + extern struct 绑定
+│   ├── resource.zig        # 资源类型封装：register/store/fetch
+│   ├── closure.zig         # 闭包创建：Zig 函数 → PHP Closure
+│   ├── serialize.zig       # 序列化：serialize/unserialize
+│   ├── ini.zig             # INI 配置：声明式注册 + 读取 + 变更通知
+│   ├── cleanup.zig         # 请求级清理注册表（bailout-safe，threadlocal）
+│   ├── arena.zig           # 内存池 ArenaOf(scope)：RequestArena（RSHUTDOWN）/ ResidentArena（MSHUTDOWN）
+│   │                       #   + unsafeAllocator 非托管入口（裸 c_allocator，责任归下游）
+│   ├── memtrack.zig        # Zig 侧 c_allocator 进程级记账：request / resident 两套物理隔离账本
+│   ├── fiber.zig           # Fiber 协程：只读查询 + create/start/suspend_/resume_/throw
+│   ├── observer.zig        # Observer 集中式观察代理（五类观察点 + fcall 过滤下推 + 现场信息）
+│   ├── string.zig          # 说明文档（字符串操作已被 zval/return/Zig std 覆盖）
+│   └── test_helpers.zig    # Zig 单元测试入口（87/87；聚合 cleanup/arena/memtrack 的 test 块）
+├── example/
+│   ├── hello/              # 最小示例：hello world（模块 hello，libhello.so）
+│   └── tests/              # 集成测试扩展（模块 ext-tests，libext-tests.so）
+│                           #   test_all（功能 239）/ test_crash（崩溃 69）
+│                           #   / test_corpus（语料 432）/ test_bailout（真实 longjmp 22）
+├── doc/
+│   ├── zen.md              # 设计哲学、竞品分析、边界（明确不做的事）
+│   ├── tutorial.md         # 从零到一的开发教程（含下游自建 C glue 逃生路径）
+│   ├── api.md              # 完整 API 参考
+│   ├── compat.md           # 版本兼容承诺
+│   ├── boundary.md         # 责任边界：骨架负责什么 / 不负责什么 + 下游自查清单
+│   └── special.md          # 实现决策与踩坑记录（唯一来源，按问题分节）
+├── benchmark/              # 三路基准：php-zig / 原生 C / 纯 PHP（性能 19 用例 + 内存 9 用例）
+└── .github/workflows/      # CI：test（PHP 8.2~8.5 矩阵）+ benchmark（手动 / 每周定时）
+```
+
+### 模块加载流程
+
+```
+PHP dlopen(.so)
+  → get_module()
+  → check init sentinel (module_entry.size != @sizeOf(ZendModuleEntry))
+  → initModule():
+      ├─ 运行时获取 ACC 常量：phpglue_acc_public/static() 等
+      ├─ for each FunctionDesc/ClassDesc:
+      │    ├─ 函数：从 C glue 模板 memcpy arg_info，覆盖 name 字段
+      │    │    末尾加 sentinel 哨兵条目供 variadic 检查
+      │    ├─ 类：zend_register_internal_class() 注册类
+      │    │    之后用 zend_declare_class_constant() 声明类常量
+      │    └─ 方法：同函数注册流程
+      ├─ module_entry.zend_api  = phpglue_module_api_no()
+      ├─ module_entry.build_id  = phpglue_module_build_id()
+      ├─ Arena.bindPhpProbes() + configureResidentFromIni()  # MINIT：挂探针 + 读常驻级额度
+      │                                                       # （请求级额度在 RINIT 读，见上）
+      └─ 注册生命周期钩子（MINIT/MSHUTDOWN/RINIT/RSHUTDOWN/phpinfo）
+  → return &module_entry
+```
+
 ## 起步
 
 需要 Zig 0.16+，以及目标 PHP 的开发头文件。
@@ -182,35 +258,35 @@ Hello from php-zig!
 
 ## 能力
 
-| 类别 | 状态 | 说明 |
-|------|:--:|------|
-| 函数注册 | ✅ | 声明式 + comptime struct 反射 arg_info，参数名/类型/可选性全自动推导 |
-| 参数默认值 | ✅ | `ParamDesc.createWithDefault/createTypedWithDefault`，Reflection 可读默认值 |
-| 可变参数 | ✅ | `ParamDesc.createVariadic/createVariadicTyped`，`...$args` variadic 位 |
-| 类型系统 | ✅ | IS_* 全类型判断（8 种）+ isCallable/isIterable/isScalar/isEmpty/isNumeric、取值/设值、eql/neq、算术运算符（add/sub/mul/div/mod）、关系比较（cmp/lt/le/gt/ge） |
-| 数组 | ✅ | append / set / setAssoc / find / del / count / pop / shift / unshift / merge / keys / values / slice / sort / each / iterator / filter / map / reduce |
-| 返回值 | ✅ | 9 种返回类型 |
-| 调用 PHP | ✅ | `PhpFunc.call*` 系列 + `Object.call` 对象方法 + `callZval` 闭包调用 |
-| 异常 / 错误 | ✅ | `Throw.throwException`（\Exception）+ `throwClass`（自定义异常/错误类）+ Error 家族（throwError/typeError/valueError 等）+ `Error.docref/warning/notice` |
-| 模块常量 | ✅ | long / double / string / bool / null 五种 |
-| 类注册 | ✅ | 方法（含 static/protected/private）+ 类常量 + 类属性（5 种类型）+ 继承 + 构造器 |
-| extern struct 绑定 | ✅ | `ClassDesc.createObject` — Zig struct 生命周期绑定到 PHP 对象 |
-| 接口 | ✅ | `createInterface` 注册 + `createImplements` 实现 |
-| 类属性 | ✅ | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` + 全反射 `createFromStruct` |
-| 生命周期 | ✅ | MINIT / MSHUTDOWN / RINIT / RSHUTDOWN |
-| 对象属性 | ✅ | `readProperty` / `writeProperty` + `instanceOf` + `toObject()` |
-| 资源类型 | ✅ | `Resource.register/store/fetch` |
-| 请求级内存池 | ✅ | `RequestArena` + `Cleanup.register`（bailout-safe，RSHUTDOWN 回收） |
-| 常驻级内存池 | ✅ | `ResidentArena`（跨请求存活，MSHUTDOWN 回收，独立 `resident_limit`）；`shared()` 进程级单例 |
-| 统一内存观测 | ✅ | `Memtrack.usageScope/peakScope/total` 两套物理隔离账本（request / resident）+ `unsafeAllocator` 非托管入口 |
-| Zig 侧内存治理 | ✅ | 进程级原子计数 + INI 限额（请求级默认参与 `memory_limit` 额度）；容器感知与告警由下游实现 |
-| 闭包导出 | ✅ | `Closure.create` 从 Zig 函数创建 PHP Closure |
-| Fiber 协程 | ✅ | 只读查询（isFiber/getStatus/getCurrent/getReturn）+ 控制操作（create/start/suspend_/resume_/throw，走 PHP 原生方法复用校验） |
-| Observer 观察代理 | ✅ | 五类观察点静态注册（fcall begin/end、error、function_declared、class_linked、fiber init/switch/destroy）+ `funcName` |
-| INI 配置 | ✅ | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知 |
-| 序列化 | ✅ | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize() |
-| phpinfo | ✅ | `info_func` 回调 |
-| 测试 | ✅ | Zig 单元测试 87 项 + PHP 集成测试：功能 229 / 崩溃隔离 59 / 类型语料 408 / bailout 兜底 17 |
+| 类别               | 状态 | 说明                                                                                                                                                          |
+|--------------------|:----:|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 函数注册           |  ✅  | 声明式 + comptime struct 反射 arg_info，参数名/类型/可选性全自动推导                                                                                          |
+| 参数默认值         |  ✅  | `ParamDesc.createWithDefault/createTypedWithDefault`，Reflection 可读默认值                                                                                   |
+| 可变参数           |  ✅  | `ParamDesc.createVariadic/createVariadicTyped`，`...$args` variadic 位                                                                                        |
+| 类型系统           |  ✅  | IS_* 全类型判断（8 种）+ isCallable/isIterable/isScalar/isEmpty/isNumeric、取值/设值、eql/neq、算术运算符（add/sub/mul/div/mod）、关系比较（cmp/lt/le/gt/ge） |
+| 数组               |  ✅  | append / set / setAssoc / find / del / count / pop / shift / unshift / merge / keys / values / slice / sort / each / iterator / filter / map / reduce         |
+| 返回值             |  ✅  | 9 种返回类型                                                                                                                                                  |
+| 调用 PHP           |  ✅  | `PhpFunc.call*` 系列 + `Object.call` 对象方法 + `callZval` 闭包调用                                                                                           |
+| 异常 / 错误        |  ✅  | `Throw.throwException`（\Exception）+ `throwClass`（自定义异常/错误类）+ Error 家族（throwError/typeError/valueError 等）+ `Error.docref/warning/notice`      |
+| 模块常量           |  ✅  | long / double / string / bool / null 五种                                                                                                                     |
+| 类注册             |  ✅  | 方法（含 static/protected/private）+ 类常量 + 类属性（5 种类型）+ 继承 + 构造器                                                                               |
+| extern struct 绑定 |  ✅  | `ClassDesc.createObject` — Zig struct 生命周期绑定到 PHP 对象                                                                                                 |
+| 接口               |  ✅  | `createInterface` 注册 + `createImplements` 实现                                                                                                              |
+| 类属性             |  ✅  | 声明式 `ClassPropertyDesc.create*` + comptime struct 反射 `createWithPropsFrom` + 全反射 `createFromStruct`                                                   |
+| 生命周期           |  ✅  | MINIT / MSHUTDOWN / RINIT / RSHUTDOWN                                                                                                                         |
+| 对象属性           |  ✅  | `readProperty` / `writeProperty` + `instanceOf` + `toObject()`                                                                                                |
+| 资源类型           |  ✅  | `Resource.register/store/fetch`                                                                                                                               |
+| 请求级内存池       |  ✅  | `RequestArena` + `Cleanup.register`（bailout-safe，RSHUTDOWN 回收）                                                                                           |
+| 常驻级内存池       |  ✅  | `ResidentArena`（跨请求存活，MSHUTDOWN 回收，独立 `resident_limit`）；`shared()` 进程级单例                                                                   |
+| 统一内存观测       |  ✅  | `Memtrack.usageScope/peakScope/total` 两套物理隔离账本（request / resident）+ `unsafeAllocator` 非托管入口                                                    |
+| Zig 侧内存治理     |  ✅  | 进程级原子计数 + INI 限额（请求级默认参与 `memory_limit` 额度）；容器感知与告警由下游实现                                                                     |
+| 闭包导出           |  ✅  | `Closure.create` 从 Zig 函数创建 PHP Closure                                                                                                                  |
+| Fiber 协程         |  ✅  | 只读查询（isFiber/getStatus/getCurrent/getReturn）+ 控制操作（create/start/suspend_/resume_/throw，走 PHP 原生方法复用校验）                                  |
+| Observer 观察代理  |  ✅  | 五类观察点静态注册（fcall begin/end、error、function_declared、class_linked、fiber init/switch/destroy）+ `funcName`                                          |
+| INI 配置           |  ✅  | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知                                                                                       |
+| 序列化             |  ✅  | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize()                                                                                        |
+| phpinfo            |  ✅  | `info_func` 回调                                                                                                                                              |
+| 测试               |  ✅  | Zig 单元测试 87 / PHP 集成测试：功能 239、崩溃隔离 69、类型语料 432、bailout 兜底 22（PHP 8.4 实测）                                                          |
 
 ### 两种注册哲学，并存
 
@@ -251,6 +327,15 @@ phpzig.ClassDesc.createWithPropsFrom("Bank", &.{ ...methods... }, BankProps);
 框架不硬编码任何 PHP 版本号。`ZEND_MODULE_API_NO`、`ZEND_ACC_*` 标志位、`sizeof(zend_internal_arg_info)`、`USING_ZTS` 等全部由 C glue 在编译期从 PHP 头文件获取。用哪个版本的 PHP 头文件编译，就产出一个与该版本兼容的 `.so`。
 
 注意事项见 [special.md](doc/special.md)。
+
+交叉编译由 `-Dphp` 驱动，各主机可产出的目标：
+
+| 主机    | 可产出                                                                  |
+|---------|-------------------------------------------------------------------------|
+| Linux   | Linux（glibc/musl，Zig 自带）、macOS（`libSystem.tbd`，Zig 自带）       |
+| Windows | Windows（mingw 自带 / **msvc 需本机 VS 或 Build Tools**）、Linux、macOS |
+
+> Windows DLL（官方 MSVC 构建的 PHP）**只能在本机装有 MSVC 的 Windows 上编译**——Zig 不内置 MSVC libc，官方 `php8.lib` 是 MSVC import library，与 mingw ABI 不匹配。详见 `doc/special.md`。
 
 ## 责任边界
 
@@ -296,11 +381,11 @@ phpzig.ClassDesc.createObject("Counter", &.{ /* methods */ }, Counter, counterIn
 自己分配的内存走 Arena。`RequestArena` 与 `ResidentArena` 是**同一个泛型实现**
 （`ArenaOf(scope)`）的两个实例，差异只有两处：额度来源、是否注册 RSHUTDOWN 钩子。
 
-| | `RequestArena` | `ResidentArena` |
-|---|---|---|
-| 生命周期 | 请求级，RSHUTDOWN 兜底回收 | 模块级，MSHUTDOWN 回收（`shared()` 单例由框架负责） |
-| 额度来源 | `min(arena_limit, memory_limit 剩余)` | `resident_limit`（**不读 `memory_limit`**） |
-| 创建方式 | 请求内 `init()` | `shared()` 进程级单例，或 `init()` + 手动 `destroy()` |
+|          | `RequestArena`                        | `ResidentArena`                                       |
+|----------|---------------------------------------|-------------------------------------------------------|
+| 生命周期 | 请求级，RSHUTDOWN 兜底回收            | 模块级，MSHUTDOWN 回收（`shared()` 单例由框架负责）   |
+| 额度来源 | `min(arena_limit, memory_limit 剩余)` | `resident_limit`（**不读 `memory_limit`**）           |
+| 创建方式 | 请求内 `init()`                       | `shared()` 进程级单例，或 `init()` + 手动 `destroy()` |
 
 两个作用域共用同一套 reject 语义；请求级在 bailout（`longjmp` 跳过 `defer`）
 后仍保证回收：
@@ -347,11 +432,11 @@ phpzig.resident_limit = 0           ; 常驻级上限，0 = 不设防（默认�
 `arena.unsafeAllocator()` 返回裸 `c_allocator`，语义是**明确放弃**该 Arena 的
 托管、额度与兜底：
 
-| 你想要的 | 怎么做 | 观测 | 限额 | 兜底 |
-|---|---|:--:|:--:|:--:|
-| 受管 | `arena.allocator()` | ✅ | ✅ | ✅ |
-| 裸 + 可观测 | `unsafeAllocator()` + `Memtrack.trackAlloc/trackFree` | ✅ | ❌ | ❌ |
-| 纯裸 | `unsafeAllocator()` | ❌ | ❌ | ❌ |
+| 你想要的    | 怎么做                                                | 观测 | 限额 | 兜底 |
+|-------------|-------------------------------------------------------|:----:|:----:|:----:|
+| 受管        | `arena.allocator()`                                   |  ✅  |  ✅  |  ✅  |
+| 裸 + 可观测 | `unsafeAllocator()` + `Memtrack.trackAlloc/trackFree` |  ✅  |  ❌  |  ❌  |
+| 纯裸        | `unsafeAllocator()`                                   |  ❌  |  ❌  |  ❌  |
 
 「受限额保护」只有受管路径能提供——这是 unsafe 的实质代价。非必要不使用；
 一旦使用，释放时机与 OOM 后果均由下游自控。

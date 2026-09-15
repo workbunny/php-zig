@@ -225,3 +225,18 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
 | `0.y.z` 的 **z** | 发布不破坏 API（bugfix / 内部重构） |
 | `0.y` 的 **y** | 可能破坏 API（破坏性变更见本节对应版本条目） |
 | `0.x` 全部 | 暂不承诺 1.x 稳定性，迁移以本节为准 |
+
+---
+
+## [0.1 ~ 0.10] 能力归档
+
+> 本文件自 0.11.0 起逐版本维护；此前版本无逐条记录，按「能力边界」归并归档于此。
+
+| 版本 | 能力 |
+|---|---|
+| v0.1 ~ v0.7 | 骨架：C glue 层、comptime 模块注册、OOP（类 / 继承 / 接口 / 属性 / 访问修饰符）、闭包、struct 反射 arg_info、错误报告 |
+| v0.8.0 | extern struct 对象绑定、INI、序列化、参数默认值 / 可变参数 |
+| v0.9.x | 请求级 `RequestArena` + `Cleanup`（bailout-safe）、Fiber 协程、Observer 五类观察点、`Zval.incRef`/`separate`、`-Dphp` 平台识别、Windows DLL 定案 |
+| v0.10.0 | 文档体系（`api` / `tutorial` / `zen` / `special`）+ README 能力矩阵 |
+| v0.10.1 | Observer 补强（`funcInfo` / `callSite` / `fcall_filter`）、Zig 侧内存治理（进程级原子计数 + INI 限额 + 参与 `memory_limit` 额度）、三路性能与内存基准、下游自建 C glue 逃生路径 |
+| v0.10.2 | 类型系统（`PhpType` 联合类型 + 编译期校验）、弱转换取值（消灭垃圾指针 UB）、模块级函数 `flags` 传递修复、测试三件套（崩溃隔离 + 语料矩阵）、`memtrack` 收敛框架全部 c_allocator 分配 |
