@@ -15,8 +15,9 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
 - **FFI fork 隔离后端**（`example/tests/isolation.php`）：ZTS 构建不带 `pcntl`，改用 FFI 直调
   libc 的 `fork`/`waitpid`，状态字按 POSIX 宏在 PHP 侧解码。三套隔离件因此在 ZTS 下同样运行；
   后端顺序 `pcntl → ffi`，可用 `PZ_ISOLATE_BACKEND=pcntl|ffi` 强制指定。
-- CI 新增 **PHP 8.4 ZTS 档**：矩阵变为 8.2 / 8.3 / 8.4 / 8.5 NTS + 8.4 ZTS，两档都跑满四套件。
-  ZTS 档显式启用 `ffi` 扩展（预编译 ZTS 构建默认不含），并加「校验隔离后端」步骤把两档各钉到一个后端。
+- CI 矩阵扩为 **8.2 / 8.3 / 8.4 / 8.5 × NTS / ZTS 共 8 档**，每档都跑满四套件。
+  ZTS 档显式启用 `ffi` 扩展（预编译 ZTS 构建默认不含），并加「校验隔离后端」步骤把各档钉到
+  对应后端（NTS → pcntl，ZTS → FFI fork）。
 - `envBrokenThrow()`：`Call to undefined function` / `Class "X" not found` / `Undefined constant`
   一律判为环境失败 —— 这类抛出证明的是「没跑到」，不是「没崩」。
 
