@@ -203,7 +203,7 @@ php-zig/
 │   ├── boundary.md         # 责任边界：骨架负责什么 / 不负责什么 + 下游自查清单
 │   └── special.md          # 实现决策与踩坑记录（唯一来源，按问题分节）
 ├── benchmark/              # 三路基准：php-zig / 原生 C / 纯 PHP（性能 19 用例 + 内存 9 用例）
-└── .github/workflows/      # CI：test（PHP 8.2~8.5 矩阵）+ benchmark（手动 / 每周定时）
+└── .github/workflows/      # CI：test（PHP 8.2~8.5 NTS + 8.4 ZTS，均跑四套件）+ benchmark（手动 / 每周定时）
 ```
 
 ### 模块加载流程

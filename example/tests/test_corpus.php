@@ -7,7 +7,7 @@
  *   test_corpus.php 自动枚举的笛卡尔积（N 个代表值 × M 个核心函数）
  *
  * 【判据】
- *   1. 不崩溃 —— fork 隔离下崩溃即信号
+ *   1. 不崩溃 —— 子进程隔离下崩溃即信号
  *   2. 诊断在预期范围内 —— 按坐标（函数 × 语料）预先声明，双向核对
  *
  * 提示：预期诊断是**输入决定的**（object → int/float 警告、array → string 警告），
@@ -20,12 +20,22 @@
 $passed = 0;
 $rejected = 0;
 
-if (!function_exists('pcntl_fork')) {
-    echo "pcntl 不可用，跳过语料库测试\n";
-    exit(0);
+require __DIR__ . '/isolation.php';
+
+// 前置：被测扩展必须已加载，否则每个坐标都只是"函数未定义抛错"，断言无意义
+if (!function_exists('hello_world') || !function_exists('hello_sum')) {
+    echo "ext-tests 扩展未加载（缺 hello_world / hello_sum）：无法运行语料库测试\n";
+    exit(1);
 }
 
-require __DIR__ . '/isolation.php';
+// 前置：隔离后端。pcntl（NTS 自带）或 FFI fork（ZTS 无 pcntl）。
+// 环境不满足一律非绿。
+$backend = isolateBackend();
+if ($backend === null) {
+    echo "无可用隔离后端（pcntl / FFI 均不可用）：无法运行语料库测试\n";
+    exit(1);
+}
+echo "隔离后端：{$backend}\n";
 
 /** 语料库：PHP 各类型的代表值 */
 function corpus(): array {
@@ -158,6 +168,7 @@ echo "  隔离：fork 子进程；诊断经回传通道分类（子进程内 log
 $nCrash = 0;        // 信号崩溃
 $nBadExit = 0;      // 致命错误 / 非预期退出
 $nUnexpected = 0;   // 意外诊断
+$nEnv = 0;          // 环境级失败（扩展未加载 / 未定义函数），不得算作「不崩溃」
 $nMissed = 0;       // 预期诊断未命中（声明与行为脱节）
 $nExpectHit = 0;    // 预期诊断命中数
 $expectTotal = 0;   // 预期诊断总数：逐坐标累加，与声明同源，故不可能与声明漂移
@@ -190,13 +201,18 @@ foreach ($funcs as $fname => [$f, $arity, $rule]) {
             $nUnexpected += count($bad);
             $details[] = "$fname × $cname => 意外诊断 " . implode(' / ', $bad);
         }
+        // 环境级失败：throws 是「函数未定义」这类前置缺失，不是被测行为
+        if (envBrokenThrow($res['thrown'])) {
+            $nEnv++;
+            $details[] = "$fname × $cname => 环境缺失（扩展未加载？）：{$res['thrown']}";
+        }
         if ($missed) {
             $nMissed++;
             $n = $res['diags'] === [] ? 0 : count($res['diags']);  // 复杂表达式不能直接插值
             $details[] = "$fname × $cname => 预期诊断未命中（声明 " . count($expect) . " 条，实际 {$n} 条）";
         }
 
-        if ($crashed || $badExit || $bad !== [] || $missed) {
+        if ($crashed || $badExit || $bad !== [] || $missed || envBrokenThrow($res['thrown'])) {
             $rejected++;
         } else {
             $passed++;
@@ -205,11 +221,18 @@ foreach ($funcs as $fname => [$f, $arity, $rule]) {
     }
 }
 
+// 结构断言：矩阵必须逐格跑完。少跑一格时「拒绝 0」同样成立，单看通过率看不出来。
+$matrixSize = count($funcs) * count($c);
+if ($passed + $rejected !== $matrixSize) {
+    echo "\n结构断言失败：矩阵应为 {$matrixSize} 格，实跑 " . ($passed + $rejected) . " 格\n";
+    exit(1);
+}
+
 // ============================================================
 // 结果分类
 // ============================================================
 echo "矩阵结果：通过 {$passed}，拒绝 {$rejected}\n";
-echo "  崩溃 {$nCrash} · 意外退出 {$nBadExit} · 意外诊断 {$nUnexpected} · 预期未命中 {$nMissed}\n";
+echo "  崩溃 {$nCrash} · 意外退出 {$nBadExit} · 意外诊断 {$nUnexpected} · 环境缺失 {$nEnv} · 预期未命中 {$nMissed}\n";
 $ruleDesc = '数值 cast 位 × object → int/float 警告；字符串 cast 位 × array → Array to string conversion';
 if (CAST_WARN_SINCE_85) {
     $ruleDesc .= '；8.5 新增：INF/NAN → int、以及 (string)NAN';

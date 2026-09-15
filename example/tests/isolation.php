@@ -1,6 +1,14 @@
 <?php
 /**
- * fork 隔离 + 诊断分类 —— crash / corpus / bailout 三个隔离型测试共用
+ * 子进程隔离 + 诊断分类 —— crash / corpus / bailout 三个隔离型测试共用
+ *
+ * 【隔离后端】两个，表现等价（都是拷贝进程镜像出一个子进程，子进程内崩溃不波及父进程）：
+ *   pcntl —— NTS 构建自带：pcntl_fork + pcntl_waitpid + pcntl_wif*
+ *   ffi   —— ZTS 构建不带 pcntl，改用 FFI 直调 libc 的 fork/waitpid，
+ *            状态字按 POSIX 宏在 PHP 侧解码（glibc/musl 一致）
+ * 选择顺序 pcntl → ffi；可用环境变量 PZ_ISOLATE_BACKEND=pcntl|ffi 强制，
+ * 便于 NTS/ZTS 两档分别验证各自后端。FFI 路径需要 ffi 扩展与 ffi.enable=1
+ * （CLI 默认为 preload，非预加载脚本会被拒）。
  *
  * 【诊断的两条通道】
  *   display_errors → 输出缓冲（子进程 ob_start() 可拦）
@@ -38,7 +46,113 @@ function signalName(int $sig): string
 }
 
 /**
- * fork 出子进程执行 $fn，回传结构化结果。子进程内任何诊断都不再流向终端。
+ * 该「抛出」是否说明**环境/前置缺失**，而不是被测代码的行为。
+ *
+ * 判据：扩展未加载（或某个函数/类没注册）时，子进程抛的是
+ * `Error: Call to undefined function xxx()` / `Class "X" not found`。
+ * 这类结果在「只要不崩溃就算合格」的断言下会被当成通过 —— 那是假绿：
+ * 它证明的是"什么都没跑到"，不是"没崩"。调用方拿到 true 必须判失败。
+ */
+function envBrokenThrow(?string $thrown): bool
+{
+    if ($thrown === null) {
+        return false;
+    }
+    return preg_match('/Call to undefined function|Class ".*" not found|Undefined constant/', $thrown) === 1;
+}
+
+/**
+ * 当前进程可用的隔离后端：'pcntl' | 'ffi' | null（null = 都没得用）。
+ *
+ * 探测而非假设：FFI 是否可用取决于扩展与 ffi.enable（preload 下不可用）。
+ * 调用方拿到 null 必须显式跳过并打印，不得让「没跑」伪装成「通过」。
+ */
+function isolateBackend(): ?string
+{
+    static $probed = false;
+    static $backend = null;
+    if ($probed) {
+        return $backend;
+    }
+    $probed = true;
+
+    $forced = getenv('PZ_ISOLATE_BACKEND');
+    if ($forced === 'pcntl' || $forced === 'ffi') {
+        return $backend = (isolateBackendUsable($forced) ? $forced : null);
+    }
+    if (isolateBackendUsable('pcntl')) {
+        return $backend = 'pcntl';
+    }
+    if (isolateBackendUsable('ffi')) {
+        return $backend = 'ffi';
+    }
+    return $backend = null;
+}
+
+/** 指定后端在当前进程是否真的可用 */
+function isolateBackendUsable(string $name): bool
+{
+    if ($name === 'pcntl') {
+        return function_exists('pcntl_fork') && function_exists('pcntl_waitpid');
+    }
+    if (!class_exists('FFI')) {
+        return false;
+    }
+    try {
+        isolateFfi();
+        return true;
+    } catch (\Throwable) {
+        // ffi.enable=preload 时 cdef 会抛错——正是要探测的状态
+        return false;
+    }
+}
+
+/** FFI 句柄。lib 传 null = 用当前进程已加载的符号（libc 一定在） */
+function isolateFfi(): FFI
+{
+    static $ffi = null;
+    return $ffi ??= FFI::cdef(
+        "int fork(void);\nint waitpid(int pid, int *status, int options);\n",
+    );
+}
+
+/** 复制出子进程；返回 0 = 当前是子进程，-1 = 失败 */
+function isolateFork(): int
+{
+    return isolateBackend() === 'ffi' ? (int) isolateFfi()->fork() : pcntl_fork();
+}
+
+/**
+ * 等子进程结束，返回 [退出码, 信号名]。
+ * FFI 路径下状态字由 PHP 侧按 POSIX 宏解码：
+ *   退出 = (status & 0x7f) == 0，退出码 = (status >> 8) & 0xff
+ *   信号 = ((status & 0x7f) + 1) >> 1 > 0，信号号 = status & 0x7f
+ */
+function isolateWait(int $pid): array
+{
+    if (isolateBackend() === 'ffi') {
+        $ffi = isolateFfi();
+        $status = $ffi->new('int');
+        $ffi->waitpid($pid, FFI::addr($status), 0);
+        $s = (int) $status->cdata;
+        $exited = ($s & 0x7f) === 0;
+        $signaled = ((($s & 0x7f) + 1) >> 1) > 0;
+        return [$exited ? (($s >> 8) & 0xff) : -1, $signaled ? signalName($s & 0x7f) : null];
+    }
+
+    pcntl_waitpid($pid, $status);
+    $exited = pcntl_wifexited($status);
+    $signaled = pcntl_wifsignaled($status);
+    return [$exited ? pcntl_wexitstatus($status) : -1, $signaled ? signalName(pcntl_wtermsig($status)) : null];
+}
+
+/**
+ * 复制出子进程执行 $fn，回传结构化结果。子进程内任何诊断都不再流向终端。
+ *
+ * 后端由 isolateBackend() 决定（pcntl 或 FFI fork），调用方无需关心。
+ *
+ * 诊断回传被截断（超过 ISOLATE_DIAG_MAX）时**直接失败退出**：截断意味着分类通道
+ * 不可信，此时"意外诊断为空"可能只是因为那条被丢了，继续跑就是假绿。
  *
  * @return array{
  *   signal: ?string,
@@ -51,6 +165,11 @@ function signalName(int $sig): string
  */
 function forkIsolate(callable $fn): array
 {
+    if (isolateBackend() === null) {
+        fwrite(STDERR, "forkIsolate: 无可用隔离后端（pcntl 与 FFI 都不可用）\n");
+        exit(1);
+    }
+
     $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
     if ($pair === false) {
         // 没有 socketpair 就不假装能隔离诊断：静默降级等于把诊断重新变成泄漏
@@ -59,25 +178,31 @@ function forkIsolate(callable $fn): array
     }
     [$parentEnd, $childEnd] = $pair;
 
-    $pid = pcntl_fork();
+    $pid = isolateFork();
+    if ($pid === -1) {
+        fwrite(STDERR, "forkIsolate: 复制子进程失败\n");
+        exit(1);
+    }
     if ($pid === 0) {
         fclose($parentEnd);
         isolateChildMain($fn, $childEnd);
         // isolateChildMain 不返回
     }
     fclose($childEnd);
-    pcntl_waitpid($pid, $status);
-
-    $signaled = pcntl_wifsignaled($status);
-    $exited = pcntl_wifexited($status);
-    $exitCode = $exited ? pcntl_wexitstatus($status) : -1;
-    $sigName = $signaled ? signalName(pcntl_wtermsig($status)) : null;
+    [$exitCode, $sigName] = isolateWait($pid);
 
     // 子进程已退出 → 写端全部关闭 → 这里读到 EOF，不会阻塞
     $raw = stream_get_contents($parentEnd);
     fclose($parentEnd);
 
     $payload = is_string($raw) && $raw !== '' ? json_decode($raw, true) : null;
+
+    $dropped = is_array($payload) ? (int) ($payload['dropped'] ?? 0) : 0;
+    if ($dropped > 0) {
+        fwrite(STDERR, "forkIsolate: 诊断回传被截断（丢弃 {$dropped} 条，上限 " . ISOLATE_DIAG_MAX
+            . "）：分类不可信，按失败处理\n");
+        exit(1);
+    }
 
     return [
         'signal'       => $sigName,

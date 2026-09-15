@@ -6,8 +6,9 @@
  * `add(PHP_INT_MAX,1)` 整数溢出崩溃、`hello_format(null,null)` 野指针
  * 解引用崩溃——而功能测试无一发现。
  *
- * 本文件用 fork 隔离每个用例：崩溃（SEGV/ABRT）只影响子进程，父进程能
- * 捕获信号并精确定位到具体用例。没有 fork 能力时（非 CLI）跳过。
+ * 本文件用子进程隔离每个用例：崩溃（SEGV/ABRT）只影响子进程，父进程能
+ * 捕获信号并精确定位到具体用例。隔离后端由 isolation.php 选（pcntl，或
+ * ZTS 下的 FFI fork）；两者都不可用时跳过并打印。
  *
  * 断言理念：危险测试的核心断言是「**不崩溃**」，其次才是行为可预期
  * （cast 语义 / TypeError / 优雅降级），**不是**返回值精确相等。
@@ -22,13 +23,32 @@
 $passed = 0;
 $rejected = 0;
 $skipped = 0;
+$casesRun = 0;
 
-if (!function_exists('pcntl_fork')) {
-    echo "pcntl 不可用，跳过崩溃隔离测试\n";
-    exit(0);
-}
+/**
+ * 用例数下界（结构断言）。低于它说明有整段用例被删掉或压根没执行 ——
+ * 那种情况下「拒绝 0」同样成立，单看通过率看不出来。新增用例时上调此值。
+ */
+const EXPECTED_MIN_CASES = 69;
 
 require __DIR__ . '/isolation.php';
+
+// 前置：被测扩展必须已加载。
+// 缺了它每个用例都会抛 Error: Call to undefined function …，而本文件的核心断言是
+// 「不崩溃」（return 与 throw 都算合格）—— 于是 69 个用例全绿，什么都没测到。
+if (!function_exists('hello_world') || !function_exists('add')) {
+    echo "ext-tests 扩展未加载（缺 hello_world / add）：无法运行崩溃隔离测试\n";
+    exit(1);
+}
+
+// 前置：隔离后端。pcntl（NTS 自带）或 FFI fork（ZTS 无 pcntl）。
+// 环境不满足一律非绿：不满足即失败，不做「跳过即通过」。
+$backend = isolateBackend();
+if ($backend === null) {
+    echo "无可用隔离后端（pcntl / FFI 均不可用）：无法运行崩溃隔离测试\n";
+    exit(1);
+}
+echo "隔离后端：{$backend}\n";
 
 /**
  * fork 隔离执行一个用例，按标签与诊断分类判定。
@@ -43,7 +63,8 @@ require __DIR__ . '/isolation.php';
  * @param list<string> $allowDiags 该用例允许出现的诊断正则（默认空 = 不该有任何诊断）
  */
 function crashTest(string $name, callable $fn, array $expect = ['no-crash'], array $allowDiags = []): void {
-    global $passed, $rejected, $skipped;
+    global $passed, $rejected, $skipped, $casesRun;
+    $casesRun++;
 
     $res = forkIsolate($fn);
     $tag = isolateTag($res);
@@ -52,11 +73,18 @@ function crashTest(string $name, callable $fn, array $expect = ['no-crash'], arr
     $badExit = !$crashed && ($res['outcome'] === 'fatal' || $res['outcome'] === 'lost');
     $bad = unexpectedDiags($res['diags'], $allowDiags);
 
+    // 环境级失败不能算「不崩溃」：扩展缺失/类未注册抛出的 Error 证明的是
+    // 「什么都没跑到」，不是「没崩」。这类结果一律拒绝并单独报出来。
+    $env = [];
+    if (envBrokenThrow($res['thrown'])) {
+        $env[] = '环境缺失（扩展未加载？）：' . $res['thrown'];
+    }
+
     $ok = false;
     if (!$crashed && !$badExit) {
         $ok = in_array('no-crash', $expect, true) || in_array($tag, $expect, true);
     }
-    if ($bad !== []) {
+    if ($bad !== [] || $env !== []) {
         $ok = false;
     }
 
@@ -74,6 +102,9 @@ function crashTest(string $name, callable $fn, array $expect = ['no-crash'], arr
         }
         foreach ($bad as $b) {
             echo "      意外诊断：$b\n";
+        }
+        foreach ($env as $e) {
+            echo "      {$e}\n";
         }
     }
 }
@@ -221,6 +252,14 @@ crashTest('hello_cast_string(循环引用数组)', fn() => hello_cast_string($cy
 // 结果汇总
 // ============================================================
 echo "\n========================================\n";
-echo "崩溃隔离测试：通过 {$passed}，拒绝 {$rejected}，跳过 {$skipped}\n";
-echo $rejected === 0 ? "全部通过\n" : "有拒绝项！\n";
-exit($rejected === 0 ? 0 : 1);
+echo "崩溃隔离测试：通过 {$passed}，拒绝 {$rejected}，跳过 {$skipped}，实跑 {$casesRun}\n";
+if ($skipped > 0) {
+    // 跳过 = 前置条件不满足，不能计入通过
+    echo "有 {$skipped} 个用例被跳过（视为失败）\n";
+}
+if ($casesRun < EXPECTED_MIN_CASES) {
+    echo "结构断言失败：实跑 {$casesRun} 个用例，低于下界 " . EXPECTED_MIN_CASES . "\n";
+    exit(1);
+}
+echo $rejected === 0 && $skipped === 0 ? "全部通过\n" : "有拒绝项！\n";
+exit($rejected === 0 && $skipped === 0 ? 0 : 1);

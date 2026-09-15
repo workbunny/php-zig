@@ -26,9 +26,21 @@
  *   §29    内存增长探针（泄漏防线）  §30 RequestArena 监控与限额
  */
 
+// 前置：被测扩展必须已加载。缺了它本文件会在第一个 hello_world() 调用上抛未捕获
+// Error（exit 255）—— 非绿是对的，但先给一条能读懂的原因。
+if (!function_exists('hello_world')) {
+    echo "ext-tests 扩展未加载（缺 hello_world）：无法运行功能测试\n";
+    exit(1);
+}
+
 $passed = 0;
 $failed = 0;
-$skipped = 0;
+
+/**
+ * 断言数下界（结构断言）。低于它说明有整段断言被删掉或压根没执行 ——
+ * 那种情况下「0 失败」同样成立。新增断言时上调此值。
+ */
+const EXPECTED_MIN_ASSERTIONS = 239;
 
 // 供 Observer 补强测试使用：必须是 PHP 用户函数（与扩展提供的内部函数对照），
 // 且参数个数固定为 3 以便断言 num_args
@@ -965,6 +977,12 @@ test('cleanup 注销后回落基线', $ledgerBaseline, hello_arena_report()['res
 // 结果汇总
 // ============================================================
 $total = $passed + $failed;
+
+if ($total < EXPECTED_MIN_ASSERTIONS) {
+    echo "\n结构断言失败：实跑 {$total} 条断言，低于下界 " . EXPECTED_MIN_ASSERTIONS . "\n";
+    exit(1);
+}
+
 echo "\n========================================\n";
 echo "结果: $passed / $total 通过";
 if ($failed > 0) {

@@ -1,9 +1,16 @@
 # php-zig 测试矩阵
 #
-# 从 PHP 8.2 向后支持：8.2 / 8.3 / 8.4 / 8.5 四版本并行跑
+# 从 PHP 8.2 向后支持：8.2 / 8.3 / 8.4 / 8.5 四版本并行跑（NTS），外加 8.4 ZTS 一档
 #   1. Zig 单元测试（不依赖 PHP 运行时）
 #   2. 构建集成测试扩展（.so）
-#   3. PHP 集成测试三件套（test_all 功能 / test_crash 崩溃隔离 / test_corpus 语料矩阵）
+#   3. PHP 集成测试四件套（test_all 功能 / test_crash 崩溃隔离 / test_corpus 语料矩阵 / test_bailout bailout 兜底）
+#
+# ZTS 档的意义：请求级状态（Cleanup 注册表、arena 派生额度）是 threadlocal，ztsMode 推导
+# 与 ZTS 头文件路径只在 ZTS 构建下才真正走到——NTS 矩阵覆盖不到这些分支。
+#
+# 隔离后端：三套隔离件需要「拷贝出子进程」的能力。NTS 自带 pcntl；ZTS 不带 pcntl，
+# 故 isolation.php 支持 FFI 直调 libc 的 fork/waitpid 作为等价后端（需 -d ffi.enable=1，
+# CLI 默认 preload 会拒绝非预加载脚本）。于是两档都跑满四套件，且各自覆盖一个后端。
 name: test
 
 on:
@@ -13,12 +20,23 @@ on:
 
 jobs:
   test:
-    name: PHP ${{ matrix.php }}
+    name: PHP ${{ matrix.php }} ${{ matrix.phpts == 'zts' && 'ZTS' || 'NTS' }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         php: ['8.2', '8.3', '8.4', '8.5']
+        # phpts 轴只为「让 include 另开一档」而存在：include 的键若能无损并入既有组合，
+        # GitHub 会并入而非新增——那样 8.4 ZTS 会顶掉 8.4 NTS。带上 phpts 轴后
+        # include 的 phpts 与原值冲突，才会新增第 5 个 job。
+        phpts: ['nts']
+        include:
+          # ZTS 覆盖：threadlocal 请求级状态、ztsMode 推导、ZTS 头文件路径与结构体布局
+          - php: '8.4'
+            phpts: 'zts'
+    # setup-php 用 env 的 phpts 选择线程模型（nts | ts | zts）
+    env:
+      phpts: ${{ matrix.phpts }}
     steps:
       - uses: actions/checkout@v4
 
@@ -31,7 +49,25 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
+          # ZTS 档必须显式启用 ffi：ZTS 不带 pcntl，三套隔离件靠 FFI fork 兜底，
+          # 而预编译 ZTS 构建默认不含 ffi（本地 php:8.4-zts 实测无 FFI）。
+          extensions: ${{ matrix.phpts == 'zts' && 'ffi' || '' }}
           coverage: none
+
+      - name: 校验线程模型与 fork 能力
+        env:
+          EXPECT_ZTS: ${{ matrix.phpts == 'zts' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          php -r 'printf("PHP %s %s | pcntl_fork=%s | 期望ZTS=%s\n", PHP_VERSION, PHP_ZTS ? "ZTS" : "NTS", function_exists("pcntl_fork") ? "有" : "无", getenv("EXPECT_ZTS"));'
+          test "$(php -r 'echo (int) PHP_ZTS;')" = "$EXPECT_ZTS" \
+            || { echo "实际线程模型与矩阵不符（期望 ZTS=$EXPECT_ZTS）" >&2; exit 1; }
+          # NTS 档：pcntl 随 CLI 默认自带，后三套靠它做 fork 隔离；
+          # 一旦缺失，那三套会「打印跳过并 exit 0」——即假绿，故直接失败。
+          if [ "$EXPECT_ZTS" = "0" ]; then
+            php -r 'exit(function_exists("pcntl_fork") ? 0 : 2);' \
+              || { echo "NTS 档缺 pcntl_fork：test_crash / test_corpus / test_bailout 将静默跳过" >&2; exit 1; }
+          fi
 
       - name: 确保 PHP 开发头文件可用
         run: |
@@ -65,28 +101,52 @@ jobs:
           echo "PHP_SDK=$PHP_SDK" >> "$GITHUB_ENV"
 
       - name: Zig 单元测试
-        run: zig build test --summary all
+        # 0 用例也报成功（新模块忘了在聚合入口 @import 登记时，其 test 块被静默跳过），
+        # 故断言收集到的用例数非零，把「静默跳过」变成失败。
+        run: |
+          set -euo pipefail
+          out=$(zig build test --summary all 2>&1) || { echo "$out"; exit 1; }
+          echo "$out"
+          echo "$out" | grep -qE '[1-9][0-9]* tests passed' \
+            || { echo "单测未收集到任何用例：检查 src/test_helpers.zig 的 @import 登记" >&2; exit 1; }
 
       - name: 构建集成测试扩展
         working-directory: example/tests
         run: zig build -Dphp="$PHP_SDK" --summary all
 
-      # 集成测试三件套：功能正确 / 崩溃隔离 / 类型语料矩阵。
-      # 崩溃与语料文件用 fork 隔离，会触发 SIGSEGV/ABRT 时以非零退出码暴露，
-      # 由 fail-fast: false 保证单版本失败不阻塞其它版本。
+      - name: 校验隔离后端（pcntl 或 FFI fork）
+        # NTS 走 pcntl，ZTS 走 FFI fork。后端缺失时三套隔离件会打印「跳过」并 exit 0，
+        # 那就是假绿 —— 这里直接失败，并把实际选中的后端打进日志。
+        # NTS 档额外钉住 pcntl：保证两档各覆盖一个后端，而不是都滑到同一条路径。
+        env:
+          PZ_ISOLATE_BACKEND: ${{ matrix.phpts == 'zts' && 'ffi' || 'pcntl' }}
+        working-directory: example/tests
+        run: |
+          set -euo pipefail
+          php -d ffi.enable=1 -r '
+            require "isolation.php";
+            $b = isolateBackend();
+            printf("隔离后端：%s（本档期望 %s）\n", $b ?? "无", getenv("PZ_ISOLATE_BACKEND"));
+            exit($b === null ? 1 : 0);
+          '
+
+      # 集成测试四件套：功能正确 / 崩溃隔离 / 类型语料矩阵 / bailout 兜底。
+      # 后三套子进程隔离，触发 SIGSEGV/ABRT 时以非零退出码暴露；
+      # fail-fast: false 保证单版本失败不阻塞其它版本。
+      # -d ffi.enable=1：ZTS 档走 FFI 隔离后端所必需，NTS 档无害。
       - name: PHP 集成测试（功能）
         working-directory: example/tests
         run: php -d extension=zig-out/lib/libext-tests.so test_all.php
 
       - name: PHP 集成测试（崩溃隔离）
         working-directory: example/tests
-        run: php -d extension=zig-out/lib/libext-tests.so test_crash.php
+        run: php -d ffi.enable=1 -d extension=zig-out/lib/libext-tests.so test_crash.php
 
       - name: PHP 集成测试（类型语料矩阵）
         working-directory: example/tests
-        run: php -d extension=zig-out/lib/libext-tests.so test_corpus.php
+        run: php -d ffi.enable=1 -d extension=zig-out/lib/libext-tests.so test_corpus.php
 
       # 真实 bailout（longjmp）兜底：验证 defer 被跳过后 RSHUTDOWN 仍能回收
       - name: PHP 集成测试（bailout 兜底）
         working-directory: example/tests
-        run: php -d extension=zig-out/lib/libext-tests.so test_bailout.php
+        run: php -d ffi.enable=1 -d extension=zig-out/lib/libext-tests.so test_bailout.php

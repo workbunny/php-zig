@@ -4,8 +4,8 @@
  *
  * bailout 会跳过 Zig 的 defer，请求级资源只能靠 RSHUTDOWN 的 Cleanup 回收。
  * 单测里手动调 Cleanup.flush() 模拟不出这条路径（longjmp 不走 Zig 的返回路径），
- * 故由 fork 出的子进程真实触发一次，观察点写进 marker 文件带回父进程断言
- * （fork 后内存不共享）。
+ * 故由子进程真实触发一次（隔离后端见 isolation.php：pcntl 或 FFI fork），
+ * 观察点写进 marker 文件带回父进程断言（子进程与父进程内存不共享）。
  *
  * 观察点由扩展侧的 hello_bailout_probe 写入：
  *   held-usage=N          RSHUTDOWN 时 arena 仍持有的字节数。回调后注册 → LIFO
@@ -29,16 +29,21 @@
 $passed = 0;
 $failed = 0;
 
-if (!function_exists('pcntl_fork')) {
-    echo "pcntl 不可用，跳过 bailout 兜底测试\n";
-    exit(0);
-}
 if (!function_exists('hello_bailout_probe')) {
     echo "hello_bailout_probe 未注册，无法运行 bailout 兜底测试\n";
     exit(1);
 }
 
 require __DIR__ . '/isolation.php';
+
+// 隔离后端：pcntl（NTS 自带）或 FFI fork（ZTS 无 pcntl）。
+// 环境不满足一律非绿（探针未注册的分支在上面同样是 exit(1)）。
+$backend = isolateBackend();
+if ($backend === null) {
+    echo "无可用隔离后端（pcntl / FFI 均不可用）：无法运行 bailout 兜底测试\n";
+    exit(1);
+}
+echo "隔离后端：{$backend}\n";
 
 /** 探针在 arena 里分配的字节数，用来区分「defer 跑没跑」 */
 const HOLD_BYTES = 65536;
@@ -48,6 +53,11 @@ const RESIDENT_BYTES = 32768;
 const PAT_PROBE_FATAL = '/php-zig bailout probe/';
 /** PHP 8.4 起 trigger_error(E_USER_ERROR) 被弃用（仍致命）；C 组故意选用它，故属预期 */
 const PAT_TRIGGER_ERROR_DEPRECATED = '/Passing E_USER_ERROR to trigger_error\(\) is deprecated/';
+/**
+ * 断言数下界（结构断言）。低于它说明有整组断言被删掉或压根没执行 ——
+ * 那种情况下「失败 0」同样成立。新增断言时上调此值。
+ */
+const EXPECTED_MIN_CHECKS = 22;
 
 function check(string $name, bool $ok, string $detail = ''): void
 {
@@ -197,7 +207,11 @@ assertBailoutRecovered('回调内 E_USER_ERROR', $res, $kv);
 // 结果汇总
 // ============================================================
 echo "\n========================================\n";
-echo "bailout 兜底测试：通过 {$passed}，失败 {$failed}\n";
+echo "bailout 兜底测试：通过 {$passed}，失败 {$failed}，实跑 " . ($passed + $failed) . "\n";
 echo "预期诊断：B/C 两组各 1 条探针 Fatal error（本组断言对象），A 组 0 条\n";
+if ($passed + $failed < EXPECTED_MIN_CHECKS) {
+    echo "结构断言失败：实跑 " . ($passed + $failed) . " 条断言，低于下界 " . EXPECTED_MIN_CHECKS . "\n";
+    exit(1);
+}
 echo $failed === 0 ? "全部通过\n" : "有失败项！\n";
 exit($failed === 0 ? 0 : 1);

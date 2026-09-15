@@ -1330,20 +1330,6 @@ pub const {name}Untyped = true;           // 故意不加约束（无参函数�
 
 新增 `phpglue_string_alloc` / `phpglue_string_buffer` / `phpglue_return_string_ptr`，用 `ZVAL_STR` 把既有 `zend_string` 零拷贝移交给返回值。`concat` 用例 72.57 → 41.13 ns（1.94x → 1.11x）。
 
-## 泄漏类缺陷：既有测试体系测不出，须建增长探针
-
-### 问题
-
-内存泄漏（如前述 `call*Str` 泄漏临时 zval）在既有测试体系下**完全测不出**：单元测试不依赖 PHP 运行时；集成测试每用例只调一两次，泄漏几十字节淹没在请求池里，断言全绿。
-
-### 根因
-
-既有断言都是「值是否正确」与「是否崩溃」，没有一条断言「反复调用后内存是否收敛」。
-
-### 解决方案
-
-新增通用防线「内存增长探针」：把目标 API 循环调用数万次（`hello_mem_*` 系列），断言增量小于 64KB 预算（覆盖临时变量的正常抖动，但远小于「每次泄漏一个字符串」的量级），并配反向验证控制组保证探针本身有效。实现见 `example/tests/test_all.php` §29 与 `example/tests/src/main.zig` 的探针区。
-
 ## PHP 8.2/8.3 上只注册第一个模块函数
 
 ### 问题
