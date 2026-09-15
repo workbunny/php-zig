@@ -21,3 +21,7 @@ zig-pkg/
 *.swo
 .DS_Store
 Thumbs.db
+
+# development
+.workbunny/
+TODO.md
