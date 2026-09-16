@@ -16,6 +16,10 @@ name: test
 on:
   push:
     branches: [master]
+    # 发布 tag 也走一遍测试（tags 与 branches 是并列过滤条件，任一命中即触发）。
+    # 用 '*' 而非 '0.*'：本仓现在用裸版本号打 tag（0.11.6、0.9.2），将来若改
+    # 'v1.0.0' 之类命名，'*' 不会让发布漏测。
+    tags: ['*']
   pull_request:
   workflow_dispatch:
 
