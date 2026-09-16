@@ -226,7 +226,7 @@ pub fn php_bench_nested(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     var i: T.zend_long = 0;
     while (i < n) : (i += 1) {
         var row_zv: T.Zval = undefined;
-        var row = phpzig.Array.init(&row_zv);   // 返回 Array 值，须 var 才能取其可变地址
+        var row = phpzig.Array.init(&row_zv); // 返回 Array 值，须 var 才能取其可变地址
         row.setAssocLong("id", i * 4);
         // appendZval 底层是 add_next_index_zval——**接管**所有权而非增加引用
         // 计数。此处再 ptr_dtor 会把数组持有的底层数据一并释放，读出来是 0。

@@ -11,8 +11,8 @@ pub const ErrorType = enum(c_int) {
     /// Zig 侧的 `defer` 会被跳过。仅用于「扩展进入不可恢复状态」的场合：
     /// 想让 PHP 侧可捕获，请用 `Throw`（抛异常）而不是它。
     fatal = 1,
-    warning = 2,   // E_WARNING
-    notice = 8,    // E_NOTICE
+    warning = 2, // E_WARNING
+    notice = 8, // E_NOTICE
     deprecated = 8192, // E_DEPRECATED
     user_warning = 512, // E_USER_WARNING
     user_notice = 1024, // E_USER_NOTICE

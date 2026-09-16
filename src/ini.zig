@@ -17,10 +17,10 @@ pub const IniModifiable = c.IniModifiable;
 
 /// INI 项描述符
 pub const IniEntry = struct {
-    name:          [:0]const u8,
+    name: [:0]const u8,
     default_value: [:0]const u8,
-    entry_type:    IniType        = .long,
-    modifiable:    IniModifiable  = .all,
+    entry_type: IniType = .long,
+    modifiable: IniModifiable = .all,
 
     pub fn createLong(name: [:0]const u8, default_value: [:0]const u8) IniEntry {
         return .{ .name = name, .default_value = default_value, .entry_type = .long };

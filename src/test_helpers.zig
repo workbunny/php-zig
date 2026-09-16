@@ -255,9 +255,9 @@ test "FunctionDesc.createFrom with mixed types" {
     const desc = mod.FunctionDesc.createFrom("fn", @ptrCast(@alignCast(&dummyHandler)), Args);
     try std.testing.expectEqual(@as(usize, 4), desc.params.len);
     try std.testing.expectEqual(mod.ParamType.string, desc.params[0].param_type);
-    try std.testing.expectEqual(mod.ParamType.long,   desc.params[1].param_type);
+    try std.testing.expectEqual(mod.ParamType.long, desc.params[1].param_type);
     try std.testing.expectEqual(mod.ParamType.double, desc.params[2].param_type);
-    try std.testing.expectEqual(mod.ParamType.bool,   desc.params[3].param_type);
+    try std.testing.expectEqual(mod.ParamType.bool, desc.params[3].param_type);
 }
 
 test "FunctionDesc.createFrom with optional types" {
@@ -265,7 +265,7 @@ test "FunctionDesc.createFrom with optional types" {
     const desc = mod.FunctionDesc.createFrom("fn", @ptrCast(@alignCast(&dummyHandler)), Args);
     try std.testing.expectEqual(@as(usize, 2), desc.params.len);
     try std.testing.expectEqual(false, desc.params[0].allow_null);
-    try std.testing.expectEqual(true,  desc.params[1].allow_null);
+    try std.testing.expectEqual(true, desc.params[1].allow_null);
     try std.testing.expectEqual(mod.ParamType.long, desc.params[1].param_type);
 }
 
@@ -522,9 +522,9 @@ test "Module() with interface and implements compiles" {
 
 test "Module() with 12 params (beyond former 8 limit)" {
     const params = [_]mod.ParamDesc{
-        .{ .name = "p1" },  .{ .name = "p2" },  .{ .name = "p3" },  .{ .name = "p4" },
-        .{ .name = "p5" },  .{ .name = "p6" },  .{ .name = "p7" },  .{ .name = "p8" },
-        .{ .name = "p9" },  .{ .name = "p10" }, .{ .name = "p11" }, .{ .name = "p12" },
+        .{ .name = "p1" }, .{ .name = "p2" },  .{ .name = "p3" },  .{ .name = "p4" },
+        .{ .name = "p5" }, .{ .name = "p6" },  .{ .name = "p7" },  .{ .name = "p8" },
+        .{ .name = "p9" }, .{ .name = "p10" }, .{ .name = "p11" }, .{ .name = "p12" },
     };
     const M = mod.Module(.{
         .name = "beyondparams",
@@ -609,8 +609,16 @@ test "Module() with 80 INI entries (beyond former 64 limit)" {
 // ＝＝ 辅助桩函数（仅用于类型编译验证） ＝＝
 
 fn dummyHandler(_: *php_types.ZendExecuteData, _: *php_types.Zval) callconv(.c) void {}
-fn minitStub(_: c_int, _: c_int) callconv(.c) c_int { return 0; }
-fn mshutdownStub(_: c_int, _: c_int) callconv(.c) c_int { return 0; }
-fn rinitStub(_: c_int, _: c_int) callconv(.c) c_int { return 0; }
-fn rshutdownStub(_: c_int, _: c_int) callconv(.c) c_int { return 0; }
+fn minitStub(_: c_int, _: c_int) callconv(.c) c_int {
+    return 0;
+}
+fn mshutdownStub(_: c_int, _: c_int) callconv(.c) c_int {
+    return 0;
+}
+fn rinitStub(_: c_int, _: c_int) callconv(.c) c_int {
+    return 0;
+}
+fn rshutdownStub(_: c_int, _: c_int) callconv(.c) c_int {
+    return 0;
+}
 fn infoStub(_: *mod.ZendModuleEntry) callconv(.c) void {}

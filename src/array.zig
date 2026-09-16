@@ -52,8 +52,6 @@ pub const Array = struct {
         return null;
     }
 
-
-
     pub fn exists(self: *const Array, key: []const u8) bool {
         return c.phpglue_hash_str_exists(self.hashTable(), key.ptr, key.len) != 0;
     }
@@ -79,24 +77,48 @@ pub const Array = struct {
 
     // ＝＝ 追加元素（自动索引） ＝＝
 
-    pub fn appendLong(self: *Array, v: T.zend_long) void             { c.phpglue_add_next_index_long(self.zv.ptr, v); }
-    pub fn appendDouble(self: *Array, v: f64) void                   { c.phpglue_add_next_index_double(self.zv.ptr, v); }
-    pub fn appendString(self: *Array, s: []const u8) void            { c.phpglue_add_next_index_stringl(self.zv.ptr, s.ptr, s.len); }
-    pub fn appendBool(self: *Array, v: bool) void                    { c.phpglue_add_next_index_bool(self.zv.ptr, v); }
-    pub fn appendNull(self: *Array) void                             { c.phpglue_add_next_index_null(self.zv.ptr); }
-    pub fn appendZval(self: *Array, zv: Zval) void                   { c.phpglue_add_next_index_zval(self.zv.ptr, zv.ptr); }
+    pub fn appendLong(self: *Array, v: T.zend_long) void {
+        c.phpglue_add_next_index_long(self.zv.ptr, v);
+    }
+    pub fn appendDouble(self: *Array, v: f64) void {
+        c.phpglue_add_next_index_double(self.zv.ptr, v);
+    }
+    pub fn appendString(self: *Array, s: []const u8) void {
+        c.phpglue_add_next_index_stringl(self.zv.ptr, s.ptr, s.len);
+    }
+    pub fn appendBool(self: *Array, v: bool) void {
+        c.phpglue_add_next_index_bool(self.zv.ptr, v);
+    }
+    pub fn appendNull(self: *Array) void {
+        c.phpglue_add_next_index_null(self.zv.ptr);
+    }
+    pub fn appendZval(self: *Array, zv: Zval) void {
+        c.phpglue_add_next_index_zval(self.zv.ptr, zv.ptr);
+    }
 
     // ＝＝ 按数字索引设值 ＝＝
 
-    pub fn setLong(self: *Array, idx: T.zend_ulong, v: T.zend_long) void     { c.phpglue_add_index_long(self.zv.ptr, idx, v); }
-    pub fn setString(self: *Array, idx: T.zend_ulong, s: []const u8) void     { c.phpglue_add_index_stringl(self.zv.ptr, idx, s.ptr, s.len); }
-    pub fn setBool(self: *Array, idx: T.zend_ulong, v: bool) void             { c.phpglue_add_index_bool(self.zv.ptr, idx, v); }
+    pub fn setLong(self: *Array, idx: T.zend_ulong, v: T.zend_long) void {
+        c.phpglue_add_index_long(self.zv.ptr, idx, v);
+    }
+    pub fn setString(self: *Array, idx: T.zend_ulong, s: []const u8) void {
+        c.phpglue_add_index_stringl(self.zv.ptr, idx, s.ptr, s.len);
+    }
+    pub fn setBool(self: *Array, idx: T.zend_ulong, v: bool) void {
+        c.phpglue_add_index_bool(self.zv.ptr, idx, v);
+    }
 
     // ＝＝ 按字符串键设值（关联数组） ＝＝
 
-    pub fn setAssocLong(self: *Array, key: []const u8, v: T.zend_long) void   { c.phpglue_add_assoc_long(self.zv.ptr, key.ptr, key.len, v); }
-    pub fn setAssocString(self: *Array, key: []const u8, s: []const u8) void   { c.phpglue_add_assoc_stringl(self.zv.ptr, key.ptr, key.len, s.ptr, s.len); }
-    pub fn setAssocBool(self: *Array, key: []const u8, v: bool) void           { c.phpglue_add_assoc_bool(self.zv.ptr, key.ptr, key.len, v); }
+    pub fn setAssocLong(self: *Array, key: []const u8, v: T.zend_long) void {
+        c.phpglue_add_assoc_long(self.zv.ptr, key.ptr, key.len, v);
+    }
+    pub fn setAssocString(self: *Array, key: []const u8, s: []const u8) void {
+        c.phpglue_add_assoc_stringl(self.zv.ptr, key.ptr, key.len, s.ptr, s.len);
+    }
+    pub fn setAssocBool(self: *Array, key: []const u8, v: bool) void {
+        c.phpglue_add_assoc_bool(self.zv.ptr, key.ptr, key.len, v);
+    }
 
     // ＝＝ 高级操作 ＝＝
 
@@ -188,9 +210,13 @@ pub const Array = struct {
         var result = Array.init(out_zv);
         var iter = self.iterator();
         if (self.count() == 0) return;
-        if (iter.value()) |v| { if (predicate(v)) result.appendZval(v); }
+        if (iter.value()) |v| {
+            if (predicate(v)) result.appendZval(v);
+        }
         while (iter.next()) {
-            if (iter.value()) |v| { if (predicate(v)) result.appendZval(v); }
+            if (iter.value()) |v| {
+                if (predicate(v)) result.appendZval(v);
+            }
         }
     }
 
@@ -222,10 +248,10 @@ pub const Array = struct {
 fn appendScalar(comptime T2: type, arr: *Array, val: T2) void {
     switch (T2) {
         T.zend_long => arr.appendLong(val),
-        f64         => arr.appendDouble(val),
-        []const u8  => arr.appendString(val),
-        bool        => arr.appendBool(val),
-        Zval        => arr.appendZval(val),
-        else        => @compileError("unsupported map return type"),
+        f64 => arr.appendDouble(val),
+        []const u8 => arr.appendString(val),
+        bool => arr.appendBool(val),
+        Zval => arr.appendZval(val),
+        else => @compileError("unsupported map return type"),
     }
 }

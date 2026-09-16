@@ -14,35 +14,35 @@ pub const Zval = extern struct {
     _data: [16]u8 align(8) = undefined,
 };
 
-pub const ZendExecuteData    = opaque {};
-pub const ZendModuleEntry    = opaque {};
-pub const ZendFunctionEntry  = opaque {};
-pub const ZendClassEntry     = opaque {};
-pub const ZendObject         = opaque {};
-pub const ZendString         = opaque {};
-pub const ZendArray          = opaque {};
-pub const HashTable          = ZendArray;
+pub const ZendExecuteData = opaque {};
+pub const ZendModuleEntry = opaque {};
+pub const ZendFunctionEntry = opaque {};
+pub const ZendClassEntry = opaque {};
+pub const ZendObject = opaque {};
+pub const ZendString = opaque {};
+pub const ZendArray = opaque {};
+pub const HashTable = ZendArray;
 
 // ＝＝ Zend 类型系统 typedef ＝＝
 
-pub const zend_long  = c_long;
+pub const zend_long = c_long;
 pub const zend_ulong = u64;
 
 // ＝＝ Zend 类型常量（zend_types.h） ＝＝
 // 值自 PHP 5.x 起稳定未变
 
-pub const IS_UNDEF:     u8 = 0;
-pub const IS_NULL:      u8 = 1;
-pub const IS_FALSE:     u8 = 2;
-pub const IS_TRUE:      u8 = 3;
-pub const IS_LONG:      u8 = 4;
-pub const IS_DOUBLE:    u8 = 5;
-pub const IS_STRING:    u8 = 6;
-pub const IS_ARRAY:     u8 = 7;
-pub const IS_OBJECT:    u8 = 8;
-pub const IS_RESOURCE:  u8 = 9;
+pub const IS_UNDEF: u8 = 0;
+pub const IS_NULL: u8 = 1;
+pub const IS_FALSE: u8 = 2;
+pub const IS_TRUE: u8 = 3;
+pub const IS_LONG: u8 = 4;
+pub const IS_DOUBLE: u8 = 5;
+pub const IS_STRING: u8 = 6;
+pub const IS_ARRAY: u8 = 7;
+pub const IS_OBJECT: u8 = 8;
+pub const IS_RESOURCE: u8 = 9;
 pub const IS_REFERENCE: u8 = 10;
-pub const IS_INDIRECT:  u8 = 11;
+pub const IS_INDIRECT: u8 = 11;
 
 // ＝＝ 函数签名 ＝＝
 

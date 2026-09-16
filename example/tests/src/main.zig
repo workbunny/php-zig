@@ -592,7 +592,10 @@ fn helloErrorDocref(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) v
 // ＝＝ 异常抛出扩展 — 自定义异常类 + Error 家族 ＝＝
 
 fn helloThrowCustom(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnNull(return_value);
+        return;
+    }
     const msg = phpzig.Return.callArg(execute_data, 1);
     if (msg.isString()) {
         phpzig.Throw.throwClass("MyAppException", msg.toStringVal());
@@ -603,14 +606,20 @@ fn helloThrowCustom(execute_data: *T.ZendExecuteData, return_value: *T.Zval) cal
 }
 
 fn helloThrowCustomCode(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnNull(return_value);
+        return;
+    }
     const code = phpzig.Return.callArg(execute_data, 1).toLong();
     phpzig.Throw.throwClassCode("MyAppError", "custom error with code", code);
     phpzig.Return.returnNull(return_value);
 }
 
 fn helloThrowTypeError(execute_data: *T.ZendExecuteData, return_value: *T.Zval) callconv(.c) void {
-    if (phpzig.Return.callNumArgs(execute_data) < 1) { phpzig.Return.returnNull(return_value); return; }
+    if (phpzig.Return.callNumArgs(execute_data) < 1) {
+        phpzig.Return.returnNull(return_value);
+        return;
+    }
     const msg = phpzig.Return.callArg(execute_data, 1);
     if (msg.isString()) {
         phpzig.Throw.typeError(msg.toStringVal());

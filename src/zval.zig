@@ -26,19 +26,39 @@ pub const CastString = struct {
 pub const Zval = struct {
     ptr: *T.Zval,
 
-    pub fn fromPtr(ptr: *T.Zval) Zval     { return .{ .ptr = ptr }; }
-    pub fn fromPtrPtr(ptr: *const *T.Zval) Zval { return .{ .ptr = @constCast(ptr).* }; }
+    pub fn fromPtr(ptr: *T.Zval) Zval {
+        return .{ .ptr = ptr };
+    }
+    pub fn fromPtrPtr(ptr: *const *T.Zval) Zval {
+        return .{ .ptr = @constCast(ptr).* };
+    }
 
     // ＝＝ 类型判断 ＝＝
 
-    pub fn getType(self: Zval) u8     { return c.phpglue_zval_type(self.ptr); }
-    pub fn isNull(self: Zval) bool     { return self.getType() == T.IS_NULL; }
-    pub fn isLong(self: Zval) bool     { return self.getType() == T.IS_LONG; }
-    pub fn isDouble(self: Zval) bool   { return self.getType() == T.IS_DOUBLE; }
-    pub fn isString(self: Zval) bool   { return self.getType() == T.IS_STRING; }
-    pub fn isArray(self: Zval) bool    { return self.getType() == T.IS_ARRAY; }
-    pub fn isObject(self: Zval) bool   { return self.getType() == T.IS_OBJECT; }
-    pub fn isResource(self: Zval) bool { return self.getType() == T.IS_RESOURCE; }
+    pub fn getType(self: Zval) u8 {
+        return c.phpglue_zval_type(self.ptr);
+    }
+    pub fn isNull(self: Zval) bool {
+        return self.getType() == T.IS_NULL;
+    }
+    pub fn isLong(self: Zval) bool {
+        return self.getType() == T.IS_LONG;
+    }
+    pub fn isDouble(self: Zval) bool {
+        return self.getType() == T.IS_DOUBLE;
+    }
+    pub fn isString(self: Zval) bool {
+        return self.getType() == T.IS_STRING;
+    }
+    pub fn isArray(self: Zval) bool {
+        return self.getType() == T.IS_ARRAY;
+    }
+    pub fn isObject(self: Zval) bool {
+        return self.getType() == T.IS_OBJECT;
+    }
+    pub fn isResource(self: Zval) bool {
+        return self.getType() == T.IS_RESOURCE;
+    }
     pub fn isBool(self: Zval) bool {
         const t = self.getType();
         return t == T.IS_TRUE or t == T.IS_FALSE;
@@ -47,20 +67,34 @@ pub const Zval = struct {
     // ＝＝ 语义类型判断（依赖 Zend 运行时） ＝＝
 
     /// 是否可调用（函数名/闭包/可调用对象）
-    pub fn isCallable(self: Zval) bool { return c.phpglue_zval_is_callable(self.ptr) != 0; }
+    pub fn isCallable(self: Zval) bool {
+        return c.phpglue_zval_is_callable(self.ptr) != 0;
+    }
     /// 是否可迭代（数组/可遍历对象）
-    pub fn isIterable(self: Zval) bool { return c.phpglue_zval_is_iterable(self.ptr) != 0; }
+    pub fn isIterable(self: Zval) bool {
+        return c.phpglue_zval_is_iterable(self.ptr) != 0;
+    }
     /// 是否标量（int/float/string/bool）
-    pub fn isScalar(self: Zval) bool { return c.phpglue_zval_is_scalar(self.ptr) != 0; }
+    pub fn isScalar(self: Zval) bool {
+        return c.phpglue_zval_is_scalar(self.ptr) != 0;
+    }
     /// 是否空值（等价 PHP empty()）
-    pub fn isEmpty(self: Zval) bool { return c.phpglue_zval_is_empty(self.ptr) != 0; }
+    pub fn isEmpty(self: Zval) bool {
+        return c.phpglue_zval_is_empty(self.ptr) != 0;
+    }
     /// 是否数值（int/float，或可解析为数值的字符串）
-    pub fn isNumeric(self: Zval) bool { return c.phpglue_zval_is_numeric(self.ptr) != 0; }
+    pub fn isNumeric(self: Zval) bool {
+        return c.phpglue_zval_is_numeric(self.ptr) != 0;
+    }
 
     // ＝＝ 取值 ＝＝
 
-    pub fn toLong(self: Zval) T.zend_long    { return c.phpglue_zval_get_long(self.ptr); }
-    pub fn toDouble(self: Zval) f64           { return c.phpglue_zval_get_double(self.ptr); }
+    pub fn toLong(self: Zval) T.zend_long {
+        return c.phpglue_zval_get_long(self.ptr);
+    }
+    pub fn toDouble(self: Zval) f64 {
+        return c.phpglue_zval_get_double(self.ptr);
+    }
     /// 读字符串值。非字符串返回空切片——zval 是联合体，直接按字符串解读
     /// 会把同一位置的指针字段当成 char* 解引用（实测传 null 会崩），
     /// 故由 glue 层统一拦截，此处只需处理空指针。
@@ -92,7 +126,9 @@ pub const Zval = struct {
         if (c.phpglue_zval_cast_string(self.ptr, &out) == 0) return null;
         return .{ .raw = out };
     }
-    pub fn toBool(self: Zval) bool            { return c.phpglue_zval_is_true(self.ptr) != 0; }
+    pub fn toBool(self: Zval) bool {
+        return c.phpglue_zval_is_true(self.ptr) != 0;
+    }
 
     /// 转换为 PHP 数组包装（仅当 IS_ARRAY 时有效）
     pub fn toArray(self: Zval) ?Array {
@@ -108,11 +144,21 @@ pub const Zval = struct {
 
     // ＝＝ 设值 ＝＝
 
-    pub fn setLong(self: Zval, v: T.zend_long) void { c.phpglue_zval_set_long(self.ptr, v); }
-    pub fn setDouble(self: Zval, v: f64) void        { c.phpglue_zval_set_double(self.ptr, v); }
-    pub fn setString(self: Zval, s: []const u8) void { c.phpglue_zval_set_stringl(self.ptr, s.ptr, s.len); }
-    pub fn setBool(self: Zval, v: bool) void         { c.phpglue_zval_set_bool(self.ptr, v); }
-    pub fn setNull(self: Zval) void                  { c.phpglue_zval_set_null(self.ptr); }
+    pub fn setLong(self: Zval, v: T.zend_long) void {
+        c.phpglue_zval_set_long(self.ptr, v);
+    }
+    pub fn setDouble(self: Zval, v: f64) void {
+        c.phpglue_zval_set_double(self.ptr, v);
+    }
+    pub fn setString(self: Zval, s: []const u8) void {
+        c.phpglue_zval_set_stringl(self.ptr, s.ptr, s.len);
+    }
+    pub fn setBool(self: Zval, v: bool) void {
+        c.phpglue_zval_set_bool(self.ptr, v);
+    }
+    pub fn setNull(self: Zval) void {
+        c.phpglue_zval_set_null(self.ptr);
+    }
 
     // ＝＝ 比较运算符（纯 Zig，不依赖 C glue） ＝＝
 
@@ -133,7 +179,9 @@ pub const Zval = struct {
             const sa = self.toStringVal();
             const sb = other.toStringVal();
             if (sa.len != sb.len) return false;
-            for (sa, sb) |a, b| { if (a != b) return false; }
+            for (sa, sb) |a, b| {
+                if (a != b) return false;
+            }
             return true;
         }
         // 不同类型之间永不相等
@@ -153,13 +201,21 @@ pub const Zval = struct {
     }
 
     /// 小于 <
-    pub fn lt(self: Zval, other: Zval) bool { return self.cmp(other) < 0; }
+    pub fn lt(self: Zval, other: Zval) bool {
+        return self.cmp(other) < 0;
+    }
     /// 小于等于 <=
-    pub fn le(self: Zval, other: Zval) bool { return self.cmp(other) <= 0; }
+    pub fn le(self: Zval, other: Zval) bool {
+        return self.cmp(other) <= 0;
+    }
     /// 大于 >
-    pub fn gt(self: Zval, other: Zval) bool { return self.cmp(other) > 0; }
+    pub fn gt(self: Zval, other: Zval) bool {
+        return self.cmp(other) > 0;
+    }
     /// 大于等于 >=
-    pub fn ge(self: Zval, other: Zval) bool { return self.cmp(other) >= 0; }
+    pub fn ge(self: Zval, other: Zval) bool {
+        return self.cmp(other) >= 0;
+    }
 
     // ＝＝ 算术运算符（结果写入调用者提供的 zval） ＝＝
 
@@ -187,11 +243,19 @@ pub const Zval = struct {
     // ＝＝ 引用计数与复制 ＝＝
 
     /// 引用计数 +1（Z_ADDREF_P）；非引用类型为 no-op
-    pub fn incRef(self: Zval) void { c.phpglue_zval_add_ref(self.ptr); }
+    pub fn incRef(self: Zval) void {
+        c.phpglue_zval_add_ref(self.ptr);
+    }
     /// 引用计数 -1（Z_DELREF_P）
-    pub fn decRef(self: Zval) void { c.phpglue_zval_del_ref(self.ptr); }
+    pub fn decRef(self: Zval) void {
+        c.phpglue_zval_del_ref(self.ptr);
+    }
     /// ZVAL_COPY 副本
-    pub fn copy(self: Zval, dst: Zval) void { c.phpglue_zval_copy(dst.ptr, self.ptr); }
+    pub fn copy(self: Zval, dst: Zval) void {
+        c.phpglue_zval_copy(dst.ptr, self.ptr);
+    }
     /// 写时分离（SEPARATE_ZVAL）：引用计数 > 1 或引用类型时复制独立副本，避免污染共享引用
-    pub fn separate(self: Zval) void { c.phpglue_zval_separate(self.ptr); }
+    pub fn separate(self: Zval) void {
+        c.phpglue_zval_separate(self.ptr);
+    }
 };

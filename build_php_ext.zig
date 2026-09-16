@@ -291,8 +291,9 @@ pub fn addPhpExtension(
         },
         .windows => {
             const subdirs = [_][]const u8{
-                "include/main", "include",      "include/Zend",
-                "include/ext",  "include/TSRM", "include/sapi", "include/win32",
+                "include/main",  "include",      "include/Zend",
+                "include/ext",   "include/TSRM", "include/sapi",
+                "include/win32",
             };
             for (subdirs) |sub| {
                 ext_module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ options.php_prefix, sub }) });
