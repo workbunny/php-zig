@@ -8,6 +8,11 @@
   🐇 A Zig wrapper for the Zend API that allows developers to build PHP extensions safely and efficiently. 🐇
 </p>
 
+<p align="center">
+  <a href="https://github.com/workbunny/php-zig/actions/workflows/test.yml"><img src="https://github.com/workbunny/php-zig/actions/workflows/test.yml/badge.svg" alt="test"></a>
+  <a href="https://github.com/workbunny/php-zig/actions/workflows/benchmark.yml"><img src="https://github.com/workbunny/php-zig/actions/workflows/benchmark.yml/badge.svg" alt="benchmark"></a>
+</p>
+
 # php-zig
 
 用 Zig 语言编写 PHP 扩展，受 [PHPX](https://github.com/swoole/phpx) 启发。
