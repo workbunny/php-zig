@@ -401,6 +401,32 @@ int phpglue_throw_exception_class(const char *class_name, size_t class_len,
     const char *message, size_t message_len, zend_long code);
 
 /* ================================================================
+ * 调用隔离（捕获 bailout）
+ * ================================================================ */
+
+/** 调用一个单参回调，**捕获**其中的 bailout（longjmp）。
+ *
+ *  返回 0 = 回调正常返回；1 = 回调内发生 bailout（已被捕获，EG(bailout) 已由
+ *  zend_end_try 复位到调用前的目标）。
+ *
+ *  用途：收尾阶段逐条调用外部回调时，一条的致命错误不该丢掉整条链 —— 否则链上
+ *  剩余条目与调用方持有的中间态都会一起消失（清理链被自身中断）。
+ *
+ *  **本函数不重抛**。捕获方必须在收尾完成后自行调用 phpglue_bailout() 恢复
+ *  「致命错误必然中止请求」的语义，不得静默吞掉。
+ *
+ *  约束：捕获后引擎处于中间态，只应做本进程资源释放（free / close），
+ *  不得再执行会触及 Zend 状态的调用。 */
+int phpglue_invoke_guarded1(void (*fn)(void *), void *a);
+
+/** 同 phpglue_invoke_guarded1，但回调带两个参数。 */
+int phpglue_invoke_guarded2(void (*fn)(void *, void *), void *a, void *b);
+
+/** 重新抛出 bailout（等价 zend_bailout）。用于把 phpglue_invoke_guarded* 捕获到的
+ *  致命错误交还引擎 —— 捕获方做完不可失败的收尾后必须调用它。 */
+void phpglue_bailout(void);
+
+/* ================================================================
  * 字符串分配 / 异常状态
  * ================================================================ */
 

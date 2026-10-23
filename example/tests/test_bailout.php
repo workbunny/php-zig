@@ -23,6 +23,21 @@
  * 提示：致命错误经 log_errors 走 fd 2，ini_set('display_errors','0') 压不住 ——
  *       收集与分类见 isolation.php。
  *
+ * 六组，按「longjmp 从哪发起」与「RSHUTDOWN 有没有被执行」分：
+ *   A 正常返回（对照组）
+ *   B Zig 侧 E_ERROR
+ *   C 用户回调内 E_USER_ERROR（longjmp 穿过 Zig 帧）
+ *   D **清理回调**自身 bailout —— 链被断，但收尾必须完成（不吞错、不漏内存）
+ *   E **RINIT 阶段** bailout —— RSHUTDOWN 被整段跳过，请求级内存不回收（反向对照）
+ *   F1 **跨请求继承 · RINIT 阶段 bailout** —— 整张注册表原样留到下一请求（CVE 精确场景）
+ *   F2 **跨请求继承 · 收尾钩子内 bailout** —— 遗留被下一请求回收，worker 健康
+ *
+ * D 组新增 marker：chain-fatal=1（断链起点执行到）、chain-reached（不该出现）。
+ * E 组跑在全新进程里（fork 的子进程不会再走 RINIT），marker 路径与开关走环境变量：
+ *   PHPZIG_TEST_MARKER / PHPZIG_TEST_RINIT_BAILOUT=1
+ * F1 用 PHPZIG_TEST_RINIT_BAILOUT_ONCE=<文件> 让只有首个请求在 RINIT bailout。
+ * F2 不靠环境变量，改由 /bail 请求武装「收尾时钩子内 bailout」。
+ *
  * 用法：php -d extension=... test_bailout.php
  */
 
@@ -57,7 +72,7 @@ const PAT_TRIGGER_ERROR_DEPRECATED = '/Passing E_USER_ERROR to trigger_error\(\)
  * 断言数下界（结构断言）。低于它说明有整组断言被删掉或压根没执行 ——
  * 那种情况下「失败 0」同样成立。新增断言时上调此值。
  */
-const EXPECTED_MIN_CHECKS = 22;
+const EXPECTED_MIN_CHECKS = 46;
 
 function check(string $name, bool $ok, string $detail = ''): void
 {
@@ -89,17 +104,181 @@ function runProbe(int $mode, ?callable $cb): array
         }
     });
 
+    $kv = readMarker($marker);
+    @unlink($marker);
+
+    return [$res, $kv];
+}
+
+/**
+ * 起一个**全新** PHP 进程跑一段代码。
+ *
+ * 与 forkIsolate 的分工：forkIsolate 是「请求中途 fork」，子进程不会再走 RINIT ——
+ * 所以「RINIT 阶段 bailout」只能用全新进程复现。全新进程没有回传通道，
+ * 观察点仍走 marker 文件（路径由环境变量在 MINIT 期取，见扩展侧 myMinit）。
+ *
+ * @param array<string,string> $extraEnv
+ * @return array{exit:int, stdout:string, stderr:string}
+ */
+function runFreshProcess(array $extraEnv, string $code): array
+{
+    $cmd = escapeshellarg(PHP_BINARY)
+        . ' -d ' . escapeshellarg('extension=' . extFilePath())
+        . ' -d display_errors=0 -d log_errors=1'
+        . ' -r ' . escapeshellarg($code);
+
+    $proc = proc_open(
+        $cmd,
+        [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+        $pipes,
+        null,
+        array_merge(getenv(), $extraEnv)
+    );
+    if (!is_resource($proc)) {
+        echo "proc_open 失败，RINIT 组无法运行\n";
+        exit(1);
+    }
+    $stdout = (string) stream_get_contents($pipes[1]);
+    $stderr = (string) stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+
+    return ['exit' => proc_close($proc), 'stdout' => $stdout, 'stderr' => $stderr];
+}
+
+/**
+ * 定位当前加载的 ext-tests 扩展文件。
+ *
+ * PHP 没有可靠的「查询已加载扩展的 .so 路径」接口（8.4 的 ReflectionExtension 无
+ * getFileName）。故按约定取 zig-out 产物，并允许 PHPZIG_EXT_PATH 覆盖（ZTS 等使用
+ * 独立产物目录的场景）。取不到**直接失败** —— 环境不满足即非绿，不得跳过。
+ */
+function extFilePath(): string
+{
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+
+    $candidates = [];
+    $override = getenv('PHPZIG_EXT_PATH');
+    if (is_string($override) && $override !== '') {
+        $candidates[] = $override;
+    }
+    $candidates[] = __DIR__ . '/zig-out/lib/libext-tests.so';
+
+    foreach ($candidates as $f) {
+        if (is_file($f) && is_readable($f)) {
+            return $cached = $f;
+        }
+    }
+
+    echo '无法定位 ext-tests 扩展文件（已试：' . implode(', ', $candidates)
+        . "）；可用 PHPZIG_EXT_PATH 指定\n";
+    exit(1);
+}
+
+/**
+ * 起一个 `php -S` 单进程服务器（F 组专用），让「跨请求」真实发生。
+ *
+ * 与 runFreshProcess 的分工：那个是一次性进程（只跑一个请求）；这个要连跑多个请求
+ * 且**共用同一个 worker**，才能观测到遗留条目被下一请求继承。
+ *
+ * 一次性 bailout 开关走**文件**而不是环境变量：`php -S` 进程内环境变量不变，只读
+ * env 会让每个请求都在 RINIT 里 bailout，永远观测不到继承。
+ *
+ * 起不来直接 exit(1) —— 环境不满足即非绿，不跳过。
+ *
+ * @return array{port:int, proc:resource, logHandle:resource, log:string, marker:string, once:string}
+ */
+function serverStart(array $extraEnv = []): array
+{
+    $log = tempnam(sys_get_temp_dir(), 'phpzig_xreq_log');
+    $port = 20000 + (getmypid() % 20000);
+    $cmd = escapeshellarg(PHP_BINARY)
+        . ' -S 127.0.0.1:' . $port
+        . ' -d ' . escapeshellarg('extension=' . extFilePath())
+        . ' -d display_errors=0 -d log_errors=1'
+        . ' ' . escapeshellarg(__DIR__ . '/cross_request_router.php');
+
+    $logHandle = fopen($log, 'w');
+    $proc = proc_open($cmd, [1 => $logHandle, 2 => $logHandle], $pipes, null, array_merge(getenv(), $extraEnv));
+    if (!is_resource($proc)) {
+        echo "proc_open 起 php -S 失败，F 组无法运行\n";
+        exit(1);
+    }
+
+    // 就绪判定只做裸 TCP 连接、不发 HTTP：php -S 会为每个接受到的连接走一遍请求
+    // 生命周期（不完整的请求也占请求序号），故在探测阶段不做业务请求，
+    // 断言也不依赖 current_req 的绝对值。
+    $ready = false;
+    for ($i = 0; $i < 200; $i++) {
+        $fp = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1);
+        if (is_resource($fp)) {
+            fclose($fp);
+            $ready = true;
+            break;
+        }
+        usleep(50000);
+    }
+    if (!$ready) {
+        proc_terminate($proc, 9);
+        proc_close($proc);
+        fclose($logHandle);
+        echo "php -S 未在 10s 内就绪（port {$port}），F 组无法运行\n";
+        exit(1);
+    }
+
+    return [
+        'port'      => $port,
+        'proc'      => $proc,
+        'logHandle' => $logHandle,
+        'log'       => $log,
+    ];
+}
+
+/** 发一个最小 HTTP/1.0 GET，返回去掉响应头的正文（连接失败返回空串） */
+function httpGet(int $port, string $path): string
+{
+    $fp = @fsockopen('127.0.0.1', $port, $errno, $errstr, 2.0);
+    if (!is_resource($fp)) {
+        return '';
+    }
+    fwrite($fp, "GET {$path} HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    $raw = (string) stream_get_contents($fp);
+    fclose($fp);
+    $pos = strpos($raw, "\r\n\r\n");
+
+    return $pos === false ? '' : substr($raw, $pos + 4);
+}
+
+/**
+ * 停服并返回服务端日志。
+ * 用 SIGKILL：断言所需的日志在请求阶段已落盘，此处只求「不挂住 CI」。
+ */
+function serverStop(array $srv): string
+{
+    proc_terminate($srv['proc'], 9);
+    proc_close($srv['proc']);
+    fclose($srv['logHandle']);
+    $text = (string) @file_get_contents($srv['log']);
+    @unlink($srv['log']);
+
+    return $text;
+}
+
+/** 读 marker 文件 → 键值表 */
+function readMarker(string $marker): array
+{
     $kv = [];
-    $lines = file($marker, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
-    foreach ($lines as $line) {
+    foreach (file($marker, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
         if (str_contains($line, '=')) {
             [$k, $v] = explode('=', $line, 2);
             $kv[trim($k)] = trim($v);
         }
     }
-    @unlink($marker);
 
-    return [$res, $kv];
+    return $kv;
 }
 
 /**
@@ -204,11 +383,211 @@ echo "\n=== C. 真实 bailout：回调内 E_USER_ERROR（longjmp 穿过 Zig 帧�
 assertBailoutRecovered('回调内 E_USER_ERROR', $res, $kv);
 
 // ============================================================
+// D. 清理回调自身 bailout —— LIFO 链被断，但收尾必须完成
+//
+// 本组锁住两件事：
+//   1. 致命错误不被吞（框架捕获只为完成收尾，之后照样交还引擎）
+//   2. 链条被打断后，注册表的中间数组仍被释放（否则就是 c_allocator 静默泄漏）
+// 前者是「不静默」，后者是「不漏」——缺任一，框架的内存可观测性就不成立。
+// ============================================================
+echo "\n=== D. 清理回调内 bailout（断链与收尾）===\n";
+[$res, $kv] = runProbe(3, null);
+check('D：未崩溃（无 SEGV/ABRT）', $res['signal'] === null, $res['signal'] ?? '');
+check('D：致命错误未被吞（捕获只是为收尾，不改变结果）', $res['exit'] !== 0, "exit={$res['exit']}");
+check('D：fatal 回调确实执行（断链起点）', ($kv['chain-fatal'] ?? null) === '1');
+check(
+    'D：链上剩余条目未执行（已声明边界：longjmp 不返回）',
+    !isset($kv['chain-reached']),
+    'chain-reached=' . ($kv['chain-reached'] ?? 'no')
+);
+check(
+    'D：收尾未被中断（请求级 MSHUTDOWN 归零 = 中间数组已释放，无静默泄漏）',
+    ($kv['mshutdown-usage'] ?? null) === '0',
+    'mshutdown=' . ($kv['mshutdown-usage'] ?? 'n/a')
+);
+
+// 诊断必须另起全新进程取：本组的 fatal 发生在 exit(0) 之后的 RSHUTDOWN，
+// 那时 forkIsolate 的回传通道已经关闭 —— 它会漏掉这一条（fatal=0），
+// 所以只能走 stderr。这不是噪声漏采，是通道时序决定的分工。
+$markerD = tempnam(sys_get_temp_dir(), 'phpzig_cleanup_bail');
+file_put_contents($markerD, '');
+$freshD = runFreshProcess(
+    ['PHPZIG_TEST_MARKER' => $markerD],
+    'hello_bailout_probe(' . var_export($markerD, true) . ', 3);'
+);
+@unlink($markerD);
+check(
+    'D：致命错误经引擎如实上报（stderr 含探针消息）',
+    str_contains($freshD['stderr'], 'php-zig cleanup bailout probe'),
+    'stderr=' . substr(str_replace("\n", ' ', trim($freshD['stderr'])), 0, 120)
+);
+
+// ============================================================
+// E. RINIT 阶段 bailout —— RSHUTDOWN 被整段跳过（反向对照）
+//
+// A/B/C/D 四组证明「兜底在 RSHUTDOWN 执行时有效」；本组证明「RSHUTDOWN 本身会
+// 被跳过」——bailout 早于 PG(modules_activated) 置位时，php_request_shutdown
+// 跳过全部模块 RSHUTDOWN，请求级内存就此跨请求留存。这正是「请求边界事件需要
+// 补发」（Cleanup.beginRequest + stats().inherited）的存在理由。
+// 必须用全新进程：forkIsolate 的子进程不会再走 RINIT。
+// ============================================================
+echo "\n=== E. RINIT 阶段 bailout（RSHUTDOWN 被跳过）===\n";
+$markerE = tempnam(sys_get_temp_dir(), 'phpzig_rinit');
+file_put_contents($markerE, '');
+$fresh = runFreshProcess([
+    'PHPZIG_TEST_MARKER'        => $markerE,
+    'PHPZIG_TEST_RINIT_BAILOUT' => '1',
+], 'echo "STARTED";');
+$kvE = readMarker($markerE);
+@unlink($markerE);
+
+check('E：子进程非 0 退出（RINIT 内致命错误）', $fresh['exit'] !== 0, "exit={$fresh['exit']}");
+check(
+    'E：用户代码从未执行（启动阶段即中止）',
+    !str_contains($fresh['stdout'], 'STARTED'),
+    'stdout=' . trim($fresh['stdout'])
+);
+check(
+    'E：探针确实在 RINIT 内触发（marker 由 RINIT 写入）',
+    ($kvE['rinit-bailed'] ?? null) === '1',
+    'rinit-bailed=' . ($kvE['rinit-bailed'] ?? 'n/a')
+);
+check(
+    'E：stderr 含探针 Fatal error（致命错误如实上报）',
+    str_contains($fresh['stderr'], 'php-zig rinit bailout probe'),
+    'stderr=' . substr(trim($fresh['stderr']), 0, 120)
+);
+check(
+    'E：反向对照 —— RSHUTDOWN 被整段跳过，请求级内存未回收（>= 64K）',
+    isset($kvE['mshutdown-usage']) && (int) $kvE['mshutdown-usage'] >= HOLD_BYTES,
+    'mshutdown=' . ($kvE['mshutdown-usage'] ?? 'n/a')
+);
+
+// ============================================================
+// F. 跨请求继承 —— 「补发」语义的端到端验证（php -S 单进程多请求）
+//
+// 两种「endRequest 未送达」的成因必须分开验，风险量级不同：
+//
+//  F1  RINIT 阶段 bailout —— RSHUTDOWN 整段跳过，**注册表一条都没清**。
+//      这是 php2shell-poc 的精确前提，也是风险最高的一条。
+//  F2  收尾钩子内 bailout —— 第一次 endRequest 已跑完，只有钩子内新注册的
+//      条目留下。量级小得多，但它能验证「遗留会被下一请求正常收尾回收」。
+//
+// F1 的观测方式受过上游限制：php -S 在某请求 RINIT 失败后，**下一个**请求仍能
+// 正常响应（响应体在收尾之前就已写出），但它自己的收尾会 SEGV，之后不再服务。
+// 换言之 F1 只证「继承可见」，未证「后续回收」—— 补齐方案见 TODO.md 第 1 条。
+// 已用对照开关 PHPZIG_TEST_RINIT_BAILOUT_NOALLOC（只 bailout、不注册任何资源）
+// 确认该崩溃与框架无关，是 CLI 内置服务器处理「启动失败」的上游缺陷。
+// 故 F1 只发 **2 个请求**：拿到继承证据即止，不声称 worker 长期存活。
+// F2 走不触发该缺陷的路径，可以发满 3 个请求验证回收与存活。
+//
+// 不硬编码 current_req：php -S 为每个接受到的连接都走一遍请求生命周期，就绪探测
+// 也会占用序号，故只断言相对关系。
+// ============================================================
+
+// ------------------------------------------------------------
+// F1. RINIT 阶段 bailout（CVE 精确场景）
+// ------------------------------------------------------------
+echo "\n=== F1. 跨请求继承：RINIT 阶段 bailout ===\n";
+$onceF1 = tempnam(sys_get_temp_dir(), 'phpzig_xreq_once');
+@unlink($onceF1); // 不存在 = 尚未 bailout；请求 1 会消耗它
+$srv1 = serverStart(['PHPZIG_TEST_RINIT_BAILOUT_ONCE' => $onceF1]);
+
+$bodyF1 = httpGet($srv1['port'], '/r1');
+check(
+    'F1：请求 1 未进入业务（RINIT 即 bailout，拿不到 stats）',
+    !str_contains($bodyF1, 'current_req'),
+    'body=' . substr(trim($bodyF1), 0, 80)
+);
+
+$r1 = json_decode(httpGet($srv1['port'], '/stats'), true);
+check(
+    'F1：请求 2 拿到 stats（响应在 worker 崩之前已写出）',
+    is_array($r1) && isset($r1['current_req'])
+);
+check(
+    'F1：请求 2 继承了 RINIT bailout 遗留的条目（inherited=1）',
+    ($r1['inherited'] ?? null) === 1,
+    'inherited=' . var_export($r1['inherited'] ?? null, true)
+);
+check(
+    'F1：整张注册表原样存活到下一请求（pending=1）',
+    ($r1['pending'] ?? null) === 1,
+    'pending=' . var_export($r1['pending'] ?? null, true)
+);
+@unlink($onceF1);
+serverStop($srv1); // 不再发第三个请求 —— 见本组注释
+
+// ------------------------------------------------------------
+// F2. 收尾钩子内 bailout（worker 健康，可验证回收）
+// ------------------------------------------------------------
+echo "\n=== F2. 跨请求继承：收尾钩子内 bailout ===\n";
+$srv = serverStart();
+
+// 请求 1：武装 —— 本次收尾时在 RSHUTDOWN 钩子里注册 3 条条目并 bailout，
+// 使框架在钩子之后的第二次 endRequest() 永不执行，条目就此留到下一请求。
+$b1 = json_decode(httpGet($srv['port'], '/bail'), true);
+check(
+    'F2：请求 1 武装成功（收尾时钩子会 bailout）',
+    ($b1['armed'] ?? null) === true,
+    'body=' . var_export($b1, true)
+);
+
+// 请求 2：应继承请求 1 遗留的 3 条
+$r2 = json_decode(httpGet($srv['port'], '/stats'), true);
+check(
+    'F2：请求 2 拿到 stats（收尾 bailout 未杀死 worker）',
+    is_array($r2) && isset($r2['current_req'])
+);
+check(
+    'F2：请求 2 继承了请求 1 遗留的 3 条（inherited=3）',
+    ($r2['inherited'] ?? null) === 3,
+    'inherited=' . var_export($r2['inherited'] ?? null, true)
+);
+check(
+    'F2：遗留条目仍在册（pending=3）',
+    ($r2['pending'] ?? null) === 3,
+    'pending=' . var_export($r2['pending'] ?? null, true)
+);
+
+// 请求 3：请求 2 正常收尾时已把遗留回收
+$r3 = json_decode(httpGet($srv['port'], '/stats'), true);
+check(
+    'F2：请求 2 正常收尾后不再有继承条目（inherited=0）',
+    ($r3['inherited'] ?? null) === 0,
+    'inherited=' . var_export($r3['inherited'] ?? null, true)
+);
+check(
+    'F2：请求 1 的遗留已被回收（pending=0）',
+    ($r3['pending'] ?? null) === 0,
+    'pending=' . var_export($r3['pending'] ?? null, true)
+);
+check(
+    'F2：请求号逐请求递增（R3 = R2 + 1）',
+    is_array($r2) && is_array($r3)
+        && ($r3['current_req'] ?? -1) === ($r2['current_req'] ?? -2) + 1,
+    'r2=' . var_export($r2['current_req'] ?? null, true)
+        . ' r3=' . var_export($r3['current_req'] ?? null, true)
+);
+
+$srvLog = serverStop($srv);
+check(
+    'F2：服务端日志含 RSHUTDOWN 钩子探针 Fatal（bailout 确有发生）',
+    str_contains($srvLog, 'php-zig rshutdown hook bailout probe'),
+    'log=' . substr(str_replace("\n", ' ', trim($srvLog)), 0, 120)
+);
+check(
+    'F2：worker 未崩溃（日志无 Segmentation fault）',
+    !str_contains($srvLog, 'Segmentation fault'),
+    'log=' . substr(str_replace("\n", ' ', trim($srvLog)), -120)
+);
+
+// ============================================================
 // 结果汇总
 // ============================================================
 echo "\n========================================\n";
 echo "bailout 兜底测试：通过 {$passed}，失败 {$failed}，实跑 " . ($passed + $failed) . "\n";
-echo "预期诊断：B/C 两组各 1 条探针 Fatal error（本组断言对象），A 组 0 条\n";
+echo "预期诊断：B/C/D 三组各 1 条探针 Fatal error（本组断言对象），E 组经 stderr 单独断言，A 组 0 条\n";
 if ($passed + $failed < EXPECTED_MIN_CHECKS) {
     echo "结构断言失败：实跑 " . ($passed + $failed) . " 条断言，低于下界 " . EXPECTED_MIN_CHECKS . "\n";
     exit(1);

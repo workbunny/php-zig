@@ -873,6 +873,38 @@ void phpglue_error_docref(const char *docref, int type, const char *msg) {
 }
 
 /* ================================================================
+ * 调用隔离（捕获 bailout）
+ *
+ * 只有 C 侧能用 zend_try / zend_catch（宏 + setjmp），Zig 无法表达。
+ * 语义：捕获后不重抛 —— 由捕获方做完不可失败的收尾（释放中间数组等）
+ * 再调 phpglue_bailout() 交还引擎。
+ * ================================================================ */
+
+int phpglue_invoke_guarded1(void (*fn)(void *), void *a) {
+    volatile int bailed = 0;
+    zend_try {
+        fn(a);
+    } zend_catch {
+        bailed = 1;
+    } zend_end_try();
+    return bailed;
+}
+
+int phpglue_invoke_guarded2(void (*fn)(void *, void *), void *a, void *b) {
+    volatile int bailed = 0;
+    zend_try {
+        fn(a, b);
+    } zend_catch {
+        bailed = 1;
+    } zend_end_try();
+    return bailed;
+}
+
+void phpglue_bailout(void) {
+    zend_bailout();
+}
+
+/* ================================================================
  * 序列化 — PHP serialize/unserialize
  * ================================================================ */
 

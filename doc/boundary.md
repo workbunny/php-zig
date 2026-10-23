@@ -15,13 +15,57 @@
 | 2 | 失败显式 | 缺 `Args`/`Untyped` → 编译期报错；OOM 走 reject 语义 + 抛 PHP 异常，不 panic；`RequestArena.init()` 返回 `?*` | Zig 单测 + `test_all.php` |
 | 3 | 内存可观测 | 框架自身 `c_allocator` 全部经 `memtrack` 记账；`Arena.usage()`/`peak()` 可断言归零；INI 限额默认参与 `memory_limit` 额度 | Zig 单测 + `test_all.php` |
 | 4 | 崩溃可定位 | fork 隔离 + 信号检测 + **退出码判据**（致命错误退出不算「不崩溃」，`exit=255` 会被记成通过正是这条要堵的洞） | `test_crash.php` |
-| 5 | 请求生命周期兜底 | `Cleanup` + `RequestArena` 在 RSHUTDOWN 回收，含真实 bailout（longjmp）路径 | `test_bailout.php` |
+| 5 | 请求生命周期兜底 | `Cleanup` + `RequestArena` 在 RSHUTDOWN 回收，含真实 bailout（longjmp）路径；RSHUTDOWN 可能被整段跳过，故框架把「请求结束」抽象为可补发事件（见下节）。清理回调**逐条隔离**：单条回调的致命错误不打断整条链的收尾，但**不被吞**——收尾后照样交还引擎 | `test_bailout.php`（A~E 五组）+ Zig 单测（继承 / 摘牌 / 幂等） |
 | 6 | 线程模型无关 | 请求级状态 `threadlocal`（cleanup 注册表、arena 派生额度），进程级计数原子（memtrack），限额按请求从 INI 载入——ZTS 与 NTS 行为一致 | Zig 单测（线程隔离用例）+ CI 矩阵 |
 | 7 | 版本 / 平台适配 | 不硬编码 PHP 版本常量：`ZEND_MODULE_API_NO`、`ZEND_ACC_*`、`sizeof(zend_internal_arg_info)` 由 C glue 编译期取自 PHP 头文件 | CI 矩阵 PHP 8.2~8.5 |
 | 8 | 逃生路径 | 骨架未覆盖的 Zend API，下游可自建 C glue，与内置 glue 同机制共存 | [`tutorial.md`](tutorial.md) |
 | 9 | 两个内存作用域隔离 | 请求级 / 常驻级是两套**物理隔离**账本：`shouldReject` 只读请求级，常驻内存不挤占任何请求的 Arena 额度 | Zig 单测（红线回归）+ `test_all.php` §31 |
 | 10 | 常驻内存生命周期 | `ResidentArena.shared()` 由框架在 MSHUTDOWN 释放；请求级在 RSHUTDOWN 释放（含真实 bailout 路径） | `test_bailout.php`（请求级归零 vs 常驻级存活） |
 | 11 | 诊断可分类 | 子进程内关闭 `log_errors` 与 `display_errors`（`log_errors` 是唯一能穿透 `ob_start` 的通道），诊断经 socketpair 回传，按坐标**双向**核对：该有的必须有、不该有的不能有 | `isolation.php` + 三套隔离测试（`stderr` 全空 = 无意外诊断） |
+
+### 请求边界信号：为什么是「补发」而不是「保证执行」
+
+`Cleanup` 与 `RequestArena` 都在 RSHUTDOWN 回收，但 RSHUTDOWN **不保证执行**：
+
+- `zend_bailout()` 走 `longjmp`，跳过其后的所有清理代码；
+- 当 bailout 发生在 `PG(modules_activated)` 置位之前（RINIT 阶段内）时，
+  `php_request_shutdown` 会**整段跳过**模块 RSHUTDOWN；
+- 而 `shutdown_memory_manager()` 照常回收请求堆 —— 但框架的 `c_allocator` 分配不归它管，
+  于是在 worker 存活的前提下跨请求留存。
+
+因此框架不承诺「清理一定执行」，而承诺**事件至少送达一次**：
+
+| 事件 | 调用点 | 语义 |
+|---|---|---|
+| `Cleanup.beginRequest()` | RINIT 最早期（框架调用） | 推进 `req_id`；把当时条目数记为 `inherited`。**不执行任何回调** |
+| `Cleanup.endRequest()` | RSHUTDOWN（框架在钩子前后各调一次） | 先摘牌、后 LIFO 执行。**幂等**，下游可提前调用以自控时机 |
+
+`endRequest()` 的每条回调都经 glue 的 `zend_try` 包裹调用（`phpglue_invoke_guarded1/2`）。
+否则一条回调的 fatal 会 `longjmp` 出整个收尾过程，注册表的中间数组随之静默泄漏 ——
+**清理链被自身打断**，与本该修的那个缺陷同类。捕获后只做不可失败的事（释放中间数组），
+再 `phpglue_bailout()` 把致命错误交还引擎：**收尾一定完成，错误一定上报**，两者都不让。
+
+`beginRequest()` 之所以不清理，是因为 RINIT **之前**可能已有本请求的**活**条目
+（典型路径：INI 的 `on_modify` 在 `php_ini_activate_config` 阶段触发，早于模块 RINIT）。
+此时若做「保护性 flush」，会把仍在使用的资源误回收。**真正的危险不是「清得太晚」，
+而是「清了不该清的」。**
+
+于是 `stats().inherited > 0` 就是**上一请求 RSHUTDOWN 未送达**的直接证据；如何处置
+由下游决定（照常执行 / `discardInherited()` / 只打日志）。
+
+框架只提供判定材料，**不提供策略**：
+
+| 材料 | 用途 |
+|---|---|
+| `Cleanup.reqId()` | 当前请求号（单调递增，`beginRequest` 推进） |
+| `Entry.req` | 该条目的归属请求号（注册时自动打戳） |
+| `Cleanup.stats()` | `current_req` / `pending` / `inherited` / `capacity` / `dropped` |
+| `Entry.data` | 调用契约：框架原样传给回调，不解释内容 |
+| `Entry.any` | 下游注入口：框架永不读写，仅经 `CleanupFnEx` 原样传回 |
+| `Cleanup.discardInherited()` | 丢弃继承条目且**不执行**其回调 |
+
+> 注：`Entry.req` 是**事实**（谁注册的），不是**语义**（该不该在晚到信号里执行）。
+> 后者只有下游知道 —— 取决于 `data` 指向的东西是否还在。
 
 ### 线程模型：ZTS 与 NTS 的行为一致性
 
@@ -91,6 +135,12 @@ ZPP 弱模式有两个前提：该参数**声明了具体标量类型**，且调
 | 10 | 返回值移交之后的生命周期 | `returnString`/`returnZval` 之后所有权归引擎 | 不缓存已移交的 zval 指针 |
 | 11 | `unsafeAllocator()` 的分配 | 语义即「明确放弃托管」：不记账、不受额度约束、bailout 时无兜底 | 非必要不使用；用则自控释放时机与 OOM 后果 |
 | 12 | 常驻内存的容器上限 | `resident_limit` 默认 0（不设防），框架不做 cgroup 感知 | 按部署环境在 INI 设值，或基于 `usageScope(.resident)` 自建告警 |
+| 13 | 继承条目该不该执行 | 是否安全取决于 `Entry.data` 指向物是否还活着，只有下游知道；框架一律执行 | 用 `stats().inherited` / `Entry.req` 判断；宁可泄漏就先 `discardInherited()` |
+| 14 | `data` / `any` 指向的生命周期 | 框架不校验指针内容，只负责原样传递 | 指向 `c_allocator`/静态数据才可跨请求；指向 `emalloc` 出的请求内存会在下一请求悬垂 |
+| 15 | 条目数量上限 | `Cleanup.setMaxEntries()` 默认 0（不设防），与 `resident_limit` 的约定一致 | 按部署环境在 MINIT 期设值；用 `stats().dropped` 观测静默丢弃 |
+| 16 | 清理回调 bailout 后**链上剩余条目不再执行** | `longjmp` 不返回；捕获后引擎已处于中间态，继续执行其余回调（它们可能触碰 Zend 状态）风险不可控，故框架只保证收尾完成，不假装续跑 | 让每条清理回调自带幂等与最小依赖：只做本进程资源释放（`free` / `close`），不调 PHP API |
+| 17 | 单条清理回调的致命错误是否该吞 | 吞掉等于框架替下游静默一次 fatal，违反「失败显式」 | 需要「只记录不致命」的场合请用 `Throw` 或 `Error.warning`，不要用 `Error.fatal` |
+| 18 | 绑定类上的**动态属性** | `Serialize.unserialize` 能往 extern struct 绑定的对象上挂 Zig 侧看不到的属性（只存在于对象的 properties 哈希表，Zig 读固定字段）；PHP 8.2+ 发 `Deprecated` 但**不拦** —— `phpglue_var_unserialize` 没有 `allowed_classes` 参数，任意类都会被实例化 | 不把不可信数据交给 `unserialize`；要严格形态就在 PHP 侧校验，或改走 schema 化序列化。基线见 `test_crash.php` D 组 |
 
 ## 三、下游自查
 
@@ -109,3 +159,8 @@ ZPP 弱模式有两个前提：该参数**声明了具体标量类型**，且调
    在 MSHUTDOWN 释放）；持有常驻指针的模块级静态是否在 `shutdown()` 时清空。
 8. unsafe 自查：`unsafeAllocator()` 的每一笔是否都有对应释放；若已用裸记账 API
    注入观测，释放时是否同步 `trackFree`（漏掉会让计数永久虚高，由第 3 条兜住）。
+9. 请求边界自查：若自己的资源依赖「请求结束就一定回收」，先确认 `Cleanup.stats().inherited`
+   是否为 0——非 0 说明上一请求的 RSHUTDOWN 被跳过，回收是**补发**的（已晚一个请求）。
+   对继承条目按 `Entry.req` 判归属再决定是否执行；`Entry.any` 里若挂了指针，同样要过这一关。
+10. 静默丢弃自查：`stats().dropped` 是否长期为 0。非 0 意味着注册被 OOM/上限吞掉，
+   对应资源不会被回收——这是需要下游处理的信号，不是可忽略的噪声。

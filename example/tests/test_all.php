@@ -40,7 +40,7 @@ $failed = 0;
  * 断言数下界（结构断言）。低于它说明有整段断言被删掉或压根没执行 ——
  * 那种情况下「0 失败」同样成立。新增断言时上调此值。
  */
-const EXPECTED_MIN_ASSERTIONS = 239;
+const EXPECTED_MIN_ASSERTIONS = 257;
 
 // 供 Observer 补强测试使用：必须是 PHP 用户函数（与扩展提供的内部函数对照），
 // 且参数个数固定为 3 以便断言 num_args
@@ -130,6 +130,7 @@ $expectedFns = [
     'hello_name', 'hello_strlen', 'hello_concat', 'hello_iterate',
     'hello_object', 'hello_pop', 'hello_zip',                          // 显式段（靠前）
     'hello_obs_last_func',                                             // 显式段（靠后）
+    'hello_cleanup_stats',
     'hello_arena_report', 'hello_resident_put', 'hello_unsafe_alloc',   // 末段
 ];
 $missingFns = array_values(array_filter($expectedFns, fn($n) => !function_exists($n)));
@@ -561,6 +562,39 @@ echo "\n=== 25. v0.9 arena + cleanup ===\n";
 
 test('hello_arena_sum() 用 arena 分配求和 → 60', 60, hello_arena_sum());
 test('hello_cleanup_register() 注册清理回调', true, hello_cleanup_register());
+
+// 请求边界事件（v0.11.7）：RINIT 的 beginRequest() 必须已接线
+$cs = hello_cleanup_stats();
+test('Cleanup.current_req >= 1（RINIT 已推进请求号）', true, $cs['current_req'] >= 1);
+test('Cleanup.inherited == 0（单请求进程无继承条目）', 0, $cs['inherited']);
+test('Cleanup.pending >= 1（上方注册的回调在册）', true, $cs['pending'] >= 1);
+test('Cleanup.capacity >= pending', true, $cs['capacity'] >= $cs['pending']);
+test('Cleanup.dropped == 0（无静默丢弃）', 0, $cs['dropped']);
+// stats 是纯观测：重复调用不改变状态
+$cs2 = hello_cleanup_stats();
+test('Cleanup.stats() 为纯观测（pending 不变）', $cs['pending'], $cs2['pending']);
+
+// 零件可组合性（v0.11.7）：ext 变体 any 透传 / 下游提前收口 / 上限与丢弃可感知。
+// 三者都是「框架给能力、下游定策略」的出口，缺任一则该能力事实上不可用。
+hello_cleanup_drain(); // 与上面的注册切干净
+test('hello_cleanup_register_ex(42) 注册 ext 变体', true, hello_cleanup_register_ex(42));
+test('收口前回调未执行（ex_seen 仍为哨兵 -1）', -1, hello_cleanup_ex_last());
+test('下游可提前收口（endRequest 可被调用方触发）', true, hello_cleanup_drain());
+test('ext 回调拿到的 any 原值 == 42', 42, hello_cleanup_ex_last());
+test('收口后注册表清空', 0, hello_cleanup_stats()['pending']);
+hello_cleanup_drain();
+test('再收口不重复执行（幂等）', 42, hello_cleanup_ex_last());
+
+test('hello_cleanup_set_max(2) 设上限', true, hello_cleanup_set_max(2));
+hello_cleanup_register_many(2);
+test('上限内注册 2 条', 2, hello_cleanup_stats()['pending']);
+hello_cleanup_register_many(3);
+test('超上限：pending 停在 2 且不 abort', 2, hello_cleanup_stats()['pending']);
+test('超上限：dropped 记录 3 条静默丢弃', 3, hello_cleanup_stats()['dropped']);
+test('discardInherited 无继承条目时返回 0', 0, hello_cleanup_discard());
+hello_cleanup_set_max(0);
+hello_cleanup_drain();
+test('复位上限并收口后注册表为空', 0, hello_cleanup_stats()['pending']);
 
 // ============================================================
 // 26. v0.9.1 — Fiber（协程）能力

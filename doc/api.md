@@ -734,12 +734,36 @@ phpzig.Memtrack.trackFree(.resident, len);    // 释放方负责注销
 漏掉 `trackFree` 会让计数永久虚高（框架没有逐块记录，无法代为修正）——由归零
 断言兜住。
 
-### Cleanup（清理注册）
+### Cleanup（请求边界事件 + 清理注册）
 
 | 函数 | 说明 |
 |---|---|
-| `register(fn_, data)` | 注册 RSHUTDOWN 清理回调 |
-| `flush()` | 立即执行所有待清理回调 |
+| `beginRequest()` | 请求开始事件（框架在 RINIT 最早期调用）：推进 `req_id`、记录 `inherited`，**不执行回调** |
+| `endRequest()` | 请求结束事件：**先摘牌、后 LIFO 执行**，逐条回调经 `zend_try` 隔离（单条 bailout 不打断收尾，但收尾后照样重抛），幂等。下游可提前调用来自控时机 |
+| `flush()` | `endRequest()` 的别名（兼容旧代码） |
+| `register(fn_, data)` | 注册 basic 回调；失败（OOM/超上限）时静默丢弃并累加 `stats().dropped` |
+| `registerEx(fn_ex, data, any)` | 注册 ext 回调，`any` 原样作为第二参数传回 |
+| `tryRegister` / `tryRegisterEx` | 严格注册：失败返回 `RegisterError`（`OutOfMemory` / `RegistryFull`） |
+| `reqId()` | 当前请求号（单调递增） |
+| `stats()` | `{ current_req, pending, inherited, capacity, dropped }` |
+| `entryAt(i)` | 读取第 i 条（**值拷贝**，越界 null；扩容会搬移，勿持有指针） |
+| `discardInherited()` | 丢弃继承条目且**不执行**其回调，返回丢弃条数 |
+| `setMaxEntries(n)` | 条目上限，`0` = 不设防（MINIT 期设置） |
+
+```zig
+pub const Entry = struct {
+    cb: Callback,          // basic: fn(data) / ext: fn(data, any)
+    data: ?*anyopaque,     // 调用契约：框架原样传给回调
+    any: ?*anyopaque,      // 下游注入口：框架永不读写
+    req: u32,              // 归属请求号（注册时自动打戳）
+};
+```
+
+> ⚠️ **RSHUTDOWN 不保证执行**：`zend_bailout` 的 `longjmp` 可能让它整段消失
+> （`PG(modules_activated)` 未置位时尤其如此）。框架因此只承诺**事件至少送达一次** ——
+> `stats().inherited > 0` 就是「上一请求的事件被跳过」的直接证据。
+> 继承条目要不要执行、要不要丢弃，由下游依据 `Entry.req` / `Entry.data` 的归属自行决定。
+> 详见 [`boundary.md`](boundary.md#请求边界信号为什么是补发而不是保证执行)。
 
 ---
 

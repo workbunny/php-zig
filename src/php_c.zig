@@ -288,6 +288,15 @@ pub extern fn phpglue_create_closure(res: *T.Zval, handler: T.FunctionHandler, n
 
 pub extern fn phpglue_error_docref(docref: ?[*:0]const u8, type: c_int, msg: [*c]const u8) void;
 
+// ＝＝＝＝ 调用隔离（捕获 bailout）＝＝＝＝
+//
+// zend_try / zend_catch 是 C 宏 + setjmp，Zig 侧无法表达，故下沉到 glue。
+// 返回 0 = 正常返回；非 0 = 回调内 bailout 已被捕获（需自行 phpglue_bailout 重抛）。
+
+pub extern fn phpglue_invoke_guarded1(fn_: *const fn (?*anyopaque) callconv(.c) void, a: ?*anyopaque) c_int;
+pub extern fn phpglue_invoke_guarded2(fn_: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) void, a: ?*anyopaque, b: ?*anyopaque) c_int;
+pub extern fn phpglue_bailout() void;
+
 // ＝＝＝＝ 序列化 ＝＝＝＝
 
 pub extern fn phpglue_var_serialize(zv: *T.Zval, return_value: *T.Zval) void;

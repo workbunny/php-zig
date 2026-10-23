@@ -674,6 +674,77 @@ fn helloCleanupRegister(_: *T.ZendExecuteData, return_value: *T.Zval) callconv(.
     phpzig.Return.returnBool(return_value, true);
 }
 
+/// 请求边界观测出口：把 `Cleanup.stats()` 原样交给 PHP 侧。
+/// 用于验证 RINIT 的 `beginRequest()` 确已接线，以及「继承条目」对下游可见。
+/// 框架只提供数字，是否暴露给 PHP、如何判读由下游决定。
+fn helloCleanupStats(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const s = phpzig.Cleanup.stats();
+    var arr = phpzig.Array.init(rv);
+    arr.setAssocLong("current_req", @intCast(s.current_req));
+    arr.setAssocLong("pending", @intCast(s.pending));
+    arr.setAssocLong("inherited", @intCast(s.inherited));
+    arr.setAssocLong("capacity", @intCast(s.capacity));
+    arr.setAssocLong("dropped", @intCast(s.dropped));
+}
+
+// ＝＝ 请求边界零件的下游用法示范（v0.11.7）＝＝
+//
+// 只验证「零件可被下游按需组合」：ext 变体回调（any 透传）、下游提前收口
+// （`endRequest` 幂等）、条目上限与静默丢弃可感知。框架不替下游决定策略，
+// 这些能力就必须有可观测的出口，否则等于没有。
+
+/// ext 变体回调记录的 any 值；-1 = 回调尚未执行（哨兵）
+var ex_seen: i64 = -1;
+/// 传给 ext 回调的 any 指向此静态槽 —— 生命周期 ≥ 条目存活期
+var ex_arg: i64 = 0;
+
+fn cleanupExtProbe(data: ?*anyopaque, any: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const slot: *i64 = @ptrCast(@alignCast(any.?));
+    ex_seen = slot.*;
+}
+
+fn cleanupNoop(_: ?*anyopaque) callconv(.c) void {}
+
+/// 注册一条 ext 变体回调，`any` 指向 `$value` 的副本。
+fn helloCleanupRegisterEx(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    ex_arg = phpzig.Return.callArg(ed, 1).toLong();
+    ex_seen = -1;
+    phpzig.Cleanup.registerEx(&cleanupExtProbe, null, &ex_arg);
+    phpzig.Return.returnBool(rv, true);
+}
+
+/// ext 回调最近一次取到的 any 原值（未运行为 -1）。
+fn helloCleanupExLast(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(rv, @intCast(ex_seen));
+}
+
+/// 注册 n 条空回调，用于触达条目上限。
+fn helloCleanupRegisterMany(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    var i: c_long = 0;
+    while (i < n) : (i += 1) phpzig.Cleanup.register(&cleanupNoop, null);
+    phpzig.Return.returnBool(rv, true);
+}
+
+/// 设置条目上限，0 = 不设防。
+fn helloCleanupSetMax(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    phpzig.Cleanup.setMaxEntries(if (n < 0) 0 else @intCast(n));
+    phpzig.Return.returnBool(rv, true);
+}
+
+/// 下游提前收口：`endRequest` 幂等，可在 RSHUTDOWN 之前自行触发。
+fn helloCleanupDrain(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Cleanup.endRequest();
+    phpzig.Return.returnBool(rv, true);
+}
+
+/// 丢弃继承条目（无继承条目时返回 0）。
+fn helloCleanupDiscard(_: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    phpzig.Return.returnLong(rv, @intCast(phpzig.Cleanup.discardInherited()));
+}
+
 // ＝＝ v0.9.1 — Fiber（协程）能力 ＝＝
 
 // Fiber 执行体：在 fiber 内主动挂起自己，被 resume 后返回 resume 传入的值
@@ -1313,10 +1384,22 @@ fn bailoutHeldMarker(_: ?*anyopaque) callconv(.c) void {
     appendMarker("held-usage", phpzig.Arena.usage());
 }
 
+/// mode 3 探针：先注册（LIFO 后跑）。fatal 回调断链后它不应被执行。
+fn bailoutChainTail(_: ?*anyopaque) callconv(.c) void {
+    appendMarker("chain-reached", 1);
+}
+
+/// mode 3 探针：后注册（LIFO 先跑）。在清理回调里触发致命错误。
+fn bailoutChainFatal(_: ?*anyopaque) callconv(.c) void {
+    appendMarker("chain-fatal", 1);
+    phpzig.Error.docref(null, .fatal, "php-zig cleanup bailout probe");
+}
+
 /// hello_bailout_probe($marker_path, $mode, ...$cb)
 ///   mode 0 = 正常返回（对照组）：defer 生效，走常规释放路径
 ///   mode 1 = Zig 侧报 E_ERROR：php_error_docref → zend_bailout → longjmp
 ///   mode 2 = 回调内 trigger_error(E_USER_ERROR)：longjmp **穿过**本 Zig 帧
+///   mode 3 = **清理回调自身** bailout：验证 LIFO 链不被单条回调打断收尾
 fn helloBailoutProbe(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
     const path = phpzig.Return.callArg(ed, 1);
     const mode = phpzig.Return.callArg(ed, 2).toLong();
@@ -1325,13 +1408,21 @@ fn helloBailoutProbe(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
         return;
     }
     const p = path.toStringVal();
-    if (p.len >= bailout_path.len) {
+    if (p.len == 0 or p.len >= bailout_path.len) {
         phpzig.Return.returnNull(rv);
         return;
     }
-    @memcpy(bailout_path[0..p.len], p);
-    bailout_path[p.len] = 0; // C 字符串需要 NUL 结尾
-    bailout_path_len = p.len;
+    setMarkerPath(p);
+
+    if (mode == 3) {
+        // 不创建 arena：本组的信号是「清理注册表中间数组有没有被释放」，
+        // 掺进 arena 泄漏就分不清了。
+        // 注册顺序决定 LIFO 执行顺序：后注册的 fatal 回调先跑 → 断链。
+        phpzig.Cleanup.register(&bailoutChainTail, null);
+        phpzig.Cleanup.register(&bailoutChainFatal, null);
+        phpzig.Return.returnBool(rv, true);
+        return;
+    }
 
     const arena = phpzig.RequestArena.init() orelse return;
     defer arena.deinit(); // bailout 时这行被 longjmp 跳过 —— 正是要验证的风险点
@@ -1514,10 +1605,108 @@ fn helloInfo(module: *phpzig.mod.ZendModuleEntry) callconv(.c) void {
 
 // ＝＝ 生命周期钩子 ＝＝
 
+/// 设置 marker 文件路径（C 字符串，NUL 结尾）。空或超长视为未设置。
+fn setMarkerPath(p: []const u8) void {
+    if (p.len == 0 or p.len >= bailout_path.len) return;
+    @memcpy(bailout_path[0..p.len], p);
+    bailout_path[p.len] = 0;
+    bailout_path_len = p.len;
+}
+
+/// 环境变量是否为字符串 "1"。
+fn envFlagIsOne(name: [*:0]const u8) bool {
+    const v = getenv(name) orelse return false;
+    return v[0] == '1' and v[1] == 0;
+}
+
+/// 武装一次「RSHUTDOWN 钩子内 bailout」：只影响随后收尾的那个请求。
+///
+/// 框架在钩子**之后**还会再调一次 `endRequest()`；钩子里 bailout 就能让那一次
+/// 永不执行，于是钩子内注册的条目留到下一请求 —— 这是「遗留条目」在**同一进程内**
+/// 的制造方式，不需要让 RINIT 失败（`php -S` 遇到 RINIT 失败会崩，见 F 组注释）。
+fn helloArmRshutdownBailout(ed: *T.ZendExecuteData, rv: *T.Zval) callconv(.c) void {
+    const n = phpzig.Return.callArg(ed, 1).toLong();
+    rshutdown_bail_n = if (n < 0) 0 else @intCast(n);
+    phpzig.Return.returnBool(rv, true);
+}
+
+fn myRshutdown(type_: c_int, module_number: c_int) callconv(.c) c_int {
+    _ = type_;
+    _ = module_number;
+    if (rshutdown_bail_n == 0) return 0;
+
+    const n = rshutdown_bail_n;
+    rshutdown_bail_n = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) phpzig.Cleanup.register(&cleanupNoop, null);
+    phpzig.Error.docref(null, .fatal, "php-zig rshutdown hook bailout probe");
+    return 0; // 不可达：上一步已 longjmp
+}
+
 fn myMinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
     _ = type_;
     _ = module_number;
+    // D 组（RINIT 阶段 bailout）跑在全新进程里，探针函数根本没机会被调用，
+    // 故 marker 路径改由环境变量在 MINIT 期取 —— MINIT 早于 RINIT，可靠。
+    if (getenv("PHPZIG_TEST_MARKER")) |p| setMarkerPath(std.mem.span(p));
     return 0;
+}
+
+/// 待触发的 RSHUTDOWN bailout 条目数（0 = 未武装）。
+///
+/// 跨请求存活，故用普通全局而非请求级状态 —— 这正是「武装一次、由下一个收尾的
+/// 请求引爆」所需要的语义。
+var rshutdown_bail_n: usize = 0;
+
+/// 一次性开关：环境变量 `name` 的值是一个开关文件路径；文件不存在则创建并返回
+/// true，已存在则返回 false。
+///
+/// 为什么用文件：常驻宿主（FastCGI / FPM worker）在一个进程里跑多个请求，环境变量
+/// 全程不变。只读 env 的话每个请求都会在 RINIT 里 bailout，第 2 个请求根本走不到
+/// 业务代码，就永远观测不到「请求 2 继承请求 1 的遗留」。
+fn claimOnceEnv(name: [*:0]const u8) bool {
+    const once = getenv(name) orelse return false;
+    if (fopen(once, "r")) |f| {
+        _ = fclose(f);
+        return false;
+    }
+    if (fopen(once, "w")) |f| {
+        _ = fclose(f);
+        return true;
+    }
+    return false;
+}
+
+/// RINIT 阶段触发致命错误：复现「bailout 早于 PG(modules_activated) 置位」，
+/// 此时 `php_request_shutdown` 会整段跳过模块 RSHUTDOWN —— 与 A/B/C/D 四组的
+/// 「RSHUTDOWN 正常执行」构成反向对照。
+///
+/// 先在请求级占一块并注册清理：RSHUTDOWN 被跳过时它无处回收，MSHUTDOWN 时的
+/// 请求级 usage 会明显 > 0，这就是「跳过」的物证；在 `php -S` 单进程场景下，
+/// 它还会以「继承条目」的形式出现在下一个请求的 `stats()` 里。
+/// RINIT 期还没有用户代码，只能由扩展自己触发，故用环境变量开关。
+fn myRinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
+    _ = type_;
+    _ = module_number;
+    // 两种触发方式：每个请求都 bailout（E 组，一次性进程），或只崩首个请求
+    // （F 组，常驻宿主里要留出后续请求来观测继承）。
+    const always = envFlagIsOne("PHPZIG_TEST_RINIT_BAILOUT");
+    if (!always and !claimOnceEnv("PHPZIG_TEST_RINIT_BAILOUT_ONCE")) return 0;
+
+    // 对照开关：只 bailout、不注册任何请求级资源。
+    // 用来把两种成因分开——「php -S 遇到 RINIT 失败」本身是否会崩，
+    // 与「回收上一请求遗留条目」是否会崩，是两件事。
+    if (envFlagIsOne("PHPZIG_TEST_RINIT_BAILOUT_NOALLOC")) {
+        appendMarker("rinit-bailed", 1);
+        phpzig.Error.docref(null, .fatal, "php-zig rinit bailout probe");
+        return 0;
+    }
+
+    const arena = phpzig.RequestArena.init() orelse return 0;
+    _ = arena.allocator().alloc(u8, 64 * 1024) catch {};
+    appendMarker("rinit-bailed", 1);
+    phpzig.Error.docref(null, .fatal, "php-zig rinit bailout probe");
+    return 0; // 不可达：上一步已 longjmp
 }
 
 /// MSHUTDOWN：此时请求已结束、Cleanup 已 flush，全局计数应为 0。
@@ -1599,6 +1788,22 @@ comptime {
             // v0.9：请求级 arena + cleanup
             phpzig.FunctionDesc.create("hello_arena_sum", helloArenaSum),
             phpzig.FunctionDesc.create("hello_cleanup_register", helloCleanupRegister),
+            phpzig.FunctionDesc.create("hello_cleanup_stats", helloCleanupStats),
+            phpzig.FunctionDesc.createWithParams("hello_cleanup_register_ex", helloCleanupRegisterEx, &.{
+                phpzig.ParamDesc.create("value"),
+            }),
+            phpzig.FunctionDesc.create("hello_cleanup_ex_last", helloCleanupExLast),
+            phpzig.FunctionDesc.createWithParams("hello_cleanup_register_many", helloCleanupRegisterMany, &.{
+                phpzig.ParamDesc.create("n"),
+            }),
+            phpzig.FunctionDesc.createWithParams("hello_cleanup_set_max", helloCleanupSetMax, &.{
+                phpzig.ParamDesc.create("n"),
+            }),
+            phpzig.FunctionDesc.create("hello_cleanup_drain", helloCleanupDrain),
+            phpzig.FunctionDesc.create("hello_cleanup_discard", helloCleanupDiscard),
+            phpzig.FunctionDesc.createWithParams("hello_arm_rshutdown_bailout", helloArmRshutdownBailout, &.{
+                phpzig.ParamDesc.create("n"),
+            }),
             // v0.9.1：Fiber 协程能力
             phpzig.FunctionDesc.create("hello_fiber_body", helloFiberBody),
             phpzig.FunctionDesc.createWithParams("hello_fiber_create", helloFiberCreate, &.{phpzig.ParamDesc.create("callable")}),
@@ -1677,6 +1882,8 @@ comptime {
         },
         .minit = myMinit,
         .mshutdown = myMshutdown,
+        .rinit = myRinit,
+        .rshutdown = myRshutdown,
         .ini = &.{
             phpzig.IniEntry.createLong("hello.max_items", "100"),
             phpzig.IniEntry.createString("hello.greeting", "Hi"),
@@ -1969,3 +2176,6 @@ extern fn php_printf(fmt: [*c]const u8, ...) void;
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern fn fwrite(ptr: *const anyopaque, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern fn fclose(stream: *anyopaque) i32;
+// D 组（RINIT bailout）用环境变量传 marker 路径与开关：该组跑在全新进程里，
+// 探针函数不会被执行，只能靠 MINIT 期读环境。
+extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;

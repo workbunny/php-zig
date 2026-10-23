@@ -91,7 +91,7 @@ PHP 扩展属于内核态开发：直接操作 `zval`、管理引用计数、手
     - Serialize   : PHP 序列化（serialize/unserialize）
     - Ini         : PHP INI 配置（声明式注册 + 读取 + 变更通知）
     - Arena       : 请求级内存池（bailout-safe，自动 RSHUTDOWN 回收 + 进程级计数 + INI 限额）
-    - Cleanup     : 清理注册表（bailout-safe，RSHUTDOWN 统一回收）
+    - Cleanup     : 请求边界事件 + 清理注册表（bailout-safe，RSHUTDOWN 统一回收；req_id 归属戳 / any 注入口 / stats 观测）
     - Fiber       : PHP Fiber 协程（只读查询 + create/start/suspend_/resume_/throw）
     - Observer    : 集中式观察代理（fcall/error/declared/class_linked/fiber 五类观察点静态注册）
     - Module      : comptime 模块注册（函数/类/接口/属性/常量/继承/生命周期/INI/对象绑定）
@@ -187,19 +187,19 @@ php-zig/
 │   ├── closure.zig         # 闭包创建：Zig 函数 → PHP Closure
 │   ├── serialize.zig       # 序列化：serialize/unserialize
 │   ├── ini.zig             # INI 配置：声明式注册 + 读取 + 变更通知
-│   ├── cleanup.zig         # 请求级清理注册表（bailout-safe，threadlocal）
+│   ├── cleanup.zig         # 请求边界事件 + 清理注册表（bailout-safe，threadlocal）
 │   ├── arena.zig           # 内存池 ArenaOf(scope)：RequestArena（RSHUTDOWN）/ ResidentArena（MSHUTDOWN）
 │   │                       #   + unsafeAllocator 非托管入口（裸 c_allocator，责任归下游）
 │   ├── memtrack.zig        # Zig 侧 c_allocator 进程级记账：request / resident 两套物理隔离账本
 │   ├── fiber.zig           # Fiber 协程：只读查询 + create/start/suspend_/resume_/throw
 │   ├── observer.zig        # Observer 集中式观察代理（五类观察点 + fcall 过滤下推 + 现场信息）
 │   ├── string.zig          # 说明文档（字符串操作已被 zval/return/Zig std 覆盖）
-│   └── test_helpers.zig    # Zig 单元测试入口（87/87；聚合 cleanup/arena/memtrack 的 test 块）
+│   └── test_helpers.zig    # Zig 单元测试入口（99/99；聚合 cleanup/arena/memtrack 的 test 块）
 ├── example/
 │   ├── hello/              # 最小示例：hello world（模块 hello，libhello.so）
 │   └── tests/              # 集成测试扩展（模块 ext-tests，libext-tests.so）
-│                           #   test_all（功能 239）/ test_crash（崩溃 69）
-│                           #   / test_corpus（语料 432）/ test_bailout（真实 longjmp 22）
+│                           #   test_all（功能 257）/ test_crash（崩溃 72）
+│                           #   / test_corpus（语料 432）/ test_bailout（真实 longjmp 46）
 ├── doc/
 │   ├── zen.md              # 设计哲学、竞品分析、边界（明确不做的事）
 │   ├── tutorial.md         # 从零到一的开发教程（含下游自建 C glue 逃生路径）
@@ -291,7 +291,7 @@ Hello from php-zig!
 | INI 配置           |  ✅  | `IniEntry` 声明式注册 + `Ini.getLong/getString/getBool` 读取 + 变更通知                                                                                       |
 | 序列化             |  ✅  | `Serialize.serialize/unserialize` — 等价 PHP serialize()/unserialize()                                                                                        |
 | phpinfo            |  ✅  | `info_func` 回调                                                                                                                                              |
-| 测试               |  ✅  | Zig 单元测试 87 / PHP 集成测试：功能 239、崩溃隔离 69、类型语料 432、bailout 兜底 22（PHP 8.4 实测）                                                          |
+| 测试               |  ✅  | Zig 单元测试 99 / PHP 集成测试：功能 257、崩溃隔离 72、类型语料 432、bailout 兜底 46（PHP 8.4 实测）                                                          |
 
 ### 两种注册哲学，并存
 

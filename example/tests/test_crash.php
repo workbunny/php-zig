@@ -29,7 +29,7 @@ $casesRun = 0;
  * 用例数下界（结构断言）。低于它说明有整段用例被删掉或压根没执行 ——
  * 那种情况下「拒绝 0」同样成立，单看通过率看不出来。新增用例时上调此值。
  */
-const EXPECTED_MIN_CASES = 69;
+const EXPECTED_MIN_CASES = 72;
 
 require __DIR__ . '/isolation.php';
 
@@ -179,9 +179,17 @@ foreach ([
 }
 
 // ============================================================
-// D. 序列化 —— 畸形输入
+// D. 序列化 —— 畸形输入 + 合法但危险的载荷
+//
+// 「畸形」与「合法但危险」是两回事：前者测解析器健壮性，后者测**语义面**。
+// 后三条钉住 php2shell-poc 变体二所依赖的前提 —— `phpglue_var_unserialize`
+// 没有 `allowed_classes` 参数，任意类都会被实例化；绑定到 extern struct 的类
+// 还会经我们的 create_object handler 建对象，绕过 __construct。
+//
+// 本组只断言「不崩溃」，不断言「安全」：当前行为就是放行。等 allowed_classes
+// 落地后，这里的预期结果才从「不崩溃」升级为「拒绝」——本组就是那次的回归基线。
 // ============================================================
-echo "\n=== D. 序列化：畸形输入 ===\n";
+echo "\n=== D. 序列化：畸形输入 + 合法但危险的载荷 ===\n";
 foreach ([
     'hello_serialize([1,2])'  => fn() => hello_serialize([1, 2]),
     'hello_serialize(null)'   => fn() => hello_serialize(null),
@@ -192,6 +200,24 @@ foreach ([
 ] as $name => $fn) {
     crashTest($name, $fn);
 }
+
+// 绑定类（extern struct）：引擎会走我们的 create_object，但**不跑 __construct**
+crashTest('hello_unserialize(Counter 空)', fn() => hello_unserialize('O:7:"Counter":0:{}'));
+
+// 不存在的类：引擎应降级为 __PHP_Incomplete_Class，而不是崩或抛
+crashTest('hello_unserialize(不存在的类)', fn() => hello_unserialize('O:9:"NoSuchCls":0:{}'));
+
+// 属性注入到绑定类：`Counter` 未声明 `cmd`，引擎按 PHP 的常规路径建**动态属性**并发
+// 8.2+ 的 Deprecated。这条正是攻击面所在，故显式声明而不是放行：
+// 反序列化可以把 Zig 侧看不到的属性挂到绑定对象上（Zig 读固定字段，动态属性只存在于
+// 对象的 properties 哈希表），`类型闭合` 因此在这些对象上不成立。
+// 现状=放行+告警；若将来把绑定类改为拒绝动态属性，本用例的预期应从「告警」改为「拒绝」。
+crashTest(
+    'hello_unserialize(Counter 属性注入)',
+    fn() => hello_unserialize('O:7:"Counter":1:{s:3:"cmd";s:2:"id";}'),
+    ['no-crash'],
+    ['/^Creation of dynamic property Counter::\$cmd is deprecated$/']
+);
 
 // ============================================================
 // E. 危险结构：循环引用 / 深嵌套 / 魔术方法

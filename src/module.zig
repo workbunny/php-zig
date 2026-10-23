@@ -850,10 +850,11 @@ pub fn Module(comptime opts: ModuleOptions) type {
     // 至少保留 1 字节：当模块没有任何带参函数时 total_param_entries 为 0，
     // 否则 param_entries_buf 会退化为 [0]u8 空数组，无法索引/取地址（编译期报错）。
     const total_param_bytes = @max(1, total_param_entries) * ARGINFO_ENTRY_SIZE_MAX;
-    const has_classes = opts.classes.len > 0;
     const has_ini = opts.ini.len > 0;
-    const has_observer = opts.observer != null;
-    const needs_minit_wrapper = has_classes or opts.constants.len > 0 or opts.minit != null or has_ini or has_observer;
+    // 无条件注册：MINIT 里挂载 PHP 探针（Arena / Cleanup）。少了它，探针停留为空实现
+    // 而**静默退化**——arena 的 OOM 不再抛异常、cleanup 的回调不再被隔离。这与下游是否
+    // 声明 minit / 有无类与 INI 无关，故不再按 opts 条件注册。
+    const needs_minit_wrapper = true;
     // 无条件注册：常驻 Arena（ResidentArena.shared()）的生命终点是模块卸载，
     // 没有这条 wrapper 它必然泄漏——与下游是否声明 mshutdown / 有无 INI 无关。
     const needs_mshutdown_wrapper = true;
@@ -1280,6 +1281,7 @@ pub fn Module(comptime opts: ModuleOptions) type {
             // MINIT 后不再改动，各请求线程读到同一份，故保持进程级全局。
             // 请求级限额本身不在这里读——见 phpzigRinit。
             Arena.bindPhpProbes();
+            Cleanup.bindPhpProbes();
             // 常驻级额度是进程级语义，故在 MINIT 读（perdir 的按请求覆盖对它
             // 没有意义）。放在下游 minit 钩子之前，钩子里可用 configureResident
             // 覆盖。
@@ -1330,6 +1332,11 @@ pub fn Module(comptime opts: ModuleOptions) type {
             return rc;
         }
         fn phpzigRinit(type_: c_int, module_number: c_int) callconv(.c) c_int {
+            // 请求边界事件：推进 req_id 并记录上一请求遗留的条目数。
+            // 只记事实、不执行任何回调——RSHUTDOWN 被 longjmp 跳过时，这里是唯一
+            // 的补发点；但 RINIT 之前（如 INI 的 on_modify）可能已有本请求的活条目，
+            // 立即执行会把它们误回收，故清理由 RSHUTDOWN 侧的 endRequest 负责。
+            Cleanup.beginRequest();
             // 限额按请求载入：INI 值可被 perdir 机制按请求改变，且 ZTS 下 PG
             // 每请求线程一份——放在 MINIT 读，其它请求线程会一直用默认额度。
             Arena.configureFromIni();
@@ -1337,9 +1344,14 @@ pub fn Module(comptime opts: ModuleOptions) type {
             return 0;
         }
         fn phpzigRshutdown(type_: c_int, module_number: c_int) callconv(.c) c_int {
-            Cleanup.flush();
-            if (opts.rshutdown) |hook| return hook(type_, module_number);
-            return 0;
+            // 先回收一次：兜住上一请求被 longjmp 跳过的遗留条目，且保证即使下游
+            // 钩子自己 bailout，也不至于把本可回收的资源继续带到下一请求。
+            Cleanup.endRequest();
+            const rc: c_int = if (opts.rshutdown) |hook| hook(type_, module_number) else 0;
+            // 再回收一次：钩子内新注册的条目同样应在本次结束前落地。endRequest
+            // 幂等，空表时近乎零成本。下游若想自行控制时机，可在钩子内提前调用。
+            Cleanup.endRequest();
+            return rc;
         }
 
         pub fn get_module() callconv(.c) *ZendModuleEntry {

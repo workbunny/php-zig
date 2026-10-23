@@ -6,6 +6,64 @@ php-zig 的版本变更记录。从 0.11.0 起维护。
 > 发布不破坏 API**（`0.11.0 → 0.11.1` 兼容）；**y 版本可能破坏 API**
 > （`0.11 → 0.12` 需查本节）。变更均以本节为准。
 
+## [0.11.7] - 2026-10-23
+
+> z 版本发布，无 API 变更：`Cleanup` 从「清理注册表」升级为「请求边界事件 + 清理注册表」。
+
+### 新增
+
+- **请求边界事件**：`Cleanup.beginRequest()` / `Cleanup.endRequest()`。
+  前者在 RINIT 最早期推进 `req_id`、记录继承条目数，**不执行任何回调**；后者**先摘牌、
+  后 LIFO 执行**，幂等。框架在 `phpzigRshutdown` 的下游钩子前后各调一次，使钩子内注册
+  的条目也能在本次落地，同时保证钩子自身 bailout 不致把资源带到下一请求。
+- **观测**：`Cleanup.reqId()`、`Cleanup.stats()`（`current_req` / `pending` / `inherited`
+  / `capacity` / `dropped`）、`Cleanup.entryAt(i)`（值拷贝，越界返回 null）。
+- **`Entry` 公开**：`cb`（basic / ext 回调变体）+ `data`（调用契约）+ `any`（下游注入口，
+  框架**永不读写**）+ `req`（归属请求号，注册时自动打戳）。
+- **扩展注册入口**：`registerEx()`（`CleanupFnEx` 回调，`any` 原样传回）、`tryRegister()` /
+  `tryRegisterEx()`（失败返回 `RegisterError`，不静默）。
+- **处置原语**：`discardInherited()` —— 丢弃继承条目且不执行其回调；`setMaxEntries()` ——
+  条目上限，默认 0 不设防。
+
+### 变更
+
+- `Cleanup.flush()` 保留为 `endRequest()` 的别名，行为等价，既有调用点无需改动。
+- `Serialize.unserialize` 放行任意类的现有行为登记为边界（`doc/boundary.md` §二 第 18 条）：
+  extern struct 绑定的类会被注入 Zig 侧不可见的动态属性，PHP 8.2+ 发 `Deprecated` 但不拦。
+  补 3 条危险载荷基线用例钉住现状；`allowed_classes` 参数仍缺，属独立的后续安全项。
+
+### 修复
+
+- **清理链被自身打断**：`endRequest()` 逐条回调改经 glue 的 `zend_try` 包裹调用
+  （`phpglue_invoke_guarded1/2`）。此前任一回调内的致命错误会 `longjmp` 出整个收尾过程，
+  注册表中间数组静默泄漏；现在收尾一定完成，致命错误随后经 `phpglue_bailout()` 交还引擎
+  ——**不吞错，也不漏内存**。链上剩余条目不再执行，属已声明边界（`doc/boundary.md` §二）。
+- `register()` 扩容 OOM 由 `@panic`（**abort worker 进程**）改为丢弃该条目并累加
+  `stats().dropped`。`@panic` 会剥夺下游处理 OOM 的机会，不是可接受的安全默认。
+- **MINIT wrapper 改为无条件注册**：此前仅在下游声明了 minit/类/INI/observer 之一时才注册，
+  缺省情形下 `Arena.bindPhpProbes()` 不会执行，探针停留为空实现而**静默退化**
+  （arena 的 OOM 不再抛异常）。探针挂载属框架自身职责，不应由下游的声明决定。
+
+### 启发点
+
+来自 `php2shell-poc` 的原理复盘：`zend_bailout` 的 `longjmp` 让 RSHUTDOWN 整段消失，
+而请求堆照常回收，悬垂指针跨请求存活。迁到本项目的四条结论：
+
+1. 兜底不能只盯 `defer` —— RSHUTDOWN 本身也会被跳过。框架该保证的是**事件送达**，
+   不是**清理执行**。
+2. 防御性重置有方向性风险：把「清得太晚」修成「清了不该清的」比不修更糟。RINIT 之前
+   （INI `on_modify` 早于模块 RINIT）可能已有本请求的活条目。
+3. 归属戳（`req`）比判定策略便宜：框架给**事实**，下游给**语义**；语义标签类字段会
+   诱导框架越界，应由 `any` 承载。
+4. **兜底机制自身也要过同一套审视**：清理链会被单条回调的 fatal 打断，探针挂载会因
+   下游没声明 minit 而静默失效 —— 「发布状态 → 可失败操作 → 提交」这条检查对
+   「修漏洞的代码」同样适用。
+5. **端到端验证会反过来暴露测试手段的坑**：`php -S` 在某个请求 RINIT 失败之后，下个
+   请求能正常响应却在收尾 SEGV（已用「只 bailout 不注册资源」的对照确认与框架无关）。
+   该场景因此只发 2 个请求取证、不声称 worker 长期存活；「遗留被回收」另用不触发该
+   上游缺陷的等价场景（收尾钩子内 bailout，3 个请求）验证。结论：验证手段本身也要有
+   对照组，且**不要因为后续步骤失败就丢掉已拿到的有效证据**。
+
 ## [0.11.6] - 2026-09-16
 
 > z 版本发布，无 API 变更：接入 `zig fmt` 格式门禁，行尾钉为 LF。

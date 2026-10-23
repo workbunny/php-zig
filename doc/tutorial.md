@@ -1222,10 +1222,10 @@ zig build test
 ```bash
 cd example/tests
 zig build -Dphp=/usr/local
-php -d extension=zig-out/lib/libext-tests.so test_all.php     # 功能 239/239
-php -d extension=zig-out/lib/libext-tests.so test_crash.php   # 崩溃隔离 69/69（fork + 信号检测）
+php -d extension=zig-out/lib/libext-tests.so test_all.php     # 功能 257/257
+php -d extension=zig-out/lib/libext-tests.so test_crash.php   # 崩溃隔离 72/72（fork + 信号检测）
 php -d extension=zig-out/lib/libext-tests.so test_corpus.php  # 语料矩阵 432/432（任意类型 × API 不崩溃，诊断分类）
-php -d extension=zig-out/lib/libext-tests.so test_bailout.php # bailout 兜底 22/22（真实 longjmp）
+php -d extension=zig-out/lib/libext-tests.so test_bailout.php # bailout 兜底 46/46（真实 longjmp + 跨请求继承）
 ```
 
 最小示例（`example/hello/`）构建与运行：
