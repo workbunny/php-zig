@@ -122,10 +122,15 @@ function runProbe(int $mode, ?callable $cb): array
  */
 function runFreshProcess(array $extraEnv, string $code): array
 {
-    $cmd = escapeshellarg(PHP_BINARY)
-        . ' -d ' . escapeshellarg('extension=' . extFilePath())
-        . ' -d display_errors=0 -d log_errors=1'
-        . ' -r ' . escapeshellarg($code);
+    // 数组形式：不经 /bin/sh 包装，参数不依赖 escapeshellarg 的转义规则，
+    // 也与 serverStart 保持同一种启动方式（原因见该处注释）。
+    $cmd = [
+        PHP_BINARY,
+        '-d', 'extension=' . extFilePath(),
+        '-d', 'display_errors=0',
+        '-d', 'log_errors=1',
+        '-r', $code,
+    ];
 
     $proc = proc_open(
         $cmd,
@@ -189,17 +194,25 @@ function extFilePath(): string
  *
  * 起不来直接 exit(1) —— 环境不满足即非绿，不跳过。
  *
- * @return array{port:int, proc:resource, logHandle:resource, log:string, marker:string, once:string}
+ * @return array{port:int, proc:resource, logHandle:resource, log:string}
  */
 function serverStart(array $extraEnv = []): array
 {
     $log = tempnam(sys_get_temp_dir(), 'phpzig_xreq_log');
-    $port = 20000 + (getmypid() % 20000);
-    $cmd = escapeshellarg(PHP_BINARY)
-        . ' -S 127.0.0.1:' . $port
-        . ' -d ' . escapeshellarg('extension=' . extFilePath())
-        . ' -d display_errors=0 -d log_errors=1'
-        . ' ' . escapeshellarg(__DIR__ . '/cross_request_router.php');
+    $port = freePort();
+
+    // 必须用**数组形式**启动：字符串形式会被 PHP 包成 `/bin/sh -c '<cmd>'`，
+    // 于是 proc_get_status()['pid'] 是 sh 的 pid，proc_terminate() 只杀 sh，
+    // 真正的 php -S 变成孤儿继续占着端口 —— 下一组再起来就会静默连到它上面，
+    // 全部断言错位（表现为请求序号累积、inherited 是上一组的值）。
+    $cmd = [
+        PHP_BINARY,
+        '-S', '127.0.0.1:' . $port,
+        '-d', 'extension=' . extFilePath(),
+        '-d', 'display_errors=0',
+        '-d', 'log_errors=1',
+        __DIR__ . '/cross_request_router.php',
+    ];
 
     $logHandle = fopen($log, 'w');
     $proc = proc_open($cmd, [1 => $logHandle, 2 => $logHandle], $pipes, null, array_merge(getenv(), $extraEnv));
@@ -211,6 +224,7 @@ function serverStart(array $extraEnv = []): array
     // 就绪判定只做裸 TCP 连接、不发 HTTP：php -S 会为每个接受到的连接走一遍请求
     // 生命周期（不完整的请求也占请求序号），故在探测阶段不做业务请求，
     // 断言也不依赖 current_req 的绝对值。
+    // 探测期间同时盯进程是否已死：端口若被占，php -S 会立即退出，继续空等没有意义。
     $ready = false;
     for ($i = 0; $i < 200; $i++) {
         $fp = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.1);
@@ -219,13 +233,28 @@ function serverStart(array $extraEnv = []): array
             $ready = true;
             break;
         }
+        if (!proc_get_status($proc)['running']) {
+            break;
+        }
         usleep(50000);
     }
-    if (!$ready) {
+
+    // 连接成功只证明「端口上有人在听」，不证明「听的是我们刚起的这个」。
+    // 进程活着 + 日志无 bind 失败，才能排除连到别人的服务器。
+    $alive = proc_get_status($proc)['running'];
+    usleep(100000); // 让 php -S 的启动行落盘
+    $logText = (string) @file_get_contents($log);
+    $bindFailed = stripos($logText, 'Address already in use') !== false
+        || stripos($logText, 'Failed to listen') !== false;
+
+    if (!$ready || !$alive || $bindFailed) {
         proc_terminate($proc, 9);
         proc_close($proc);
         fclose($logHandle);
-        echo "php -S 未在 10s 内就绪（port {$port}），F 组无法运行\n";
+        echo "php -S 未能就绪（port {$port}；ready=" . var_export($ready, true)
+            . ' alive=' . var_export($alive, true)
+            . ' bindFailed=' . var_export($bindFailed, true) . "）\n";
+        echo 'log=' . substr(str_replace("\n", ' ', $logText), 0, 200) . "\n";
         exit(1);
     }
 
@@ -235,6 +264,31 @@ function serverStart(array $extraEnv = []): array
         'logHandle' => $logHandle,
         'log'       => $log,
     ];
+}
+
+/**
+ * 取一个当前空闲的本机端口。
+ *
+ * 不用 `20000 + getmypid() % 20000`：同一测试进程里两次 serverStart 会拿到同一个
+ * 端口，只要前一个服务器没死透就会撞车。交给内核分配能直接消掉这一类冲突。
+ */
+function freePort(): int
+{
+    $sock = @stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+    if ($sock === false) {
+        echo "无法分配空闲端口（{$errno} {$errstr}），F 组无法运行\n";
+        exit(1);
+    }
+    $name = (string) stream_socket_get_name($sock, false);
+    fclose($sock);
+
+    $pos = strrpos($name, ':');
+    if ($pos === false) {
+        echo "无法从 {$name} 解析端口，F 组无法运行\n";
+        exit(1);
+    }
+
+    return (int) substr($name, $pos + 1);
 }
 
 /** 发一个最小 HTTP/1.0 GET，返回去掉响应头的正文（连接失败返回空串） */
